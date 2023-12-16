@@ -1,0 +1,35 @@
+[package]
+name = "tera"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.75"
+candle-core = { git = "https://github.com/huggingface/candle", branch = "main", features = ["accelerate"] }
+candle-transformers = { git = "https://github.com/huggingface/candle", branch = "main", features = ["accelerate"] }
+candle-nn = { git = "https://github.com/huggingface/candle", branch = "main", features = ["accelerate"] }
+tokenizers = "0.15.0"
+accelerate-src = "0.3.2"
+tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+hf-hub = { version = "0.3.2", features = ["tokio"] }
+clap = { version = "4.4.11", features = ["derive"] }
+serde_json = "1.0.108"
+tracing-chrome = "0.7.1"
+lazy_static = "1.4.0"
+surrealdb = { version = "1.0.0", features = ["kv-rocksdb"] }
+serde = { version = "1.0.193", features = ["derive"] }
+async_once = "0.2.6"
+reqwest = "0.11.22"
+regex = "1.10.2"
+chrono = "0.4.31"
+pdf-extract = "0.7.2"
+byteorder = "1.5.0"
+wav = "1.0.0"
+rand = "0.8.5"
+tempfile = "3.8.0"
+dirs = "5.0.1"
+prettytable-rs = "0.10.0"
