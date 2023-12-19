@@ -1,6 +1,4 @@
 // Adopted from https://github.com/huggingface/candle/blob/96f1a28e390fceeaa12b3272c8ac5dcccc8eb5fa/candle-examples/examples/whisper/main.rs
-
-extern crate accelerate_src;
 use anyhow::{Context, Error as E, Result};
 use candle_core::{Device, IndexOp, Tensor};
 use candle_nn::{ops::softmax, VarBuilder};

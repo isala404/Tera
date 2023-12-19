@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Install cross
+        run: cargo install cross
+
+      - name: Build for Windows
+        run: |
+          mkdir release
+          cross build --target x86_64-pc-windows-gnu --release
+          tar czf tera-windows-x86-64.tar.gz -C target/x86_64-pc-windows-gnu/release tera.exe
+          mv tera-windows-x86_64.tar.gz release/
+      - name: Build for Linux
+        run: |
+          cross build --target x86_64-unknown-linux-gnu --release
+          tar czf tera-linux-x86-64.tar.gz -C target/x86_64-unknown-linux-gnu/release tera
+          mv tera-linux-x86_64.tar.gz release/
+      - name: Build for macOS Intel
+        run: |
+          cross build --target x86_64-apple-darwin --release
+          tar czf tera-linux-x86_64.tar.gz -C target/x86_64-unknown-linux-gnu/release tera
+          mv tera-linux-x86_64.tar.gz release/
+      - name: Build for macOS ARM
+        run: |
+          cross build --target aarch64-apple-darwin --release
+          tar czf tera-macos-arm-aarch64.tar.gz -C target/aarch64-apple-darwin/release tera
+          mv tera-macos-arm-aarch64.tar.gz release/
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@latest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # This token is provided by Actions, you do not need to create your own token
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: ${{ github.ref }}
+          draft: true # turn this to false once release notes are automatically added
+          prerelease: false
+          body: |
+            Note for maintainers:: Please, update the desciption with the actual release notes.
+
+      - name: Upload artifacts
+        id: upload-release-artifacts
+        uses: skx/github-action-publish-binaries@release-2.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          releaseId: ${{ steps.create_release.outputs.id }}
+          args: 'release/*'
