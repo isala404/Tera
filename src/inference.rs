@@ -17,9 +17,11 @@ lazy_static! {
 }
 
 pub fn load_model() -> Result<(QMixFormer, Tokenizer)> {
-    let api = Api::new()?.repo(Repo::model("lmz/candle-quantized-phi".to_string()));
+    let api = Api::new()?.repo(Repo::model(
+        "Demonthos/dolphin-2_6-phi-2-candle".to_string(),
+    ));
     let tokenizer_filename = api.get("tokenizer.json")?;
-    let weights_filename = api.get("model-v2-q4k.gguf")?;
+    let weights_filename = api.get("model-q4k.gguf")?;
 
     let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
     let config = Config::v2();
@@ -130,22 +132,21 @@ pub async fn answer_with_context(query: &str, references: Vec<VectorIndex>) -> R
 
     let context = json!(context).to_string();
 
-    let prompt = format!("Tera: Your task as an AI assistant is to generate the answer to the user's question \"{question}\" by analyzing both the JSON context: \"{context}\" and any available metadata. If the context or metadata lacks information to answer the question, indicate the absence of relevant details.\nAnswer:", context=context, question=query);
+    let prompt = format!("<|im_start|>system\nAs a friendly and helpful AI assistant named Tera. Your answer should be very concise and to the point. Do not repeat question or references. Today is {date}<|im_end|>\n<|im_start|>user\nquestion: \"{question}\"\nreferences: \"{context}\"\n<|im_end|>\n<|im_start|>assistant\n", context=context, question=query, date=chrono::Local::now().format("%A, %B %e, %Y"));
 
     debug!(prompt =? prompt, "Synthesizing answer with context");
 
     let (model, tokenizer) = &*PHI;
-    let device = Device::Cpu;
 
     let mut pipeline = TextGeneration::new(
         model.clone(),
         tokenizer.clone(),
-        299792458,
-        Some(0.0),
+        398752958,
+        Some(0.3),
         None,
         1.1,
         64,
-        &device,
+        &Device::Cpu,
     );
     let response = pipeline.run(&prompt, 400)?;
 
