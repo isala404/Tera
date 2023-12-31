@@ -1,6 +1,8 @@
 # Tera
 Tera is an AI assistant which is tailored just for you and runs fully locally.
 
+> I just published a [Medium Article](https://medium.com/@isalapiyarisi/lets-build-a-standalone-chatbot-with-phi-2-and-rust-48c0f714f915) about how I built Tera. Check it out if you're interested.
+
 ## Build
 
 1. Make sure you have all the dependencies installed.
@@ -49,6 +51,12 @@ Options:
 3. **Mental Health Companion**: Tell Tera about your feelings or thoughts. It can provide comforting words, motivational quotes, or mindfulness exercises.
 4. **Motivational Coach**: Feed Tera with motivational quotes and ask it to inspire you when you need a boost.
 4. **Home Inventory Manager**: Tell Tera about your home inventory and ask it to remind you when you're running low on supplies.
+
+### TODOs
+- [ ] Make use of SurrealDB's [vector indexing](https://www.youtube.com/watch?v=2MmyE_iohEs) to improve performance once it's available.
+- [ ] Publish prebuilt binaries.
+- [ ] Add CUDA and Metal support for faster inference.
+- [ ] Remove ffmpeg dependency.
 
 ## Licence
 [AGPL-3.0-or-later](LICENSE)

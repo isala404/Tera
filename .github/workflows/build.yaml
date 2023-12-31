@@ -1,0 +1,48 @@
+name: Build Binaries
+
+on: workflow_dispatch
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - name: Build for Linux
+        run: cargo build --release
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tera-linux-x86-64
+          path: target/release/tera
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - name: Build for Windows
+        run: cargo build --release
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tera-windows-x86-64
+          path: target/release/tera
+
+  mac:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - name: Install compilation target
+        run: rustup target add aarch64-apple-darwin
+      - name: Build for Mac ARM
+        run: cargo build --release --target aarch64-apple-darwin
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tera-mac-arm64
+          path: target/aarch64-apple-darwin/release/tera
