@@ -18,6 +18,7 @@ mod embeddings;
 mod inference;
 mod ingest;
 mod whisper;
+mod utils;
 
 #[tokio::main]
 async fn main() -> Result<()> {

@@ -9,12 +9,13 @@ use lazy_static::lazy_static;
 use serde_json::json;
 use tokenizers::Tokenizer;
 use tracing::debug;
-
 use crate::database::VectorIndex;
+use crate::utils::device;
 
 lazy_static! {
     pub static ref PHI: (QMixFormer, Tokenizer) = load_model().expect("Unable to load model");
 }
+
 
 pub fn load_model() -> Result<(QMixFormer, Tokenizer)> {
     let api = Api::new()?.repo(Repo::model(
@@ -25,7 +26,7 @@ pub fn load_model() -> Result<(QMixFormer, Tokenizer)> {
 
     let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
     let config = Config::v2();
-    let vb = candle_transformers::quantized_var_builder::VarBuilder::from_gguf(&weights_filename)?;
+    let vb = candle_transformers::quantized_var_builder::VarBuilder::from_gguf(&weights_filename, &device(false)?)?;
     let model = QMixFormer::new_v2(&config, vb)?;
 
     Ok((model, tokenizer))
@@ -146,7 +147,7 @@ pub async fn answer_with_context(query: &str, references: Vec<VectorIndex>) -> R
         None,
         1.1,
         64,
-        &Device::Cpu,
+        &device(false)?,
     );
     let response = pipeline.run(&prompt, 400)?;
 

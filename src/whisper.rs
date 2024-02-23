@@ -11,6 +11,7 @@ use std::process::Command;
 use tempfile::tempdir;
 use tokenizers::Tokenizer;
 use tracing::{debug, error};
+use crate::utils::device;
 
 lazy_static! {
     pub static ref WHISPER: (m::model::Whisper, Tokenizer, Config) =
@@ -241,7 +242,6 @@ pub fn token_id(tokenizer: &Tokenizer, token: &str) -> candle_core::Result<u32> 
 pub async fn whisper_decode(path: PathBuf) -> anyhow::Result<Vec<Segment>> {
     // let input = std::path::PathBuf::from(path);
     let (model, tokenizer, config) = &*WHISPER;
-    let device = Device::Cpu;
 
     let temp_dir = match tempdir() {
         Ok(temp_dir) => temp_dir,
@@ -276,7 +276,7 @@ pub async fn whisper_decode(path: PathBuf) -> anyhow::Result<Vec<Segment>> {
     let mel = Tensor::from_vec(
         mel,
         (1, config.num_mel_bins, mel_len / config.num_mel_bins),
-        &device,
+        &device(false)?,
     )?;
 
     let language_token = None;
@@ -284,7 +284,7 @@ pub async fn whisper_decode(path: PathBuf) -> anyhow::Result<Vec<Segment>> {
         model.clone(),
         tokenizer.clone(),
         299792458,
-        &device,
+        &device(false)?,
         language_token,
         false,
     )?;
@@ -307,7 +307,7 @@ pub fn load_model() -> Result<(m::model::Whisper, Tokenizer, Config)> {
 
     let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
 
-    let vb = VarBuilder::from_pth(weights_filename, m::DTYPE, &Device::Cpu)?;
+    let vb = VarBuilder::from_pth(weights_filename, m::DTYPE, &device(false)?)?;
     let model = m::model::Whisper::load(&vb, config.clone())?;
 
     Ok((model, tokenizer, config))

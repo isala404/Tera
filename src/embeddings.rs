@@ -1,10 +1,11 @@
 use anyhow::{Context, Error as E, Result};
-use candle_core::{Device, Tensor};
+use candle_core::Tensor;
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config, DTYPE};
 use hf_hub::{api::sync::Api, Repo};
 use lazy_static::lazy_static;
 use tokenizers::{PaddingParams, Tokenizer};
+use crate::utils::device;
 
 lazy_static! {
     pub static ref AI: (BertModel, Tokenizer) = load_model().expect("Unable to load model");
@@ -21,7 +22,7 @@ pub fn load_model() -> Result<(BertModel, Tokenizer)> {
 
     let mut tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
 
-    let vb = VarBuilder::from_pth(&weights_filename, DTYPE, &Device::Cpu)?;
+    let vb = VarBuilder::from_pth(&weights_filename, DTYPE, &device(false)?)?;
     let model = BertModel::load(vb, &config)?;
 
     if let Some(pp) = tokenizer.get_padding_mut() {
@@ -55,7 +56,7 @@ pub fn get_embeddings(sentence: &str) -> Result<Tensor> {
         .iter()
         .map(|tokens| {
             let tokens = tokens.get_ids().to_vec();
-            Ok(Tensor::new(tokens.as_slice(), &Device::Cpu)?)
+            Ok(Tensor::new(tokens.as_slice(), &device(false)?)?)
         })
         .collect::<Result<Vec<_>>>()
         .context("Unable to get token ids")?;
