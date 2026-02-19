@@ -1,31 +1,29 @@
 #![allow(dead_code)]
 
+use crate::utils::whatsapp_buffer::{BufferManager, TypingState};
+use crate::utils::whatsapp_client::set_active_client;
+use crate::utils::whatsapp_handlers::{
+    AuthResult, check_user_auth, create_new_user, handle_expired_code, handle_new_user,
+    handle_verification_attempt, regenerate_pairing_code, update_last_seen,
+};
+use forge::prelude::*;
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
+use uuid::Uuid;
 use wacore::proto_helpers::MessageExt;
 use wacore::types::events::Event;
 use wacore::types::message::MessageInfo;
 use wacore::types::presence::ChatPresence;
 use waproto::whatsapp as wa;
-use whatsapp_rust::bot::MessageContext;
 use whatsapp_rust::client::Client;
-
-use crate::utils::whatsapp_buffer::{BufferManager, TypingState};
-use crate::utils::whatsapp_handlers::{
-    AuthResult, check_user_auth, create_new_user, handle_expired_code, handle_new_user,
-    handle_verification_attempt, process_with_cancellation, regenerate_pairing_code,
-    replay_cached_response, update_last_seen,
-};
-use crate::utils::whatsapp_helpers::send_reaction_to_message;
-use crate::utils::whatsapp_task::{MessageKey, TaskManager, TaskStateSnapshot};
 
 const FLUSH_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Clone)]
 pub struct EventRouter {
-    task_manager: TaskManager,
     buffer_manager: BufferManager,
     user_db: PgPool,
 }
@@ -33,14 +31,9 @@ pub struct EventRouter {
 impl EventRouter {
     pub fn new(user_db: PgPool) -> Self {
         Self {
-            task_manager: TaskManager::new(),
             buffer_manager: BufferManager::new(),
             user_db,
         }
-    }
-
-    pub fn task_manager(&self) -> &TaskManager {
-        &self.task_manager
     }
 
     pub async fn handle_event(&self, event: Event, client: Arc<Client>) {
@@ -57,11 +50,14 @@ impl EventRouter {
                 self.handle_presence_event(&chat_jid, typing_state).await;
             }
             Event::Connected(_) => {
-                tracing::info!("Hospital Support Bot Connected!");
+                set_active_client(client).await;
+                tracing::info!("WhatsApp gateway connected");
             }
             Event::PairingQrCode { code, .. } => {
                 tracing::info!("Scan this QR code to pair:");
-                qr2term::print_qr(code).expect("Failed to print QR code");
+                if let Err(err) = qr2term::print_qr(code) {
+                    tracing::error!("Failed to print pairing QR: {}", err);
+                }
             }
             _ => {}
         }
@@ -75,122 +71,23 @@ impl EventRouter {
         let chat_jid = info.source.chat.to_string();
         let sender_jid = info.source.sender.to_string();
 
-        if let Some(inner) = msg.edited_message.as_ref().and_then(|e| e.message.as_ref()) {
-            tracing::debug!(
-                "DEBUG EDIT inner: conv={:?}, ext_text={}, protocol={}, edit_msg={}",
-                inner.conversation,
-                inner.extended_text_message.is_some(),
-                inner.protocol_message.is_some(),
-                inner.edited_message.is_some()
-            );
-
-            if let Some(ref pm) = inner.protocol_message {
-                tracing::debug!(
-                    "DEBUG EDIT inner.protocol_message: type={:?}, key_id={:?}",
-                    pm.r#type,
-                    pm.key.as_ref().and_then(|k| k.id.as_ref())
-                );
-
-                if let Some(original_id) = pm.key.as_ref().and_then(|k| k.id.as_ref()) {
-                    let edited_content = pm
-                        .edited_message
-                        .as_ref()
-                        .map(|m| (**m).clone())
-                        .unwrap_or_default();
-
-                    tracing::info!(
-                        "Edit detected for message {} (via inner.protocol_message)",
-                        original_id
-                    );
-                    self.handle_edit(chat_jid, original_id.clone(), edited_content, info, client)
-                        .await;
-                    return;
-                }
-            }
-        }
-
-        self.handle_new_message(chat_jid, sender_jid, msg, info, client)
-            .await;
-    }
-
-    async fn handle_edit(
-        &self,
-        chat_jid: String,
-        original_id: String,
-        new_msg: wa::Message,
-        info: MessageInfo,
-        client: Arc<Client>,
-    ) {
-        let key = MessageKey::new(chat_jid.clone(), original_id.clone());
-
-        if self
-            .buffer_manager
-            .update_buffered_message(&chat_jid, &original_id, new_msg.clone())
-            .await
-        {
-            tracing::info!("Updated buffered message {}", original_id);
-            return;
-        }
-
-        match self.task_manager.get(&key).await {
-            Some(TaskStateSnapshot::InProgress) => {
-                tracing::info!(
-                    "Cancelling in-progress task for edited message {}",
-                    original_id
-                );
-                self.task_manager.cancel(&key).await;
-
-                let ctx = MessageContext {
-                    message: Box::new(new_msg),
-                    info,
-                    client,
-                };
-                self.spawn_processing_task(key, ctx).await;
-            }
-            Some(TaskStateSnapshot::Completed { result }) => {
-                tracing::info!(
-                    "Edit received for completed message {}, sending warning",
-                    original_id
-                );
-                let ctx = MessageContext {
-                    message: Box::new(new_msg),
-                    info,
-                    client,
-                };
-
-                send_reaction_to_message(&ctx, &original_id, "\u{26a0}\u{fe0f}").await;
-                replay_cached_response(&ctx, &result).await;
-            }
-            Some(TaskStateSnapshot::Cancelled) | None => {
-                tracing::info!(
-                    "Edit received for unknown/cancelled message {}, ignoring",
-                    original_id
-                );
-            }
-        }
-    }
-
-    async fn handle_new_message(
-        &self,
-        chat_jid: String,
-        sender_jid: String,
-        msg: wa::Message,
-        info: MessageInfo,
-        client: Arc<Client>,
-    ) {
-        let ctx = MessageContext {
-            message: Box::new(msg.clone()),
-            info: info.clone(),
-            client: client.clone(),
-        };
-
         match check_user_auth(&self.user_db, &sender_jid).await {
             AuthResult::NewUser => {
                 create_new_user(&self.user_db, &sender_jid).await;
+                let ctx = whatsapp_rust::bot::MessageContext {
+                    message: Box::new(msg),
+                    info,
+                    client,
+                };
                 handle_new_user(&ctx).await;
-                return;
             }
             AuthResult::PendingVerification { expired } => {
+                let ctx = whatsapp_rust::bot::MessageContext {
+                    message: Box::new(msg),
+                    info,
+                    client,
+                };
+
                 if expired {
                     regenerate_pairing_code(&self.user_db, &sender_jid).await;
                     handle_expired_code(&ctx).await;
@@ -201,24 +98,22 @@ impl EventRouter {
                     handle_verification_attempt(&ctx, &self.user_db, &sender_jid, text.trim())
                         .await;
                 }
-                return;
             }
             AuthResult::Authenticated => {
                 update_last_seen(&self.user_db, &sender_jid).await;
+                self.buffer_manager.add(chat_jid.clone(), msg, info).await;
+                self.schedule_flush_check(chat_jid).await;
             }
         }
-
-        self.buffer_manager.add(chat_jid.clone(), msg, info).await;
-        self.schedule_flush_check(chat_jid, client).await;
     }
 
     async fn handle_presence_event(&self, chat_jid: &str, state: TypingState) {
         self.buffer_manager.update_typing(chat_jid, state).await;
     }
 
-    async fn schedule_flush_check(&self, chat_jid: String, client: Arc<Client>) {
+    async fn schedule_flush_check(&self, chat_jid: String) {
         let buffer_manager = self.buffer_manager.clone();
-        let task_manager = self.task_manager.clone();
+        let db = self.user_db.clone();
 
         tokio::spawn(async move {
             loop {
@@ -229,38 +124,156 @@ impl EventRouter {
                 }
 
                 let ready_chats = buffer_manager.get_ready_chats().await;
-                if ready_chats.contains(&chat_jid) {
-                    let messages = buffer_manager.flush(&chat_jid).await;
-                    for buffered in messages {
-                        let key = MessageKey::new(chat_jid.clone(), buffered.info.id.clone());
-                        let ctx = MessageContext {
-                            message: Box::new(buffered.message),
-                            info: buffered.info,
-                            client: client.clone(),
-                        };
-
-                        spawn_task(task_manager.clone(), key, ctx);
-                    }
-                    break;
+                if !ready_chats.contains(&chat_jid) {
+                    continue;
                 }
+
+                let buffered_messages = buffer_manager.flush(&chat_jid).await;
+                for buffered in buffered_messages {
+                    if let Err(err) =
+                        persist_inbound_message(&db, &buffered.message, &buffered.info).await
+                    {
+                        tracing::error!("Failed to persist inbound message: {}", err);
+                    }
+                }
+                break;
             }
         });
     }
-
-    async fn spawn_processing_task(&self, key: MessageKey, ctx: MessageContext) {
-        spawn_task(self.task_manager.clone(), key, ctx);
-    }
 }
 
-fn spawn_task(task_manager: TaskManager, key: MessageKey, ctx: MessageContext) {
-    tokio::spawn(async move {
-        let cancel_token = task_manager.start(key.clone()).await;
-        let message_id = key.message_id.clone();
+pub async fn persist_inbound_message(
+    db: &PgPool,
+    msg: &wa::Message,
+    info: &MessageInfo,
+) -> Result<Uuid> {
+    let media = extract_inbound_media(msg);
+    let content_text = if media.is_some() {
+        None
+    } else {
+        msg.text_content().map(ToOwned::to_owned)
+    };
 
-        if let Some(result) = process_with_cancellation(ctx, cancel_token).await {
-            task_manager.complete(key, result).await;
-        } else {
-            tracing::info!("Task for message {} was cancelled", message_id);
-        }
+    let row_id = Uuid::new_v4();
+    let metadata = json!({
+        "whatsapp_message_id": info.id,
+        "chat_jid": info.source.chat.to_string(),
+        "sender_jid": info.source.sender.to_string(),
+        "is_group": info.source.is_group,
+        "is_from_me": info.source.is_from_me,
+        "received_at": chrono::Utc::now(),
     });
+
+    sqlx::query(
+        r#"
+        INSERT INTO whatsapp_messages (
+            id, chat_id, direction, status, content_text, media, metadata
+        )
+        VALUES (
+            $1,
+            $2,
+            $3::message_direction,
+            $4::message_status,
+            $5,
+            $6,
+            $7
+        )
+        "#,
+    )
+    .bind(row_id)
+    .bind(info.source.chat.to_string())
+    .bind("in")
+    .bind("pending_agent")
+    .bind(content_text)
+    .bind(media)
+    .bind(metadata)
+    .execute(db)
+    .await?;
+
+    Ok(row_id)
+}
+
+pub fn extract_inbound_media(msg: &wa::Message) -> Option<Value> {
+    let base = msg.get_base_message();
+
+    if let Some(image) = &base.image_message {
+        return Some(json!({
+            "kind": "image",
+            "caption": image.caption,
+            "mimetype": image.mimetype,
+            "file_length": image.file_length,
+        }));
+    }
+
+    if let Some(video) = &base.video_message {
+        return Some(json!({
+            "kind": "video",
+            "caption": video.caption,
+            "mimetype": video.mimetype,
+            "file_length": video.file_length,
+        }));
+    }
+
+    if let Some(audio) = &base.audio_message {
+        return Some(json!({
+            "kind": "audio",
+            "mimetype": audio.mimetype,
+            "file_length": audio.file_length,
+            "ptt": audio.ptt,
+            "seconds": audio.seconds,
+        }));
+    }
+
+    if let Some(document) = &base.document_message {
+        return Some(json!({
+            "kind": "document",
+            "title": document.title,
+            "file_name": document.file_name,
+            "mimetype": document.mimetype,
+            "file_length": document.file_length,
+        }));
+    }
+
+    if let Some(sticker) = &base.sticker_message {
+        return Some(json!({
+            "kind": "sticker",
+            "mimetype": sticker.mimetype,
+            "is_animated": sticker.is_animated,
+        }));
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_inbound_media;
+    use waproto::whatsapp as wa;
+
+    #[test]
+    fn test_extract_inbound_media_image() {
+        let msg = wa::Message {
+            image_message: Some(Box::new(wa::message::ImageMessage {
+                caption: Some("caption".to_string()),
+                mimetype: Some("image/jpeg".to_string()),
+                file_length: Some(123),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let media = extract_inbound_media(&msg).expect("image media should be extracted");
+        assert_eq!(media["kind"], "image");
+        assert_eq!(media["caption"], "caption");
+    }
+
+    #[test]
+    fn test_extract_inbound_media_none_for_plain_text() {
+        let msg = wa::Message {
+            conversation: Some("hello".to_string()),
+            ..Default::default()
+        };
+
+        assert!(extract_inbound_media(&msg).is_none());
+    }
 }

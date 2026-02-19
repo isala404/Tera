@@ -1,4 +1,5 @@
 pub mod whatsapp_buffer;
+pub mod whatsapp_client;
 pub mod whatsapp_handlers;
 pub mod whatsapp_helpers;
 pub mod whatsapp_router;

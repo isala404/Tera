@@ -1,54 +1,58 @@
-use crate::schema::{MessageDirection, MessageStatus, WhatsappMessage};
+#![allow(dead_code)]
+
+use crate::utils::whatsapp_client::{
+    media_json_kind, send_asset_media_message, send_reaction_message, send_text_message,
+};
 use crate::utils::whatsapp_runtime::spawn_whatsapp_gateway;
 use forge::prelude::*;
+use serde::Deserialize;
+use serde_json::{Value, json};
 use sqlx::Row;
-use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use tokio::time::{Duration, Instant};
+use tokio::time::Duration;
 use uuid::Uuid;
 
-struct ChatBuffer {
-    message_ids: Vec<Uuid>,
-    last_activity: Instant,
-    is_typing: bool,
+const LOOP_INTERVAL_MS: u64 = 500;
+const BATCH_LIMIT: i64 = 25;
+
+#[derive(Debug, Deserialize)]
+struct RpcError {
+    code: String,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcResponse {
+    success: bool,
+    data: Option<Value>,
+    error: Option<RpcError>,
 }
 
 #[forge::daemon(startup_delay = "5s")]
 pub async fn ambassador(ctx: &DaemonContext) -> Result<()> {
-    tracing::info!("Ambassador daemon starting - WhatsApp gateway initialized");
+    tracing::info!("Ambassador daemon starting");
 
-    let chat_buffers: Arc<RwLock<HashMap<String, ChatBuffer>>> =
-        Arc::new(RwLock::new(HashMap::new()));
+    let http = reqwest::Client::new();
     let mut whatsapp_gateway_task = spawn_whatsapp_gateway(Arc::new(ctx.db().clone()));
 
     loop {
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(500)) => {
-                // Check for typing timeouts and flush buffers
-                if let Err(e) = process_chat_buffers(ctx, &chat_buffers).await {
-                    tracing::error!("Failed to process chat buffers: {}", e);
+            _ = tokio::time::sleep(Duration::from_millis(LOOP_INTERVAL_MS)) => {
+                if let Err(err) = dispatch_pending_inbound_jobs(ctx, &http).await {
+                    tracing::error!("Inbound dispatch loop failed: {}", err);
                 }
 
-                // Also process any pending messages in the database
-                if let Err(e) = process_pending_messages(ctx).await {
-                    tracing::error!("Failed to process pending messages: {}", e);
+                if let Err(err) = deliver_pending_outbound_messages(ctx).await {
+                    tracing::error!("Outbound delivery loop failed: {}", err);
                 }
             }
             gateway_result = &mut whatsapp_gateway_task => {
-                tracing::error!("WhatsApp gateway task stopped unexpectedly: {:?}", gateway_result);
+                tracing::error!("WhatsApp gateway task stopped: {:?}", gateway_result);
                 break;
             }
             _ = ctx.shutdown_signal() => {
-                tracing::info!("Ambassador daemon shutting down gracefully");
+                tracing::info!("Ambassador daemon shutting down");
                 whatsapp_gateway_task.abort();
-                // Flush all buffers before shutdown
-                let buffers = chat_buffers.read().await;
-                for (_chat_id, buffer) in buffers.iter() {
-                    if let Err(e) = process_buffered_messages(ctx, &buffer.message_ids).await {
-                        tracing::error!("Failed to process buffered messages during shutdown: {}", e);
-                    }
-                }
                 break;
             }
         }
@@ -57,315 +61,241 @@ pub async fn ambassador(ctx: &DaemonContext) -> Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
-async fn process_chat_buffers(
-    ctx: &DaemonContext,
-    buffers: &Arc<RwLock<HashMap<String, ChatBuffer>>>,
-) -> Result<()> {
-    let mut chat_buffers = buffers.write().await;
-    let now = Instant::now();
-    const TYPING_TIMEOUT: Duration = Duration::from_secs(5);
-
-    let chats_to_flush: Vec<String> = chat_buffers
-        .iter()
-        .filter_map(|(chat_id, buffer)| {
-            // Flush if: typing stopped (elapsed > 5s) OR buffer has messages and timeout exceeded
-            if !buffer.is_typing && now.duration_since(buffer.last_activity) > TYPING_TIMEOUT {
-                Some(chat_id.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    for chat_id in chats_to_flush {
-        if let Some(buffer) = chat_buffers.remove(&chat_id)
-            && let Err(e) = process_buffered_messages(ctx, &buffer.message_ids).await
-        {
-            tracing::error!(
-                "Failed to process buffered messages from {}: {}",
-                chat_id,
-                e
-            );
-        }
-    }
-
-    Ok(())
-}
-
-#[allow(dead_code)]
-async fn process_buffered_messages(ctx: &DaemonContext, message_ids: &[Uuid]) -> Result<()> {
-    let db = ctx.db();
-
-    for message_id in message_ids {
-        let row = sqlx::query(
-            r#"
-            SELECT
-                id, chat_id, direction, agent_id, status, content_text,
-                media, embedding, metadata, created_at, updated_at
-            FROM whatsapp_messages
-            WHERE id = $1
-            "#,
-        )
-        .bind(message_id)
-        .fetch_optional(db)
-        .await?;
-
-        if let Some(row) = row {
-            let message = WhatsappMessage {
-                id: row.get("id"),
-                chat_id: row.get("chat_id"),
-                direction: parse_direction(&row.get::<String, _>("direction")),
-                agent_id: row.get("agent_id"),
-                status: parse_status(&row.get::<String, _>("status")),
-                content_text: row.get("content_text"),
-                media: row.get("media"),
-                embedding: row.get("embedding"),
-                metadata: row.get("metadata"),
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
-            };
-
-            if let Err(e) = handle_message(ctx, message).await {
-                tracing::error!("Failed to handle buffered message {}: {}", message_id, e);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-#[allow(dead_code)]
-async fn process_pending_messages(ctx: &DaemonContext) -> Result<()> {
-    let db = ctx.db();
-
+async fn dispatch_pending_inbound_jobs(ctx: &DaemonContext, http: &reqwest::Client) -> Result<()> {
     let rows = sqlx::query(
         r#"
-        SELECT
-            id, chat_id, direction, agent_id, status, content_text,
-            media, embedding, metadata, created_at, updated_at
+        SELECT id
         FROM whatsapp_messages
-        WHERE status = 'pending'
-        LIMIT 100
+        WHERE direction = 'in'::message_direction
+          AND status = 'pending_agent'::message_status
+        ORDER BY created_at ASC
+        LIMIT $1
         "#,
     )
-    .fetch_all(db)
+    .bind(BATCH_LIMIT)
+    .fetch_all(ctx.db())
     .await?;
 
     for row in rows {
-        let message = WhatsappMessage {
-            id: row.get("id"),
-            chat_id: row.get("chat_id"),
-            direction: parse_direction(&row.get::<String, _>("direction")),
-            agent_id: row.get("agent_id"),
-            status: parse_status(&row.get::<String, _>("status")),
-            content_text: row.get("content_text"),
-            media: row.get("media"),
-            embedding: row.get("embedding"),
-            metadata: row.get("metadata"),
-            created_at: row.get("created_at"),
-            updated_at: row.get("updated_at"),
-        };
+        let message_id: Uuid = row.get("id");
 
-        if let Err(e) = handle_message(ctx, message).await {
-            tracing::error!("Failed to handle message: {}", e);
+        match dispatch_processing_job(http, message_id).await {
+            Ok(job_id) => {
+                update_status(
+                    ctx.db(),
+                    message_id,
+                    "sent_agent",
+                    json!({
+                        "job_id": job_id,
+                        "job_dispatched_at": chrono::Utc::now(),
+                    }),
+                )
+                .await?;
+            }
+            Err(err) => {
+                tracing::error!(
+                    "Failed to dispatch job for inbound message {}: {}",
+                    message_id,
+                    err
+                );
+            }
         }
     }
 
     Ok(())
 }
 
-#[allow(dead_code)]
-fn parse_direction(s: &str) -> MessageDirection {
-    match s {
-        "in" => MessageDirection::In,
-        "out" => MessageDirection::Out,
-        _ => MessageDirection::In,
+async fn dispatch_processing_job(http: &reqwest::Client, message_id: Uuid) -> Result<String> {
+    let endpoint = internal_rpc_endpoint("process_whatsapp_message_job");
+
+    let response = http
+        .post(endpoint)
+        .json(&json!({
+            "args": {
+                "message_id": message_id,
+            }
+        }))
+        .send()
+        .await
+        .map_err(|e| ForgeError::Internal(format!("Failed to call internal RPC: {}", e)))?;
+
+    let status = response.status();
+    let payload: RpcResponse = response
+        .json()
+        .await
+        .map_err(|e| ForgeError::Internal(format!("Invalid internal RPC response: {}", e)))?;
+
+    if !status.is_success() || !payload.success {
+        let err = payload
+            .error
+            .map(|e| format!("{}: {}", e.code, e.message))
+            .unwrap_or_else(|| "unknown error".to_string());
+        return Err(ForgeError::Internal(format!(
+            "Job dispatch RPC failed for {}: {}",
+            message_id, err
+        )));
     }
+
+    let job_id = payload
+        .data
+        .as_ref()
+        .and_then(|v| v.get("job_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+
+    Ok(job_id)
 }
 
-#[allow(dead_code)]
-fn parse_status(s: &str) -> MessageStatus {
-    match s {
-        "pending_agent" => MessageStatus::PendingAgent,
-        "sent_agent" => MessageStatus::SentAgent,
-        "pending_gateway" => MessageStatus::PendingGateway,
-        "sent_gateway" => MessageStatus::SentGateway,
-        "failed_gateway" => MessageStatus::FailedGateway,
-        _ => MessageStatus::PendingAgent,
-    }
-}
+async fn deliver_pending_outbound_messages(ctx: &DaemonContext) -> Result<()> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, chat_id, content_text, media, metadata
+        FROM whatsapp_messages
+        WHERE direction = 'out'::message_direction
+          AND status = 'pending_gateway'::message_status
+        ORDER BY created_at ASC
+        LIMIT $1
+        "#,
+    )
+    .bind(BATCH_LIMIT)
+    .fetch_all(ctx.db())
+    .await?;
 
-#[allow(dead_code)]
-async fn handle_message(ctx: &DaemonContext, mut message: WhatsappMessage) -> Result<()> {
-    // Route message based on direction
-    match message.direction {
-        MessageDirection::In => {
-            // Inbound: mark as sent_agent (message ready for agent to process)
-            message.status = MessageStatus::SentAgent;
-            update_message_status(ctx, &message).await?;
+    for row in rows {
+        let id: Uuid = row.get("id");
+        let chat_id: String = row.get("chat_id");
+        let content_text: Option<String> = row.get("content_text");
+        let media: Option<Value> = row.get("media");
 
-            tracing::info!(
-                "Processed inbound message from chat: {} ({})",
-                message.chat_id,
-                message.id
-            );
-        }
-        MessageDirection::Out => {
-            // Outbound: mark as sent_gateway (message sent to WhatsApp)
-            message.status = MessageStatus::SentGateway;
-            update_message_status(ctx, &message).await?;
-
-            tracing::info!(
-                "Processed outbound message to chat: {} ({})",
-                message.chat_id,
-                message.id
-            );
+        match deliver_outbound_message(&chat_id, content_text.as_deref(), media.as_ref()).await {
+            Ok(gateway_message_id) => {
+                update_status(
+                    ctx.db(),
+                    id,
+                    "sent_gateway",
+                    json!({
+                        "gateway_message_id": gateway_message_id,
+                        "delivered_at": chrono::Utc::now(),
+                    }),
+                )
+                .await?;
+            }
+            Err(err) => {
+                update_status(
+                    ctx.db(),
+                    id,
+                    "failed_gateway",
+                    json!({
+                        "delivery_error": err.to_string(),
+                        "failed_at": chrono::Utc::now(),
+                    }),
+                )
+                .await?;
+            }
         }
     }
 
     Ok(())
 }
 
-#[allow(dead_code)]
-async fn update_message_status(ctx: &DaemonContext, message: &WhatsappMessage) -> Result<()> {
-    let db = ctx.db();
+async fn deliver_outbound_message(
+    chat_id: &str,
+    content_text: Option<&str>,
+    media: Option<&Value>,
+) -> Result<String> {
+    if let Some(media_payload) = media {
+        return deliver_media_message(chat_id, media_payload).await;
+    }
 
+    if let Some(text) = content_text {
+        return send_text_message(chat_id, text).await;
+    }
+
+    Err(ForgeError::Validation(
+        "Outbound message has neither content_text nor media".to_string(),
+    ))
+}
+
+async fn deliver_media_message(chat_id: &str, media: &Value) -> Result<String> {
+    match media_json_kind(media) {
+        Some("reaction") => {
+            let emoji = media.get("emoji").and_then(Value::as_str).unwrap_or("👍");
+            let target_message_id = media
+                .get("in_reply_to_message_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ForgeError::Validation(
+                        "Reaction media payload missing in_reply_to_message_id".to_string(),
+                    )
+                })?;
+            let participant = media.get("participant").and_then(Value::as_str);
+
+            send_reaction_message(chat_id, target_message_id, participant, emoji).await
+        }
+        Some("asset_media") => {
+            let asset = media
+                .get("asset")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ForgeError::Validation("asset_media missing asset".to_string()))?;
+            let media_type = media
+                .get("media_type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ForgeError::Validation("asset_media missing media_type".to_string())
+                })?;
+
+            send_asset_media_message(chat_id, asset, media_type).await
+        }
+        Some(other) => Err(ForgeError::Validation(format!(
+            "Unsupported outbound media kind: {}",
+            other
+        ))),
+        None => Err(ForgeError::Validation(
+            "Outbound media payload missing kind".to_string(),
+        )),
+    }
+}
+
+async fn update_status(
+    db: &sqlx::PgPool,
+    id: Uuid,
+    status: &str,
+    metadata_patch: Value,
+) -> Result<()> {
     sqlx::query(
         r#"
         UPDATE whatsapp_messages
-        SET status = $1, updated_at = NOW()
-        WHERE id = $2
+        SET status = $1::message_status,
+            metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb,
+            updated_at = NOW()
+        WHERE id = $3
         "#,
     )
-    .bind(format!("{:?}", message.status).to_lowercase())
-    .bind(message.id)
+    .bind(status)
+    .bind(metadata_patch)
+    .bind(id)
     .execute(db)
     .await?;
 
     Ok(())
 }
 
+fn internal_rpc_endpoint(function_name: &str) -> String {
+    let base = std::env::var("FORGE_INTERNAL_BASE_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
+        .trim_end_matches('/')
+        .to_string();
+    format!("{}/rpc/{}", base, function_name)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_direction, parse_status};
-    use crate::schema::{MessageDirection, MessageStatus};
-    use crate::utils::test_db::setup::{init_test_db_with_vector, is_pgvector_unavailable};
-    use serde_json::json;
-    use sqlx::Row;
-    use uuid::Uuid;
+    use super::internal_rpc_endpoint;
 
-    async fn setup_db() -> Option<(forge::testing::IsolatedTestDb, sqlx::PgPool)> {
-        match init_test_db_with_vector("ambassador_test").await {
-            Ok(db) => {
-                let pool = db.pool().clone();
-                Some((db, pool))
-            }
-            Err(err) if is_pgvector_unavailable(err.as_ref()) => {
-                eprintln!("Skipping ambassador DB test: {}", err);
-                None
-            }
-            Err(err) => panic!("Failed to initialize test database: {}", err),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_message_direction_parsing() {
-        assert!(matches!(parse_direction("in"), MessageDirection::In));
-        assert!(matches!(parse_direction("out"), MessageDirection::Out));
-    }
-
-    #[tokio::test]
-    async fn test_message_status_parsing() {
-        assert!(matches!(
-            parse_status("pending_agent"),
-            MessageStatus::PendingAgent
-        ));
-        assert!(matches!(
-            parse_status("sent_agent"),
-            MessageStatus::SentAgent
-        ));
-        assert!(matches!(
-            parse_status("pending_gateway"),
-            MessageStatus::PendingGateway
-        ));
-        assert!(matches!(
-            parse_status("sent_gateway"),
-            MessageStatus::SentGateway
-        ));
-        assert!(matches!(
-            parse_status("failed_gateway"),
-            MessageStatus::FailedGateway
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_insert_message_into_database() {
-        let Some((_db, pool)) = setup_db().await else {
-            return;
-        };
-        let message_id = Uuid::new_v4();
-
-        sqlx::query(
-            r#"
-            INSERT INTO whatsapp_messages (
-                id, chat_id, direction, status, content_text, metadata
-            ) VALUES ($1, $2, $3::message_direction, $4::message_status, $5, $6)
-            "#,
-        )
-        .bind(message_id)
-        .bind("test_chat_123")
-        .bind("in")
-        .bind("pending_agent")
-        .bind(Some("Hello, world!"))
-        .bind(json!({"whatsapp_id": "wamsg123"}))
-        .execute(&pool)
-        .await
-        .expect("Failed to insert test message");
-
-        let result = sqlx::query("SELECT status::TEXT FROM whatsapp_messages WHERE id = $1")
-            .bind(message_id)
-            .fetch_one(&pool)
-            .await
-            .expect("Failed to fetch message");
-
-        let status: String = result.get("status");
-        assert_eq!(status, "pending_agent");
-    }
-
-    #[tokio::test]
-    async fn test_message_with_agent_id() {
-        let Some((_db, pool)) = setup_db().await else {
-            return;
-        };
-        let agent_id = Uuid::new_v4();
-        let message_id = Uuid::new_v4();
-
-        sqlx::query(
-            r#"
-            INSERT INTO whatsapp_messages (
-                id, chat_id, direction, agent_id, status, content_text, metadata
-            ) VALUES ($1, $2, $3::message_direction, $4, $5::message_status, $6, $7)
-            "#,
-        )
-        .bind(message_id)
-        .bind("test_chat_agent")
-        .bind("in")
-        .bind(agent_id)
-        .bind("sent_agent")
-        .bind(Some("Routed to agent"))
-        .bind(json!({"agent": agent_id.to_string()}))
-        .execute(&pool)
-        .await
-        .expect("Failed to insert message with agent");
-
-        let result = sqlx::query("SELECT agent_id FROM whatsapp_messages WHERE id = $1")
-            .bind(message_id)
-            .fetch_one(&pool)
-            .await
-            .expect("Failed to fetch message");
-
-        let fetched_agent_id: Option<Uuid> = result.get("agent_id");
-        assert_eq!(fetched_agent_id, Some(agent_id));
+    #[test]
+    fn test_internal_rpc_endpoint_default() {
+        let endpoint = internal_rpc_endpoint("process_whatsapp_message_job");
+        assert!(endpoint.ends_with("/rpc/process_whatsapp_message_job"));
     }
 }

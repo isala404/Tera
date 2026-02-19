@@ -13,6 +13,9 @@ pub mod setup {
         msg.contains("pgvector extension is REQUIRED")
             || msg.contains("extension \"vector\" is not available")
             || msg.contains("could not open extension control file")
+            || msg.contains("Failed to setup embedded Postgres")
+            || msg.contains("could not create shared memory segment")
+            || msg.contains("No space left on device")
     }
 
     /// Initialize a test database with pgvector extension (REQUIRED)
