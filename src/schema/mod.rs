@@ -1,2 +1,2 @@
-// Define your models here
-// Example: pub mod user;
+pub mod whatsapp_message;
+pub use whatsapp_message::*;

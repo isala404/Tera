@@ -41,7 +41,7 @@ services:
         condition: service_healthy
 
   db:
-    image: postgres:18
+    image: pgvector/pgvector:pg18
     env_file:
       - .env
     ports:

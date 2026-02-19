@@ -2,6 +2,7 @@ use forge::prelude::*;
 
 mod functions;
 mod schema;
+mod utils;
 
 #[cfg(feature = "embedded-frontend")]
 mod embedded {
@@ -68,6 +69,9 @@ async fn main() -> Result<()> {
 
     // Register your workflows here:
     // builder.workflow_registry_mut().register::<functions::MyWorkflow>();
+
+    // Register your daemons here:
+    // Note: Ambassador daemon will be auto-registered by Forge framework
 
     #[cfg(feature = "embedded-frontend")]
     builder.frontend_handler(embedded::serve_frontend);

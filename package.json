@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "scripts": {
+    "lint": "cd frontend && bun lint",
+    "format": "cd frontend && bun format"
+  }
+}
