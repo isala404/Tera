@@ -1,0 +1,4 @@
+.forge/
+build/
+.svelte-kit/
+dist/

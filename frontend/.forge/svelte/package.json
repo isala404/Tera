@@ -1,0 +1,16 @@
+{
+  "name": "@forge/svelte",
+  "version": "0.2.1",
+  "type": "module",
+  "main": "./index.ts",
+  "types": "./index.ts",
+  "exports": {
+    ".": "./index.ts",
+    "./client": "./client.ts",
+    "./stores": "./stores.ts",
+    "./context": "./context.ts"
+  },
+  "peerDependencies": {
+    "svelte": "^5.0.0"
+  }
+}

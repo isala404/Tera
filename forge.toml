@@ -1,0 +1,82 @@
+# FORGE Configuration
+# See https://tryforge.dev/docs/api/configuration for all options
+
+[project]
+name = "tera"
+# version = "0.1.0"
+
+[database]
+mode = "remote"
+url = "${DATABASE_URL}"
+# pool_size = 50
+# statement_timeout_secs = 30
+# replica_urls = ["${DATABASE_REPLICA_URL}"]  # Read replica for scaling reads
+# read_from_replica = false
+
+# --- Embedded mode (for development) ---
+# mode = "embedded"
+# data_dir = ".forge/postgres"
+
+[gateway]
+port = 8080
+# host = "0.0.0.0"
+cors_origins = ["http://localhost:5173"]
+
+[observability]
+enabled = true
+# log_level = "info"  # debug, info, warn, error
+# metrics_flush_interval = "10s"
+# enable_metrics = true
+# enable_logging = true
+# enable_tracing = true
+# otlp_endpoint = "http://localhost:4317"  # OpenTelemetry collector
+
+# [function]
+# default_timeout = 30  # seconds
+# cache_enabled = true
+
+# [worker]
+# enabled = true
+# concurrency = 4       # max concurrent jobs
+# poll_interval = 1000  # milliseconds
+
+# [auth]
+# jwt_algorithm = "HS256"           # HS256, HS384, HS512, RS256, RS384, RS512
+#
+# --- HMAC (HS256/HS384/HS512) - symmetric, use for self-issued tokens ---
+# jwt_secret = "${JWT_SECRET}"      # Shared secret for signing/verifying
+#
+# --- RSA (RS256/RS384/RS512) - asymmetric, use for external providers ---
+# jwks_url = ""                     # Provider's JWKS endpoint for public keys
+#
+# --- Claims validation (recommended for external providers) ---
+# jwt_issuer = ""                   # Expected `iss` claim
+# jwt_audience = ""                 # Expected `aud` claim
+#
+# --- Common provider JWKS URLs ---
+# Firebase:  https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com
+# Auth0:     https://YOUR_DOMAIN.auth0.com/.well-known/jwks.json
+# Clerk:     https://YOUR_DOMAIN.clerk.accounts.dev/.well-known/jwks.json
+# Supabase:  https://YOUR_PROJECT.supabase.co/auth/v1/jwks
+#
+# Firebase example:
+#   jwt_algorithm = "RS256"
+#   jwks_url = "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com"
+#   jwt_issuer = "https://securetoken.google.com/YOUR_PROJECT_ID"
+#   jwt_audience = "YOUR_PROJECT_ID"
+
+# [rate_limit]
+# enabled = true
+# requests = 100
+# per = "1m"
+# key = "user"  # user, ip, tenant, user_action, global
+
+# [cluster]
+# enabled = true
+# heartbeat_interval = "5s"
+# leader_election_timeout = "30s"
+# node_name = "node-1"  # Optional, auto-generated if not set
+
+# [node]
+# roles = ["gateway", "function", "worker", "scheduler"]
+# worker_capabilities = ["general"]  # general, gpu, high_cpu
