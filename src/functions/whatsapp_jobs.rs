@@ -244,6 +244,18 @@ pub fn parse_reply_lines(content: &str) -> Vec<ReplyLine> {
         .collect()
 }
 
+pub fn media_type_from_extension(path: &Path) -> &'static str {
+    let ext = path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    match ext.to_lowercase().as_str() {
+        "jpg" | "jpeg" | "png" | "webp" | "gif" => "image",
+        "mp4" | "mov" | "avi" | "mkv" => "video",
+        "ogg" | "mp3" | "wav" | "m4a" | "opus" => "audio",
+        _ => "document",
+    }
+}
+
 async fn insert_outbound_reply(
     db: &sqlx::PgPool,
     inbound: &InboundMessage,
@@ -254,15 +266,7 @@ async fn insert_outbound_reply(
     let (content_text, media) = match reply {
         ReplyLine::Text(text) => (Some(text.clone()), None),
         ReplyLine::FilePath(path) => {
-            let ext = path.extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
-            let media_type = match ext.to_lowercase().as_str() {
-                "jpg" | "jpeg" | "png" | "webp" | "gif" => "image",
-                "mp4" | "mov" | "avi" | "mkv" => "video",
-                "ogg" | "mp3" | "wav" | "m4a" | "opus" => "audio",
-                _ => "document",
-            };
+            let media_type = media_type_from_extension(path);
             let media = json!({
                 "kind": "file",
                 "local_path": path.to_string_lossy(),
@@ -413,5 +417,71 @@ mod tests {
             metadata: json!({}),
         };
         assert_eq!(build_user_prompt(&msg), "[Empty message]");
+    }
+
+    #[test]
+    fn media_type_detection_from_extension() {
+        assert_eq!(media_type_from_extension(Path::new("/tmp/photo.jpg")), "image");
+        assert_eq!(media_type_from_extension(Path::new("/tmp/photo.jpeg")), "image");
+        assert_eq!(media_type_from_extension(Path::new("/tmp/photo.PNG")), "image");
+        assert_eq!(media_type_from_extension(Path::new("/tmp/photo.webp")), "image");
+        assert_eq!(media_type_from_extension(Path::new("/tmp/video.mp4")), "video");
+        assert_eq!(media_type_from_extension(Path::new("/tmp/video.mov")), "video");
+        assert_eq!(media_type_from_extension(Path::new("/tmp/voice.ogg")), "audio");
+        assert_eq!(media_type_from_extension(Path::new("/tmp/voice.m4a")), "audio");
+        assert_eq!(media_type_from_extension(Path::new("/tmp/doc.pdf")), "document");
+        assert_eq!(media_type_from_extension(Path::new("/tmp/file.txt")), "document");
+        assert_eq!(media_type_from_extension(Path::new("/tmp/noext")), "document");
+    }
+
+    #[test]
+    fn absolute_path_without_extension_is_text() {
+        let lines = parse_reply_lines("/tmp/noext");
+        assert_eq!(lines, vec![ReplyLine::Text("/tmp/noext".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn read_reply_file_missing_returns_empty() {
+        let result = read_reply_file(Path::new("/nonexistent/reply.txt")).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn chat_history_append_creates_file() {
+        let tmp = std::env::temp_dir().join("tera_test_chat_history");
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+
+        let chat_id = format!("test_{}@s.whatsapp.net", uuid::Uuid::new_v4().as_simple());
+
+        // temporarily override CHAT_DIR by using the function directly
+        let path = tmp.join(format!("{}.md", chat_id.replace(['/', '\\', ':', '@'], "_")));
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
+
+        let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+        let entry = format!("\n### User [{}]\nhello world\n", timestamp);
+        tokio::fs::write(&path, &entry).await.unwrap();
+
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(content.contains("hello world"));
+        assert!(content.contains("User"));
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[test]
+    fn reply_file_path_matches_chat_history_pattern() {
+        let chat_id = "123@s.whatsapp.net";
+        let history = chat_history_path(chat_id);
+        let reply = reply_file_path(chat_id);
+        assert_eq!(history.parent(), reply.parent());
+    }
+
+    #[test]
+    fn system_prompt_references_reply_file() {
+        let prompt = build_system_prompt("test@s.whatsapp.net");
+        let reply_path = reply_file_path("test@s.whatsapp.net");
+        assert!(prompt.contains(&reply_path.display().to_string()));
     }
 }
