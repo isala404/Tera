@@ -24,7 +24,7 @@ cors_origins = ["http://localhost:5173"]
 
 [observability]
 enabled = true
-# log_level = "info"  # debug, info, warn, error
+log_level = "info"
 # metrics_flush_interval = "10s"
 # enable_metrics = true
 # enable_logging = true

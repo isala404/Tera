@@ -1,9 +1,7 @@
-#![allow(dead_code)]
-
-use crate::utils::whatsapp_client::{
+use crate::utils::gateway::{
     media_json_kind, send_asset_media_message, send_reaction_message, send_text_message,
+    spawn_whatsapp_gateway,
 };
-use crate::utils::whatsapp_runtime::spawn_whatsapp_gateway;
 use forge::prelude::*;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -76,11 +74,16 @@ async fn dispatch_pending_inbound_jobs(ctx: &DaemonContext, http: &reqwest::Clie
     .fetch_all(ctx.db())
     .await?;
 
+    if !rows.is_empty() {
+        tracing::info!(count = rows.len(), "Processing pending inbound messages");
+    }
+
     for row in rows {
         let message_id: Uuid = row.get("id");
 
         match dispatch_processing_job(http, message_id).await {
             Ok(job_id) => {
+                tracing::info!(%message_id, %job_id, "Dispatched processing job");
                 update_status(
                     ctx.db(),
                     message_id,
@@ -93,11 +96,7 @@ async fn dispatch_pending_inbound_jobs(ctx: &DaemonContext, http: &reqwest::Clie
                 .await?;
             }
             Err(err) => {
-                tracing::error!(
-                    "Failed to dispatch job for inbound message {}: {}",
-                    message_id,
-                    err
-                );
+                tracing::error!(%message_id, error = %err, "Failed to dispatch processing job");
             }
         }
     }
@@ -162,14 +161,26 @@ async fn deliver_pending_outbound_messages(ctx: &DaemonContext) -> Result<()> {
     .fetch_all(ctx.db())
     .await?;
 
+    if !rows.is_empty() {
+        tracing::info!(count = rows.len(), "Delivering pending outbound messages");
+    }
+
     for row in rows {
         let id: Uuid = row.get("id");
         let chat_id: String = row.get("chat_id");
         let content_text: Option<String> = row.get("content_text");
         let media: Option<Value> = row.get("media");
 
+        let kind = media
+            .as_ref()
+            .and_then(|m| m.get("kind"))
+            .and_then(Value::as_str)
+            .unwrap_or("text");
+        tracing::info!(%id, %chat_id, %kind, "Delivering outbound message");
+
         match deliver_outbound_message(&chat_id, content_text.as_deref(), media.as_ref()).await {
             Ok(gateway_message_id) => {
+                tracing::info!(%id, %gateway_message_id, "Outbound message delivered");
                 update_status(
                     ctx.db(),
                     id,
@@ -182,6 +193,7 @@ async fn deliver_pending_outbound_messages(ctx: &DaemonContext) -> Result<()> {
                 .await?;
             }
             Err(err) => {
+                tracing::error!(%id, %chat_id, error = %err, "Outbound delivery failed");
                 update_status(
                     ctx.db(),
                     id,
@@ -286,7 +298,7 @@ fn internal_rpc_endpoint(function_name: &str) -> String {
         .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
         .trim_end_matches('/')
         .to_string();
-    format!("{}/rpc/{}", base, function_name)
+    format!("{}/_api/rpc/{}", base, function_name)
 }
 
 #[cfg(test)]
@@ -296,6 +308,6 @@ mod tests {
     #[test]
     fn test_internal_rpc_endpoint_default() {
         let endpoint = internal_rpc_endpoint("process_whatsapp_message_job");
-        assert!(endpoint.ends_with("/rpc/process_whatsapp_message_job"));
+        assert!(endpoint.ends_with("/_api/rpc/process_whatsapp_message_job"));
     }
 }

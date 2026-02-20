@@ -1,6 +1,4 @@
-#![allow(dead_code)]
-
-use crate::utils::whatsapp_client::{send_composing, send_paused};
+use crate::utils::gateway::{send_composing, send_paused};
 use forge::prelude::*;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -31,7 +29,17 @@ pub async fn process_whatsapp_message_job(
     ctx: &JobContext,
     input: ProcessWhatsappMessageJobInput,
 ) -> Result<()> {
-    let inbound = load_inbound_message(ctx.db(), input.message_id).await?;
+    let message_id = input.message_id;
+    tracing::info!(%message_id, "Processing inbound message");
+
+    let inbound = load_inbound_message(ctx.db(), message_id).await?;
+    tracing::info!(
+        %message_id,
+        chat_id = %inbound.chat_id,
+        has_text = inbound.content_text.is_some(),
+        text_preview = inbound.content_text.as_deref().unwrap_or(""),
+        "Loaded inbound message"
+    );
 
     let cancel_typing = CancellationToken::new();
     let typing_task = spawn_typing_heartbeat(inbound.chat_id.clone(), cancel_typing.clone());
@@ -42,8 +50,15 @@ pub async fn process_whatsapp_message_job(
     };
     sleep(Duration::from_secs(delay_secs)).await;
 
-    if let Some(action) = plan_agent_action(inbound.content_text.as_deref()) {
-        insert_outbound_action(ctx.db(), &inbound, action).await?;
+    match plan_agent_action(inbound.content_text.as_deref()) {
+        Some(action) => {
+            tracing::info!(%message_id, ?action, "Planned agent action");
+            insert_outbound_action(ctx.db(), &inbound, action).await?;
+            tracing::info!(%message_id, "Outbound action inserted");
+        }
+        None => {
+            tracing::info!(%message_id, "No action planned for message");
+        }
     }
 
     cancel_typing.cancel();

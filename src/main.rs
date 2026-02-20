@@ -61,17 +61,13 @@ async fn main() -> Result<()> {
     // Register your mutations here:
     // builder.function_registry_mut().register_mutation::<functions::CreateUserMutation>();
 
-    // Register your jobs here:
-    // builder.job_registry_mut().register::<functions::MyJob>();
+    builder
+        .job_registry_mut()
+        .register::<functions::whatsapp_jobs::ProcessWhatsappMessageJobJob>();
 
-    // Register your crons here:
-    // builder.cron_registry_mut().register::<functions::MyCron>();
-
-    // Register your workflows here:
-    // builder.workflow_registry_mut().register::<functions::MyWorkflow>();
-
-    // Register your daemons here:
-    // Note: Ambassador daemon will be auto-registered by Forge framework
+    builder
+        .daemon_registry_mut()
+        .register::<functions::ambassador::AmbassadorDaemon>();
 
     #[cfg(feature = "embedded-frontend")]
     builder.frontend_handler(embedded::serve_frontend);

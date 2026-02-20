@@ -1,21 +1,250 @@
 use async_trait::async_trait;
+use forge::prelude::*;
 use prost::Message;
+use rand::Rng;
+use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
+use uuid::Uuid;
 use wacore::appstate::hash::HashState;
 use wacore::appstate::processor::AppStateMutationMAC;
 use wacore::libsignal::protocol::{KeyPair, PrivateKey, PublicKey};
-use wacore::store::Device as CoreDevice;
+use wacore::proto_helpers::MessageExt;
 use wacore::store::device::DEVICE_PROPS;
 use wacore::store::error::{Result as StoreResult, StoreError};
 use wacore::store::traits::{
     AppStateSyncKey, AppSyncStore, DeviceInfo, DeviceListRecord, DeviceStore, LidPnMappingEntry,
     ProtocolStore, SignalStore, TcTokenEntry,
 };
+use wacore::store::Device as CoreDevice;
+use wacore::types::message::MessageInfo;
 use wacore_binary::jid::Jid;
 use waproto::whatsapp as wa;
 
-/// PostgreSQL-backed storage for WhatsApp protocol state.
+const ADJECTIVES: &[&str] = &[
+    "HAPPY", "LUCKY", "SUNNY", "FAST", "BRIGHT", "COOL", "MAGIC", "SUPER", "BLUE", "RED",
+    "GREEN", "GOLD", "SILVER", "BRAVE", "CALM", "WISE",
+];
+const NOUNS: &[&str] = &[
+    "PANDA", "TIGER", "EAGLE", "LION", "MOON", "STAR", "OCEAN", "RIVER", "BEAR", "WOLF", "FOX",
+    "HAWK", "SHIP", "PLANET", "FOREST", "MTN",
+];
+
+pub fn generate_pairing_code() -> String {
+    let mut rng = rand::rng();
+    let adj = ADJECTIVES[rng.random_range(0..ADJECTIVES.len())];
+    let noun = NOUNS[rng.random_range(0..NOUNS.len())];
+    format!("{} {}", adj, noun)
+}
+
+pub enum AuthResult {
+    NewUser,
+    PendingVerification { expired: bool },
+    Authenticated,
+}
+
+pub async fn check_user_auth(db: &PgPool, sender_jid: &str) -> AuthResult {
+    let row: Option<(bool, i64)> =
+        match sqlx::query_as("SELECT is_authenticated, created_at FROM users WHERE jid = $1")
+            .bind(sender_jid)
+            .fetch_optional(db)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("Failed to query user: {}", e);
+                return AuthResult::NewUser;
+            }
+        };
+
+    match row {
+        None => AuthResult::NewUser,
+        Some((false, created_at)) => {
+            let expired = (chrono::Utc::now().timestamp() - created_at) > 180;
+            AuthResult::PendingVerification { expired }
+        }
+        Some((true, _)) => AuthResult::Authenticated,
+    }
+}
+
+pub async fn create_new_user(db: &PgPool, sender_jid: &str) -> Option<String> {
+    let code = generate_pairing_code();
+    let now = chrono::Utc::now().timestamp();
+
+    if let Err(e) = sqlx::query(
+        "INSERT INTO users (jid, pairing_code, is_authenticated, created_at, last_seen) VALUES ($1, $2, FALSE, $3, $4)",
+    )
+    .bind(sender_jid)
+    .bind(&code)
+    .bind(now)
+    .bind(now)
+    .execute(db)
+    .await
+    {
+        tracing::error!("Failed to create user: {}", e);
+        return None;
+    }
+
+    tracing::info!(
+        "New user verification required: jid={} code={}",
+        sender_jid,
+        code
+    );
+    Some(code)
+}
+
+pub async fn regenerate_pairing_code(db: &PgPool, sender_jid: &str) -> Option<String> {
+    let new_code = generate_pairing_code();
+    let now = chrono::Utc::now().timestamp();
+
+    if let Err(e) =
+        sqlx::query("UPDATE users SET pairing_code = $1, created_at = $2 WHERE jid = $3")
+            .bind(&new_code)
+            .bind(now)
+            .bind(sender_jid)
+            .execute(db)
+            .await
+    {
+        tracing::error!("Failed to regenerate pairing code: {}", e);
+        return None;
+    }
+
+    tracing::info!("Code expired: jid={} new_code={}", sender_jid, new_code);
+    Some(new_code)
+}
+
+pub async fn get_stored_pairing_code(db: &PgPool, sender_jid: &str) -> Option<String> {
+    sqlx::query_scalar("SELECT pairing_code FROM users WHERE jid = $1")
+        .bind(sender_jid)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+}
+
+pub async fn authenticate_user(db: &PgPool, sender_jid: &str) {
+    if let Err(e) =
+        sqlx::query("UPDATE users SET is_authenticated = TRUE, last_seen = $1 WHERE jid = $2")
+            .bind(chrono::Utc::now().timestamp())
+            .bind(sender_jid)
+            .execute(db)
+            .await
+    {
+        tracing::error!("Failed to authenticate user: {}", e);
+    }
+}
+
+pub async fn update_last_seen(db: &PgPool, sender_jid: &str) {
+    let _ = sqlx::query("UPDATE users SET last_seen = $1 WHERE jid = $2")
+        .bind(chrono::Utc::now().timestamp())
+        .bind(sender_jid)
+        .execute(db)
+        .await;
+}
+
+pub async fn persist_inbound_message(
+    db: &PgPool,
+    msg: &wa::Message,
+    info: &MessageInfo,
+) -> Result<Uuid> {
+    let media = extract_inbound_media(msg);
+    let content_text = if media.is_some() {
+        None
+    } else {
+        msg.text_content().map(ToOwned::to_owned)
+    };
+
+    let row_id = Uuid::new_v4();
+    let metadata = json!({
+        "whatsapp_message_id": info.id,
+        "chat_jid": info.source.chat.to_string(),
+        "sender_jid": info.source.sender.to_string(),
+        "is_group": info.source.is_group,
+        "is_from_me": info.source.is_from_me,
+        "received_at": chrono::Utc::now(),
+    });
+
+    sqlx::query(
+        r#"
+        INSERT INTO whatsapp_messages (
+            id, chat_id, direction, status, content_text, media, metadata
+        )
+        VALUES (
+            $1,
+            $2,
+            $3::message_direction,
+            $4::message_status,
+            $5,
+            $6,
+            $7
+        )
+        "#,
+    )
+    .bind(row_id)
+    .bind(info.source.chat.to_string())
+    .bind("in")
+    .bind("pending_agent")
+    .bind(content_text)
+    .bind(media)
+    .bind(metadata)
+    .execute(db)
+    .await?;
+
+    Ok(row_id)
+}
+
+pub fn extract_inbound_media(msg: &wa::Message) -> Option<Value> {
+    let base = msg.get_base_message();
+
+    if let Some(image) = &base.image_message {
+        return Some(json!({
+            "kind": "image",
+            "caption": image.caption,
+            "mimetype": image.mimetype,
+            "file_length": image.file_length,
+        }));
+    }
+
+    if let Some(video) = &base.video_message {
+        return Some(json!({
+            "kind": "video",
+            "caption": video.caption,
+            "mimetype": video.mimetype,
+            "file_length": video.file_length,
+        }));
+    }
+
+    if let Some(audio) = &base.audio_message {
+        return Some(json!({
+            "kind": "audio",
+            "mimetype": audio.mimetype,
+            "file_length": audio.file_length,
+            "ptt": audio.ptt,
+            "seconds": audio.seconds,
+        }));
+    }
+
+    if let Some(document) = &base.document_message {
+        return Some(json!({
+            "kind": "document",
+            "title": document.title,
+            "file_name": document.file_name,
+            "mimetype": document.mimetype,
+            "file_length": document.file_length,
+        }));
+    }
+
+    if let Some(sticker) = &base.sticker_message {
+        return Some(json!({
+            "kind": "sticker",
+            "mimetype": sticker.mimetype,
+            "is_animated": sticker.is_animated,
+        }));
+    }
+
+    None
+}
+
 #[derive(Clone)]
 pub struct PostgresStore {
     pool: Arc<PgPool>,
@@ -23,19 +252,8 @@ pub struct PostgresStore {
 }
 
 impl PostgresStore {
-    #[allow(dead_code)]
     pub fn new(pool: Arc<PgPool>) -> Self {
         Self { pool, device_id: 1 }
-    }
-
-    #[allow(dead_code)]
-    pub fn new_for_device(pool: Arc<PgPool>, device_id: i32) -> Self {
-        Self { pool, device_id }
-    }
-
-    #[allow(dead_code)]
-    pub fn pool(&self) -> Arc<PgPool> {
-        Arc::clone(&self.pool)
     }
 
     fn serialize_keypair(key_pair: &KeyPair) -> Vec<u8> {
@@ -1125,11 +1343,12 @@ impl DeviceStore for PostgresStore {
 
 #[cfg(test)]
 mod tests {
-    use super::PostgresStore;
+    use super::{extract_inbound_media, generate_pairing_code, PostgresStore};
     use crate::utils::test_db::setup::{init_test_db_with_vector, is_pgvector_unavailable};
     use forge::testing::IsolatedTestDb;
     use std::sync::Arc;
     use wacore::store::traits::{DeviceStore, LidPnMappingEntry, ProtocolStore, SignalStore};
+    use waproto::whatsapp as wa;
 
     struct TestStore {
         _db: IsolatedTestDb,
@@ -1143,7 +1362,7 @@ mod tests {
                 Some(TestStore { _db: db, store })
             }
             Err(err) if is_pgvector_unavailable(err.as_ref()) => {
-                eprintln!("Skipping whatsapp_store DB test: {}", err);
+                eprintln!("Skipping store DB test: {}", err);
                 None
             }
             Err(err) => panic!("test db should initialize: {}", err),
@@ -1238,5 +1457,41 @@ mod tests {
             .expect("get_pn_mapping should work")
             .expect("mapping should exist");
         assert_eq!(by_pn.lid, entry.lid);
+    }
+
+    #[test]
+    fn test_generate_pairing_code_format() {
+        let code = generate_pairing_code();
+        let parts: Vec<&str> = code.split_whitespace().collect();
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].chars().all(|c| c.is_ascii_uppercase()));
+        assert!(parts[1].chars().all(|c| c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn test_extract_inbound_media_image() {
+        let msg = wa::Message {
+            image_message: Some(Box::new(wa::message::ImageMessage {
+                caption: Some("caption".to_string()),
+                mimetype: Some("image/jpeg".to_string()),
+                file_length: Some(123),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let media = extract_inbound_media(&msg).expect("image media should be extracted");
+        assert_eq!(media["kind"], "image");
+        assert_eq!(media["caption"], "caption");
+    }
+
+    #[test]
+    fn test_extract_inbound_media_none_for_plain_text() {
+        let msg = wa::Message {
+            conversation: Some("hello".to_string()),
+            ..Default::default()
+        };
+
+        assert!(extract_inbound_media(&msg).is_none());
     }
 }
