@@ -178,10 +178,7 @@ async fn run_claude_agent(inbound: &InboundMessage) -> Result<Vec<ReplyLine>> {
     let user_prompt = build_user_prompt(inbound);
     let reply_path = reply_file_path(&inbound.chat_id);
 
-    // append inbound message to history
     append_to_chat_history(&inbound.chat_id, "User", &user_prompt).await?;
-
-    // clean up any stale reply file
     let _ = tokio::fs::remove_file(&reply_path).await;
 
     let full_prompt = format!("{}\n\n---\nUser message:\n{}", system_prompt, user_prompt);
@@ -204,7 +201,6 @@ async fn run_claude_agent(inbound: &InboundMessage) -> Result<Vec<ReplyLine>> {
 
     let reply_lines = read_reply_file(&reply_path).await?;
 
-    // append agent replies to history
     let reply_text: Vec<String> = reply_lines.iter().map(|l| match l {
         ReplyLine::Text(t) => t.clone(),
         ReplyLine::FilePath(p) => format!("[File: {}]", p.display()),
@@ -214,7 +210,6 @@ async fn run_claude_agent(inbound: &InboundMessage) -> Result<Vec<ReplyLine>> {
         append_to_chat_history(&inbound.chat_id, "Assistant", &reply_text.join("\n")).await?;
     }
 
-    // clean up reply file
     let _ = tokio::fs::remove_file(&reply_path).await;
 
     Ok(reply_lines)

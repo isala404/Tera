@@ -333,12 +333,10 @@ mod tests {
     }
 
     #[test]
-    fn test_chat_buffer_ready_when_idle_and_debounced() {
+    fn test_empty_buffer_never_ready_even_after_debounce() {
         let mut buffer = ChatBuffer::new();
-        // simulate having a message by directly manipulating the vec count check
         buffer.typing_state = TypingState::Idle;
         buffer.last_activity = Instant::now() - Duration::from_secs(4);
-        // empty buffer is never ready regardless of timing
         assert!(!buffer.is_ready_to_flush());
     }
 

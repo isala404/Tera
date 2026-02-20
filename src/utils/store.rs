@@ -203,12 +203,7 @@ pub async fn persist_inbound_message(
         m.insert("local_path".to_string(), Value::String(local_path));
     }
 
-    let content_text = if media.is_some() {
-        // keep caption as text if present
-        msg.text_content().map(ToOwned::to_owned)
-    } else {
-        msg.text_content().map(ToOwned::to_owned)
-    };
+    let content_text = msg.text_content().map(ToOwned::to_owned);
 
     let row_id = Uuid::new_v4();
     let metadata = json!({
