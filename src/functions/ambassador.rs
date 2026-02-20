@@ -1,5 +1,5 @@
 use crate::utils::gateway::{
-    media_json_kind, send_asset_media_message, send_reaction_message, send_text_message,
+    media_json_kind, send_file_message, send_reaction_message, send_text_message,
     spawn_whatsapp_gateway,
 };
 use forge::prelude::*;
@@ -245,19 +245,19 @@ async fn deliver_media_message(chat_id: &str, media: &Value) -> Result<String> {
 
             send_reaction_message(chat_id, target_message_id, participant, emoji).await
         }
-        Some("asset_media") => {
-            let asset = media
-                .get("asset")
+        Some("file") => {
+            let local_path = media
+                .get("local_path")
                 .and_then(Value::as_str)
-                .ok_or_else(|| ForgeError::Validation("asset_media missing asset".to_string()))?;
+                .ok_or_else(|| ForgeError::Validation("file media missing local_path".to_string()))?;
             let media_type = media
                 .get("media_type")
                 .and_then(Value::as_str)
                 .ok_or_else(|| {
-                    ForgeError::Validation("asset_media missing media_type".to_string())
+                    ForgeError::Validation("file media missing media_type".to_string())
                 })?;
 
-            send_asset_media_message(chat_id, asset, media_type).await
+            send_file_message(chat_id, local_path, media_type).await
         }
         Some(other) => Err(ForgeError::Validation(format!(
             "Unsupported outbound media kind: {}",

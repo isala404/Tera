@@ -142,14 +142,70 @@ pub async fn update_last_seen(db: &PgPool, sender_jid: &str) {
         .await;
 }
 
+async fn download_inbound_media(
+    msg: &wa::Message,
+    client: &Arc<whatsapp_rust::client::Client>,
+) -> Option<String> {
+    use crate::utils::gateway::DOWNLOAD_DIR;
+
+    let base = msg.get_base_message();
+
+    let (downloadable, ext) = if base.image_message.is_some() {
+        (base.image_message.as_ref().map(|m| &**m as &dyn wacore::download::Downloadable), "jpg")
+    } else if base.video_message.is_some() {
+        (base.video_message.as_ref().map(|m| &**m as &dyn wacore::download::Downloadable), "mp4")
+    } else if base.audio_message.is_some() {
+        (base.audio_message.as_ref().map(|m| &**m as &dyn wacore::download::Downloadable), "ogg")
+    } else if base.document_message.is_some() {
+        (base.document_message.as_ref().map(|m| &**m as &dyn wacore::download::Downloadable), "bin")
+    } else {
+        return None;
+    };
+
+    let downloadable = downloadable?;
+    let filename = format!("{}_{}.{}", chrono::Utc::now().timestamp_millis(), Uuid::new_v4().as_simple(), ext);
+    let file_path = std::path::Path::new(DOWNLOAD_DIR).join(&filename);
+
+    match client.download(downloadable).await {
+        Ok(data) => {
+            if let Err(e) = tokio::fs::create_dir_all(DOWNLOAD_DIR).await {
+                tracing::error!("Failed to create download dir: {}", e);
+                return None;
+            }
+            if let Err(e) = tokio::fs::write(&file_path, &data).await {
+                tracing::error!("Failed to write downloaded media: {}", e);
+                return None;
+            }
+            let abs_path = std::fs::canonicalize(&file_path).ok()?;
+            tracing::info!(path = %abs_path.display(), size = data.len(), "Downloaded inbound media");
+            Some(abs_path.to_string_lossy().to_string())
+        }
+        Err(e) => {
+            tracing::error!("Failed to download media: {}", e);
+            None
+        }
+    }
+}
+
 pub async fn persist_inbound_message(
     db: &PgPool,
     msg: &wa::Message,
     info: &MessageInfo,
+    client: Option<&Arc<whatsapp_rust::client::Client>>,
 ) -> Result<Uuid> {
-    let media = extract_inbound_media(msg);
+    let mut media = extract_inbound_media(msg);
+
+    // download media to local file if client available
+    if let (Some(media_val), Some(client)) = (&mut media, client)
+        && let Some(local_path) = download_inbound_media(msg, client).await
+        && let Some(m) = media_val.as_object_mut()
+    {
+        m.insert("local_path".to_string(), Value::String(local_path));
+    }
+
     let content_text = if media.is_some() {
-        None
+        // keep caption as text if present
+        msg.text_content().map(ToOwned::to_owned)
     } else {
         msg.text_content().map(ToOwned::to_owned)
     };
