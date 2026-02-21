@@ -17,8 +17,6 @@ use whatsapp_rust::client::Client;
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
 
-pub const DOWNLOAD_DIR: &str = "downloads";
-
 const RESTART_DELAY_SECS: u64 = 5;
 
 static ACTIVE_CLIENT: OnceLock<RwLock<Option<Arc<Client>>>> = OnceLock::new();
@@ -291,9 +289,6 @@ async fn run_whatsapp_gateway_forever(pool: Arc<PgPool>) {
 }
 
 async fn run_gateway_once(pool: Arc<PgPool>) -> Result<()> {
-    if let Err(err) = std::fs::create_dir_all(DOWNLOAD_DIR) {
-        tracing::error!("Failed to create downloads directory: {}", err);
-    }
     let backend = Arc::new(PostgresStore::new(pool.clone()));
     let router = EventRouter::new((*pool).clone());
     let router_for_bot = router.clone();

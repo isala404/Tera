@@ -9,7 +9,7 @@ use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-const CHAT_DIR: &str = "chats";
+pub const WORKSPACE_DIR: &str = "workspace";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessWhatsappMessageJobInput {
@@ -95,26 +95,38 @@ async fn load_inbound_message(db: &sqlx::PgPool, message_id: Uuid) -> Result<Inb
     })
 }
 
-fn chat_history_path(chat_id: &str) -> PathBuf {
-    let sanitized = chat_id.replace(['/', '\\', ':', '@'], "_");
-    Path::new(CHAT_DIR).join(format!("{}.md", sanitized))
+pub fn sanitize_chat_id(chat_id: &str) -> String {
+    chat_id.replace(['/', '\\', ':', '@'], "_")
+}
+
+pub fn workspace_dir(chat_id: &str) -> PathBuf {
+    Path::new(WORKSPACE_DIR).join(sanitize_chat_id(chat_id))
+}
+
+pub fn media_dir(chat_id: &str) -> PathBuf {
+    workspace_dir(chat_id).join("media")
+}
+
+fn history_path(chat_id: &str) -> PathBuf {
+    workspace_dir(chat_id).join("HISTORY.md")
 }
 
 fn reply_file_path(chat_id: &str) -> PathBuf {
-    let sanitized = chat_id.replace(['/', '\\', ':', '@'], "_");
-    Path::new(CHAT_DIR).join(format!("{}_reply.txt", sanitized))
+    workspace_dir(chat_id).join("reply.txt")
 }
 
 fn build_system_prompt(chat_id: &str) -> String {
-    let history_path = chat_history_path(chat_id);
+    let ws = workspace_dir(chat_id);
     format!(
         r#"You are an AI assistant communicating with a user via WhatsApp.
 
 Chat ID: {chat_id}
-Chat history file: {history}
+Workspace: {workspace}
+Chat history: {history}
 
 IMPORTANT RULES:
 - Read the chat history file first using Read tool or cat to understand prior context
+- Media files from the user are in {media}/ with relative paths noted in history
 - When the user asks you to do something, do it using your available tools
 - Write your final reply to: {reply}
 - Each line in reply.txt is sent as a separate WhatsApp message
@@ -124,7 +136,9 @@ IMPORTANT RULES:
 - Do NOT include any prefix like "Reply:" just the raw message text
 - If you need to send multiple messages, put each on its own line"#,
         chat_id = chat_id,
-        history = history_path.display(),
+        workspace = ws.display(),
+        history = history_path(chat_id).display(),
+        media = media_dir(chat_id).display(),
         reply = reply_file_path(chat_id).display(),
     )
 }
@@ -148,10 +162,10 @@ fn build_user_prompt(inbound: &InboundMessage) -> String {
 }
 
 async fn append_to_chat_history(chat_id: &str, role: &str, content: &str) -> Result<()> {
-    let path = chat_history_path(chat_id);
+    let path = history_path(chat_id);
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await.map_err(|e| {
-            ForgeError::Internal(format!("Failed to create chat dir: {}", e))
+            ForgeError::Internal(format!("Failed to create workspace dir: {}", e))
         })?;
     }
 
@@ -371,18 +385,28 @@ mod tests {
     }
 
     #[test]
-    fn chat_history_path_sanitizes_jid() {
-        let path = chat_history_path("123456@s.whatsapp.net");
-        assert_eq!(path, PathBuf::from("chats/123456_s.whatsapp.net.md"));
+    fn workspace_dir_structure() {
+        let chat_id = "123456@s.whatsapp.net";
+        let ws = workspace_dir(chat_id);
+        let media = media_dir(chat_id);
+        let history = history_path(chat_id);
+        let reply = reply_file_path(chat_id);
+
+        assert_eq!(ws, PathBuf::from("workspace/123456_s.whatsapp.net"));
+        assert_eq!(media, ws.join("media"));
+        assert_eq!(history, ws.join("HISTORY.md"));
+        assert_eq!(reply, ws.join("reply.txt"));
     }
 
     #[test]
     fn system_prompt_contains_required_elements() {
         let prompt = build_system_prompt("123@s.whatsapp.net");
         assert!(prompt.contains("WhatsApp"));
-        assert!(prompt.contains("reply"));
+        assert!(prompt.contains("HISTORY.md"));
+        assert!(prompt.contains("reply.txt"));
         assert!(prompt.contains("123@s.whatsapp.net"));
-        assert!(prompt.contains("chat history"));
+        assert!(prompt.contains("media"));
+        assert!(prompt.contains("workspace/"));
     }
 
     #[test]
@@ -447,42 +471,9 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    #[tokio::test]
-    async fn chat_history_append_creates_file() {
-        let tmp = std::env::temp_dir().join("tera_test_chat_history");
-        let _ = tokio::fs::remove_dir_all(&tmp).await;
-
-        let chat_id = format!("test_{}@s.whatsapp.net", uuid::Uuid::new_v4().as_simple());
-
-        // temporarily override CHAT_DIR by using the function directly
-        let path = tmp.join(format!("{}.md", chat_id.replace(['/', '\\', ':', '@'], "_")));
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await.unwrap();
-        }
-
-        let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
-        let entry = format!("\n### User [{}]\nhello world\n", timestamp);
-        tokio::fs::write(&path, &entry).await.unwrap();
-
-        let content = tokio::fs::read_to_string(&path).await.unwrap();
-        assert!(content.contains("hello world"));
-        assert!(content.contains("User"));
-
-        let _ = tokio::fs::remove_dir_all(&tmp).await;
-    }
-
     #[test]
-    fn reply_file_path_matches_chat_history_pattern() {
-        let chat_id = "123@s.whatsapp.net";
-        let history = chat_history_path(chat_id);
-        let reply = reply_file_path(chat_id);
-        assert_eq!(history.parent(), reply.parent());
-    }
-
-    #[test]
-    fn system_prompt_references_reply_file() {
-        let prompt = build_system_prompt("test@s.whatsapp.net");
-        let reply_path = reply_file_path("test@s.whatsapp.net");
-        assert!(prompt.contains(&reply_path.display().to_string()));
+    fn sanitize_chat_id_replaces_special_chars() {
+        assert_eq!(sanitize_chat_id("123@s.whatsapp.net"), "123_s.whatsapp.net");
+        assert_eq!(sanitize_chat_id("group:123@g.us"), "group_123_g.us");
     }
 }

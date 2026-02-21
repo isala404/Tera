@@ -25,6 +25,9 @@ pg_data/
 .DS_Store
 Thumbs.db
 
+# Workspace (per-chat agent data)
+workspace/
+
 # Logs
 *.log
 npm-debug.log*

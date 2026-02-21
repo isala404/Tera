@@ -145,8 +145,9 @@ pub async fn update_last_seen(db: &PgPool, sender_jid: &str) {
 async fn download_inbound_media(
     msg: &wa::Message,
     client: &Arc<whatsapp_rust::client::Client>,
+    chat_id: &str,
 ) -> Option<String> {
-    use crate::utils::gateway::DOWNLOAD_DIR;
+    use crate::functions::whatsapp_jobs::media_dir;
 
     let base = msg.get_base_message();
 
@@ -163,13 +164,14 @@ async fn download_inbound_media(
     };
 
     let downloadable = downloadable?;
+    let dir = media_dir(chat_id);
     let filename = format!("{}_{}.{}", chrono::Utc::now().timestamp_millis(), Uuid::new_v4().as_simple(), ext);
-    let file_path = std::path::Path::new(DOWNLOAD_DIR).join(&filename);
+    let file_path = dir.join(&filename);
 
     match client.download(downloadable).await {
         Ok(data) => {
-            if let Err(e) = tokio::fs::create_dir_all(DOWNLOAD_DIR).await {
-                tracing::error!("Failed to create download dir: {}", e);
+            if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+                tracing::error!("Failed to create media dir: {}", e);
                 return None;
             }
             if let Err(e) = tokio::fs::write(&file_path, &data).await {
@@ -196,8 +198,9 @@ pub async fn persist_inbound_message(
     let mut media = extract_inbound_media(msg);
 
     // download media to local file if client available
+    let chat_id_str = info.source.chat.to_string();
     if let (Some(media_val), Some(client)) = (&mut media, client)
-        && let Some(local_path) = download_inbound_media(msg, client).await
+        && let Some(local_path) = download_inbound_media(msg, client, &chat_id_str).await
         && let Some(m) = media_val.as_object_mut()
     {
         m.insert("local_path".to_string(), Value::String(local_path));
