@@ -189,6 +189,7 @@ async fn run_claude_agent(inbound: &InboundMessage) -> Result<Vec<ReplyLine>> {
         .arg("-p")
         .arg(&full_prompt)
         .arg("--dangerously-skip-permissions")
+        .arg("--chrome")
         .output()
         .await
         .map_err(|e| ForgeError::Internal(format!("Failed to spawn claude: {}", e)))?;
