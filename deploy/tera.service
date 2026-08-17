@@ -1,0 +1,57 @@
+# Linux deployment unit for tera (PLAN.md section 6.4).
+#
+# Install as a user service so the daemon runs as the account that owns the Codex
+# credentials and the WhatsApp pairing:
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/tera.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now tera
+#   journalctl --user -u tera -f
+#
+# For it to keep running while you are not logged in:
+#
+#   sudo loginctl enable-linger "$USER"
+
+[Unit]
+Description=Personal assistant daemon (tera)
+Documentation=file:%h/assistant-workspace/AGENTS.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/tera daemon --workspace %h/assistant-workspace
+WorkingDirectory=%h
+
+# What the assistant calls you, in every prompt and instruction file. Falls back
+# to the login name, which is usually right but rarely what you want written into
+# a greeting. `tera status` prints whichever it resolved.
+# Environment=TERA_OWNER=Ada Lovelace
+
+# The owner check is closed by default: with no JID set, only the paired
+# account's own messages are served. Set it explicitly once you know your id , 
+# it is printed in the log the first time a message is ignored.
+# Environment=WHATSAPP_OWNER_JID=947xxxxxxxx
+
+Environment=RUST_LOG=info,tera=debug
+
+# Restart, but not in a tight loop: a failure at startup is usually a missing
+# credential or a broken workspace, and hammering it will not fix either.
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# SIGINT, because that is what the shutdown path listens for: it clears the
+# typing indicator and removes the runtime socket before exiting.
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+# The assistant runs Codex with full disk access by design, so sandboxing the
+# unit would only break it. What is worth having is a memory ceiling, so a
+# runaway turn cannot take the machine with it.
+MemoryMax=8G
+
+[Install]
+WantedBy=default.target

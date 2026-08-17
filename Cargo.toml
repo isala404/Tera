@@ -2,33 +2,33 @@
 name = "tera"
 version = "0.1.0"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+authors = ["Isala Piyarisi <mail@isala.me>"]
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/isala404/Tera"
+description = "Persistent personal helper daemon, SQLite event store, Codex App Server integration, MCP server, and memory engine"
 
 [dependencies]
-anyhow = "1.0.75"
-candle-core = { git = "https://github.com/huggingface/candle", branch = "main" }
-candle-transformers = { git = "https://github.com/huggingface/candle", branch = "main" }
-candle-nn = { git = "https://github.com/huggingface/candle", branch = "main" }
-tokenizers = "0.15.0"
-tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
+tokio = { version = "1.43", features = ["full"] }
+# Held at 0.39, not stale. 0.40 wants libsqlite3-sys 0.38 while
+# whatsapp-rust-sqlite-storage pins ^0.37, and only one crate in the graph may
+# link the native sqlite3 library. Moves when whatsapp-rust does.
+rusqlite = { version = "0.39", features = ["bundled", "chrono"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+anyhow = "1.0"
 tracing = "0.1"
-tracing-subscriber = "0.3"
-hf-hub = { version = "0.3.2", features = ["tokio"] }
-clap = { version = "4.4.11", features = ["derive"] }
-serde_json = "1.0.108"
-tracing-chrome = "0.7.1"
-lazy_static = "1.4.0"
-surrealdb = { version = "1.0.0", features = ["kv-rocksdb"] }
-serde = { version = "1.0.193", features = ["derive"] }
-async_once = "0.2.6"
-reqwest = "0.11.22"
-regex = "1.10.2"
-chrono = "0.4.31"
-pdf-extract = "0.7.2"
-byteorder = "1.5.0"
-wav = "1.0.0"
-rand = "0.8.5"
-tempfile = "3.8.0"
-dirs = "5.0.1"
-prettytable-rs = "0.10.0"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.13", features = ["v4", "serde"] }
+async-trait = "0.1"
+cron = "0.17"
+libc = "0.2"
+whatsapp-rust = { version = "0.7", default-features = false, features = ["tokio-transport", "sqlite-storage", "ureq-client", "tokio-runtime"] }
+whatsapp-rust-sqlite-storage = "0.7"
+whatsapp-rust-tokio-transport = { version = "0.7", default-features = false }
+whatsapp-rust-ureq-http-client = "0.7"
+qrcode = { version = "0.14.1", default-features = false }
+
+[dev-dependencies]
+tempfile = "3.27"

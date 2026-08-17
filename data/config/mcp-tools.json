@@ -1,0 +1,70 @@
+[
+  {
+    "name": "send_message",
+    "description": "Send a WhatsApp message to {{OWNER}}. This is the ONLY way to reach them. Text you return at the end of a turn is a fallback inside a conversation, and nothing at all from a scheduled task. Plain text, no markdown: no headings, bold, bullet lists or tables. Short. Batch several things into one message rather than sending three.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "text": { "type": "string", "description": "Message text. Plain, short, no markdown." },
+        "image_path": { "type": "string", "description": "Path to an image file: absolute, or relative to the workspace root" },
+        "video_path": { "type": "string", "description": "Path to a video file: absolute, or relative to the workspace root" },
+        "audio_path": { "type": "string", "description": "Path to an audio file: absolute, or relative to the workspace root" }
+      }
+    }
+  },
+  {
+    "name": "react",
+    "description": "React to a message with an emoji. Often the right answer instead of a message: acknowledging something, agreeing, or when the emoji is the whole reply. Costs them nothing to read.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "message_id": { "type": "string", "description": "Internal event id of the message to react to, e.g. msg_a1b2. Not a WhatsApp id." },
+        "emoji": { "type": "string", "description": "Emoji character (e.g. ❤️, 👍)" }
+      },
+      "required": ["message_id", "emoji"]
+    }
+  },
+  {
+    "name": "schedule",
+    "description": "Schedule a one-shot or recurring background task. Use this for anything time-based; never install a cron job or launchd plist. All times are this machine's local time. The run happens on a fresh thread in its own task directory with no memory of this conversation, so write `prompt` as standalone instructions: what to do, where to look, and what is worth messaging {{OWNER}} about. The response echoes back the resolved first run. Check it says what you meant.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "description": "Short descriptive name, e.g. 'Morning brief'" },
+        "prompt": { "type": "string", "description": "Standalone instructions for the worker. It has no conversation context. Say what to do, where the inputs are, and when to message {{OWNER}} versus finish silently." },
+        "timing": {
+          "type": "object",
+          "description": "When to run. One-shot: {\"type\":\"once\",\"at\":\"2026-08-18T07:30:00+05:30\"}, RFC3339 with an offset, and it must be in the future. Recurring: {\"type\":\"recurring\",\"rrule\":\"...\"} where rrule is either a cron expression evaluated in local time or a fixed interval EVERY_15M / EVERY_2H / EVERY_3D. Cron is ordinary 5-field crontab: \"30 7 * * *\" is 07:30 daily, \"0 9 * * MON\" is 09:00 Mondays, \"0 18 * * MON-FRI\" is weekday evenings. Day-of-week numbers follow crontab (0 and 7 are Sunday), but prefer the three-letter names, they cannot be misread. An unparseable rrule is rejected, not silently turned into something else.",
+          "properties": {
+            "type": { "type": "string", "enum": ["once", "recurring"] },
+            "at": { "type": "string", "description": "One-shot only. RFC3339 with a UTC offset. Must be in the future." },
+            "rrule": { "type": "string", "description": "Recurring only. Cron expression in local time, or EVERY_<n>M / EVERY_<n>H / EVERY_<n>D." }
+          },
+          "required": ["type"]
+        },
+        "tier": {
+          "type": "string",
+          "enum": ["routine", "default", "heavy"],
+          "description": "How much model to spend on each run. 'routine' (gpt-5.6-luna, low effort) for mechanical work of known shape. Checks, sweeps, assembling a brief from known sources. This is the right answer for most schedules. 'default' (gpt-5.6-luna, xhigh) when the run needs real judgement. 'heavy' (gpt-5.6-sol, high) only when the thinking is genuinely hard, or {{OWNER}} asked for sol. Defaults to 'routine'."
+        }
+      },
+      "required": ["name", "prompt", "timing"]
+    }
+  },
+  {
+    "name": "list_schedules",
+    "description": "List active schedules with their next run in local time and their tier. Use it before creating something that may already exist, and to check that a schedule you just made fires when you intended.",
+    "inputSchema": { "type": "object" }
+  },
+  {
+    "name": "cancel_schedule",
+    "description": "Cancel an active schedule. A recurring task that has stopped being useful is clutter someone will eventually have to ask about, so cancel it rather than leaving it running.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "schedule_id": { "type": "string", "description": "Schedule ID to cancel, e.g. sched_a1b2" }
+      },
+      "required": ["schedule_id"]
+    }
+  }
+]
