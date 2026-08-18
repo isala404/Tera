@@ -37,16 +37,8 @@ fn main() {
         if files.is_empty() {
             panic!("built-in skill {name:?} has no files");
         }
-        if let Some(interface_path) = files
-            .iter()
-            .find(|path| path.as_str() == "agents/openai.yaml")
-        {
-            validate_interface_description(
-                &skill_dir.join(interface_path),
-                &fs::read_to_string(skill_dir.join(interface_path)).unwrap_or_else(|error| {
-                    panic!("cannot read agents/openai.yaml for {name:?}: {error}")
-                }),
-            );
+        if files.iter().any(|path| path == "agents/openai.yaml") {
+            panic!("built-in skill {name:?} must not include agents/openai.yaml");
         }
 
         generated.push_str("    BuiltinSkill {\n");
@@ -176,25 +168,11 @@ fn validate_skill_metadata(name: &str, text: &str, path: &Path) {
         .and_then(|rest| rest.split_once("\n---\n"))
         .map(|(_, body)| body.trim())
         .unwrap_or_default();
-    if body.as_bytes().len() > MAX_BODY_BYTES {
+    if body.len() > MAX_BODY_BYTES {
         panic!(
             "{} body is {} bytes; the maximum is {MAX_BODY_BYTES}",
             path.display(),
             body.len()
-        );
-    }
-}
-
-fn validate_interface_description(path: &Path, text: &str) {
-    let lines: Vec<_> = text.lines().collect();
-    let Some(description) = frontmatter_value(&lines, "short_description") else {
-        return;
-    };
-    let chars = description.chars().count();
-    if chars > MAX_DESCRIPTION_CHARS {
-        panic!(
-            "{} short_description is {chars} characters; the maximum is {MAX_DESCRIPTION_CHARS}",
-            path.display()
         );
     }
 }

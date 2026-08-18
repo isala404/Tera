@@ -59,7 +59,6 @@ pub const MEMORY_OPTIMIZER_PROMPT: &str = include_str!("../data/prompts/memory-o
 pub const MEMORY_REBUILD_PROMPT: &str = include_str!("../data/prompts/memory-rebuild.md");
 pub const SCHEDULED_TASK_PROMPT: &str = include_str!("../data/prompts/scheduled-task.md");
 pub const SCHEDULED_TASK_LATE_NOTE: &str = include_str!("../data/prompts/scheduled-task-late.md");
-pub const SKILL_REVIEW_PROMPT: &str = include_str!("../data/prompts/skill-review.md");
 /// The seeded machine-health schedule. Its own prompt rather than something the
 /// agent has to compose, so a fresh workspace looks after the host from day one.
 pub const SELF_CARE_PROMPT: &str = include_str!("../data/prompts/self-care.md");
@@ -87,6 +86,7 @@ mod tests {
     use super::*;
 
     const ALL: &[(&str, &str)] = &[
+        ("README.md", include_str!("../README.md")),
         ("workspace/AGENTS.md", WORKSPACE_AGENTS),
         ("workspace/PERSONA.md", PERSONA),
         ("workspace/SYSTEM.md", SYSTEM_NOTES),
@@ -101,8 +101,8 @@ mod tests {
         ("prompts/memory-rebuild.md", MEMORY_REBUILD_PROMPT),
         ("prompts/scheduled-task.md", SCHEDULED_TASK_PROMPT),
         ("prompts/scheduled-task-late.md", SCHEDULED_TASK_LATE_NOTE),
-        ("prompts/skill-review.md", SKILL_REVIEW_PROMPT),
         ("prompts/self-care.md", SELF_CARE_PROMPT),
+        ("skills/spotify/SKILL.md", include_str!("../data/skills/spotify/SKILL.md")),
         ("config/codex-config.toml", CODEX_CONFIG_TOML),
         ("config/mcp-tools.json", MCP_TOOLS_JSON),
     ];
@@ -128,6 +128,66 @@ mod tests {
             }
         }
         found
+    }
+
+    fn markdown_prose(text: &str) -> Vec<(usize, String)> {
+        let mut prose = Vec::new();
+        let mut in_fence = false;
+        let mut in_frontmatter = false;
+
+        for (index, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+            if index == 0 && trimmed == "---" {
+                in_frontmatter = true;
+                continue;
+            }
+            if in_frontmatter {
+                if trimmed == "---" {
+                    in_frontmatter = false;
+                }
+                continue;
+            }
+            if line.trim_start().starts_with("```") {
+                in_fence = !in_fence;
+                continue;
+            }
+            if in_fence || trimmed.starts_with("<!--") {
+                continue;
+            }
+            if !trimmed.is_empty()
+                && trimmed
+                    .chars()
+                    .all(|character| matches!(character, '|' | ' ' | ':' | '-'))
+            {
+                continue;
+            }
+
+            let mut plain = String::new();
+            let mut in_inline_code = false;
+            let mut in_link_target = false;
+            let mut previous = None;
+            for character in line.chars() {
+                if character == '`' {
+                    in_inline_code = !in_inline_code;
+                } else if !in_inline_code && character == '(' && previous == Some(']') {
+                    in_link_target = true;
+                } else if in_link_target {
+                    if character == ')' {
+                        in_link_target = false;
+                    }
+                } else if !in_inline_code {
+                    plain.push(character);
+                }
+                previous = Some(character);
+            }
+            let plain = plain.trim_start();
+            let plain = plain.strip_prefix("- ").unwrap_or(plain);
+            if !plain.is_empty() {
+                prose.push((index + 1, plain.to_string()));
+            }
+        }
+
+        prose
     }
 
     /// The files that address the user by name must keep doing it through
@@ -271,6 +331,14 @@ mod tests {
         assert!(WORKSPACE_AGENTS.contains("No markdown"));
     }
 
+    #[test]
+    fn test_the_root_instructions_keep_messages_informal() {
+        assert!(WORKSPACE_AGENTS.contains("No em dashes, colons or semicolons in messages"));
+        assert!(WORKSPACE_AGENTS.contains("informal, slightly goofy and witty"));
+        assert!(WORKSPACE_AGENTS.contains("Absolutely, you're right"));
+        assert!(WORKSPACE_AGENTS.contains("Never agree automatically"));
+    }
+
     /// The tiers moved to WORKING.md when AGENTS.md was cut down. They have to be
     /// explained somewhere the agent will actually read before delegating.
     #[test]
@@ -290,12 +358,11 @@ mod tests {
     /// is not. If it drifts back to carrying everything, the saving is gone.
     #[test]
     fn test_the_root_instructions_stay_small_and_point_at_the_rest() {
-        // Every session pays for this file, so the budget is tight enough that
-        // adding a section means taking one out or moving it. It was 1424 words
-        // before the split; anything approaching that is a regression.
+        // Every session pays for this file. Keep the operational parts compact,
+        // but leave enough room for the voice rules that make the agent distinct.
         let words = WORKSPACE_AGENTS.split_whitespace().count();
         assert!(
-            words < 900,
+            words < 750,
             "AGENTS.md is {words} words; move detail into WORKING.md or a SCHEMA reference"
         );
 
@@ -322,6 +389,36 @@ mod tests {
         assert!(WORKSPACE_AGENTS.contains("100 characters"));
         assert!(!WORKSPACE_AGENTS.contains("Should I create a skill for this?"));
         assert!(WORKSPACE_AGENTS.contains("$skill-creator"));
+        assert!(WORKING.contains("gpt-5.6-sol"));
+        assert!(WORKING.contains("Create or improve a skill"));
+        assert!(WORKING.contains("compact executable scripts"));
+        assert!(WORKING.contains("Do not create `agents/openai.yaml`"));
+    }
+
+    #[test]
+    fn test_the_root_instructions_pace_large_task_updates() {
+        assert!(WORKSPACE_AGENTS.contains("use `send_message` while working"));
+        assert!(WORKSPACE_AGENTS.contains("meaningful boundary"));
+        assert!(WORKSPACE_AGENTS.contains("Do not narrate commands"));
+        assert!(WORKSPACE_AGENTS.contains("load every detail at the front"));
+        assert!(WORKSPACE_AGENTS.contains("large final message"));
+    }
+
+    #[test]
+    fn test_markdown_prose_avoids_formal_punctuation() {
+        for (name, text) in ALL {
+            if !name.ends_with(".md") {
+                continue;
+            }
+            for (line, prose) in markdown_prose(text) {
+                for forbidden in [':', ';', '\u{2014}', '\u{2013}', '-'] {
+                    assert!(
+                        !prose.contains(forbidden),
+                        "{name}:{line} contains {forbidden:?} in prose: {prose}"
+                    );
+                }
+            }
+        }
     }
 
     /// No em dashes anywhere in shipped text.

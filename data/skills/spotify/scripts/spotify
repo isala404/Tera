@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import hashlib
+import json
+import os
+import re
+import secrets
+import sys
+import time
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.request import Request, urlopen
+
+
+AUTHORIZE_URL = "https://accounts.spotify.com/authorize"
+TOKEN_URL = "https://accounts.spotify.com/api/token"
+API_URL = "https://api.spotify.com/v1"
+REDIRECT_URI = "http://127.0.0.1:8989/login"
+SCOPES = (
+    "user-read-playback-state",
+    "user-modify-playback-state",
+)
+HTTP_TIMEOUT_SECONDS = 20
+PENDING_LIFETIME_SECONDS = 15 * 60
+
+
+class SpotifyError(Exception):
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
+
+def runtime_root():
+    configured = os.environ.get("TERA_SPOTIFY_ROOT")
+    if configured:
+        return Path(configured)
+    skill_dir = Path(__file__).resolve().parent.parent
+    workspace = skill_dir.parents[2]
+    return workspace / ".runtime" / "spotify"
+
+
+def state_path(name):
+    return runtime_root() / name
+
+
+def ensure_runtime_root():
+    root = runtime_root()
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    root.chmod(0o700)
+
+
+def read_json(name, required=True):
+    path = state_path(name)
+    try:
+        with path.open(encoding="utf-8") as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        if required:
+            raise SpotifyError(f"Spotify {name.removesuffix('.json')} is missing.")
+        return None
+    except (OSError, ValueError) as error:
+        raise SpotifyError(f"Cannot read {path}: {error}") from error
+
+
+def write_json(name, value):
+    ensure_runtime_root()
+    path = state_path(name)
+    temporary = path.with_name(f".{path.name}.tmp-{secrets.token_hex(8)}")
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(temporary, path)
+    except OSError as error:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise SpotifyError(f"Cannot write {path}: {error}") from error
+
+
+def configured_client_id(explicit=None):
+    def valid(value):
+        value = str(value or "").strip()
+        return value if value and not any(character.isspace() for character in value) else None
+
+    if explicit is not None:
+        client_id = valid(explicit)
+        if not client_id:
+            raise SpotifyError("Spotify client ID must be one non-empty value.")
+        return client_id
+
+    environment = valid(os.environ.get("SPOTIFY_CLIENT_ID"))
+    if environment:
+        return environment
+
+    for name in ("token.json", "pending.json"):
+        state = read_json(name, required=False) or {}
+        client_id = valid(state.get("client_id"))
+        if client_id:
+            return client_id
+
+    raise SpotifyError(
+        "Spotify client ID is missing. Create a Spotify developer app, register "
+        f"{REDIRECT_URI}, then run: scripts/spotify auth start CLIENT_ID"
+    )
+
+
+def pkce_challenge(verifier):
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def start_auth(client_id=None):
+    client_id = configured_client_id(client_id)
+    verifier = secrets.token_urlsafe(64)
+    state = secrets.token_urlsafe(24)
+    write_json(
+        "pending.json",
+        {
+            "client_id": client_id,
+            "created_at": int(time.time()),
+            "redirect_uri": REDIRECT_URI,
+            "state": state,
+            "verifier": verifier,
+        },
+    )
+    query = urlencode(
+        {
+            "client_id": client_id,
+            "code_challenge": pkce_challenge(verifier),
+            "code_challenge_method": "S256",
+            "redirect_uri": REDIRECT_URI,
+            "response_type": "code",
+            "scope": " ".join(SCOPES),
+            "state": state,
+        }
+    )
+    print(f"{AUTHORIZE_URL}?{query}")
+
+
+def callback_values(callback_url, pending):
+    parsed = urlparse(callback_url.strip())
+    if (
+        parsed.scheme != "http"
+        or parsed.netloc != "127.0.0.1:8989"
+        or parsed.path != "/login"
+    ):
+        raise SpotifyError(f"Expected the complete redirect URL beginning with {REDIRECT_URI}.")
+
+    try:
+        query = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
+    except ValueError as error:
+        raise SpotifyError("Spotify redirect URL has a malformed query.") from error
+
+    states = query.get("state", [])
+    if len(states) != 1 or not states[0]:
+        raise SpotifyError("Spotify redirect URL must contain exactly one state.")
+    if not secrets.compare_digest(states[0], pending["state"]):
+        raise SpotifyError("Spotify redirect state does not match the pending login.")
+    errors = query.get("error", [])
+    if errors:
+        detail = errors[0] if len(errors) == 1 and errors[0] else "unknown error"
+        raise SpotifyError(f"Spotify authorization failed: {detail}")
+    codes = query.get("code", [])
+    if len(codes) != 1 or not codes[0]:
+        raise SpotifyError("Spotify redirect URL must contain exactly one code.")
+    return codes[0]
+
+
+def finish_auth(callback_url):
+    pending = read_json("pending.json")
+    age = int(time.time()) - int(pending.get("created_at", 0))
+    if age < 0 or age > PENDING_LIFETIME_SECONDS:
+        raise SpotifyError("Spotify login expired. Run scripts/spotify auth start again.")
+    code = callback_values(callback_url, pending)
+    token = token_request(
+        {
+            "client_id": pending["client_id"],
+            "code": code,
+            "code_verifier": pending["verifier"],
+            "grant_type": "authorization_code",
+            "redirect_uri": pending["redirect_uri"],
+        }
+    )
+    save_token(token, pending["client_id"])
+    try:
+        state_path("pending.json").unlink()
+    except FileNotFoundError:
+        pass
+    print("Spotify authorization complete.")
+
+
+def response_error(error):
+    try:
+        payload = json.loads(error.read().decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    detail = payload.get("error_description") or payload.get("reason")
+    api_error = payload.get("error")
+    if isinstance(api_error, dict):
+        detail = api_error.get("message") or detail
+    elif isinstance(api_error, str):
+        detail = api_error
+    detail = detail or error.reason
+    return SpotifyError(f"Spotify returned HTTP {error.code}: {detail}", error.code)
+
+
+def request_json(url, method="GET", form=None, body=None, bearer=None):
+    headers = {"Accept": "application/json"}
+    data = None
+    if form is not None:
+        data = urlencode(form).encode("ascii")
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    elif body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+
+    try:
+        with urlopen(
+            Request(url, data=data, headers=headers, method=method),
+            timeout=HTTP_TIMEOUT_SECONDS,
+        ) as response:
+            raw = response.read()
+    except HTTPError as error:
+        raise response_error(error) from error
+    except (URLError, TimeoutError) as error:
+        raise SpotifyError(f"Cannot reach Spotify: {getattr(error, 'reason', error)}") from error
+
+    if not raw:
+        return None
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as error:
+        raise SpotifyError("Spotify returned an invalid JSON response.") from error
+
+
+def token_request(form):
+    return request_json(TOKEN_URL, method="POST", form=form)
+
+
+def save_token(token, client_id, previous_refresh_token=None):
+    access_token = token.get("access_token")
+    refresh_token = token.get("refresh_token") or previous_refresh_token
+    if not access_token or not refresh_token:
+        raise SpotifyError("Spotify token response omitted required credentials.")
+    write_json(
+        "token.json",
+        {
+            "access_token": access_token,
+            "client_id": client_id,
+            "expires_at": int(time.time()) + int(token.get("expires_in", 3600)),
+            "refresh_token": refresh_token,
+            "scope": token.get("scope", " ".join(SCOPES)),
+            "token_type": token.get("token_type", "Bearer"),
+        },
+    )
+
+
+def refresh_access_token(token):
+    refreshed = token_request(
+        {
+            "client_id": token["client_id"],
+            "grant_type": "refresh_token",
+            "refresh_token": token["refresh_token"],
+        }
+    )
+    save_token(refreshed, token["client_id"], token["refresh_token"])
+    return read_json("token.json")
+
+
+def access_token(force_refresh=False):
+    token = read_json("token.json")
+    if force_refresh or int(token.get("expires_at", 0)) <= int(time.time()) + 30:
+        token = refresh_access_token(token)
+    return token["access_token"]
+
+
+def api_request(path, method="GET", query=None, body=None):
+    url = f"{API_URL}{path}"
+    if query:
+        url = f"{url}?{urlencode(query)}"
+    for attempt in range(2):
+        try:
+            return request_json(
+                url,
+                method=method,
+                body=body,
+                bearer=access_token(force_refresh=attempt == 1),
+            )
+        except SpotifyError as error:
+            if error.status != 401 or attempt == 1:
+                raise
+    raise SpotifyError("Spotify request failed after refreshing authorization.")
+
+
+def artist_names(item):
+    return ", ".join(artist.get("name", "Unknown artist") for artist in item.get("artists", []))
+
+
+def format_duration(milliseconds):
+    seconds = max(0, int(milliseconds or 0) // 1000)
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def show_status():
+    playback = api_request("/me/player")
+    if not playback or not playback.get("item"):
+        print("Nothing is playing.")
+        return
+    item = playback["item"]
+    state = "Playing" if playback.get("is_playing") else "Paused"
+    artists = artist_names(item)
+    device = playback.get("device", {}).get("name", "unknown device")
+    progress = format_duration(playback.get("progress_ms"))
+    duration = format_duration(item.get("duration_ms"))
+    print(f"{state}: {item.get('name', 'Unknown item')} — {artists} [{progress}/{duration} on {device}]")
+
+
+def get_devices():
+    return (api_request("/me/player/devices") or {}).get("devices", [])
+
+
+def show_devices():
+    devices = get_devices()
+    if not devices:
+        print("No Spotify devices are available. Open Spotify on a device first.")
+        return
+    for device in devices:
+        markers = []
+        if device.get("is_active"):
+            markers.append("active")
+        if device.get("is_restricted"):
+            markers.append("restricted")
+        suffix = f" ({', '.join(markers)})" if markers else ""
+        print(f"{device.get('name')} — {device.get('type', 'unknown')}{suffix}")
+
+
+def choose_device(name):
+    devices = [device for device in get_devices() if not device.get("is_restricted")]
+    exact = [device for device in devices if device.get("name", "").casefold() == name.casefold()]
+    matches = exact or [
+        device for device in devices if name.casefold() in device.get("name", "").casefold()
+    ]
+    if len(matches) != 1:
+        available = ", ".join(device.get("name", "unknown") for device in devices) or "none"
+        raise SpotifyError(f"Device name is not unique or was not found. Available: {available}")
+    device_id = matches[0].get("id")
+    if not device_id:
+        raise SpotifyError("Spotify did not return an ID for that device.")
+    api_request("/me/player", method="PUT", body={"device_ids": [device_id], "play": False})
+    print(f"Connected to {matches[0]['name']}.")
+
+
+def search_tracks(query, limit=5):
+    result = api_request("/search", query={"q": query, "type": "track", "limit": limit}) or {}
+    return result.get("tracks", {}).get("items", [])
+
+
+def show_search(query):
+    tracks = search_tracks(query)
+    if not tracks:
+        print("No tracks found.")
+        return
+    for track in tracks:
+        print(f"{track.get('uri')} — {track.get('name')} — {artist_names(track)}")
+
+
+def play_track(query):
+    tracks = search_tracks(query, limit=1)
+    if not tracks:
+        raise SpotifyError(f"No track found for: {query}")
+    track = tracks[0]
+    api_request("/me/player/play", method="PUT", body={"uris": [track["uri"]]})
+    print(f"Playing {track.get('name')} — {artist_names(track)}.")
+
+
+def track_uri(value):
+    match = re.fullmatch(r"spotify:track:([A-Za-z0-9]+)", value)
+    if match:
+        return f"spotify:track:{match.group(1)}"
+    parsed = urlparse(value)
+    if parsed.scheme == "https" and parsed.netloc == "open.spotify.com":
+        match = re.fullmatch(r"/track/([A-Za-z0-9]+)", parsed.path)
+        if match:
+            return f"spotify:track:{match.group(1)}"
+    raise SpotifyError("Expected a Spotify track URI or open.spotify.com track URL.")
+
+
+def playback_command(command):
+    endpoints = {
+        "next": ("/me/player/next", "POST"),
+        "pause": ("/me/player/pause", "PUT"),
+        "play": ("/me/player/play", "PUT"),
+        "previous": ("/me/player/previous", "POST"),
+    }
+    path, method = endpoints[command]
+    api_request(path, method=method)
+    print(f"Spotify {command} succeeded.")
+
+
+def toggle_playback():
+    playback = api_request("/me/player")
+    playback_command("pause" if playback and playback.get("is_playing") else "play")
+
+
+def open_track(value):
+    uri = track_uri(value)
+    api_request("/me/player/play", method="PUT", body={"uris": [uri]})
+    print(f"Playing {uri}.")
+
+
+def auth_status():
+    token = read_json("token.json", required=False)
+    pending = read_json("pending.json", required=False)
+    client_id = os.environ.get("SPOTIFY_CLIENT_ID") or (token or {}).get("client_id")
+    client_id = client_id or (pending or {}).get("client_id")
+    print(f"client-id: {'configured' if client_id else 'missing'}")
+    print(f"authorization: {'complete' if token else 'missing'}")
+    print(f"pending-login: {'yes' if pending else 'no'}")
+
+
+def parser():
+    root = argparse.ArgumentParser(prog="spotify")
+    commands = root.add_subparsers(dest="command", required=True)
+
+    auth = commands.add_parser("auth")
+    auth_commands = auth.add_subparsers(dest="auth_command", required=True)
+    auth_start = auth_commands.add_parser("start")
+    auth_start.add_argument("client_id", nargs="?")
+    auth_finish = auth_commands.add_parser("finish")
+    auth_finish.add_argument("redirect_url", nargs="?")
+    auth_commands.add_parser("status")
+
+    for command in ("devices", "next", "pause", "play", "previous", "status", "toggle"):
+        commands.add_parser(command)
+    for command, argument in (
+        ("connect", "device"),
+        ("open", "track"),
+        ("search", "query"),
+        ("track", "query"),
+    ):
+        subcommand = commands.add_parser(command)
+        if argument == "query":
+            subcommand.add_argument(argument, nargs="+")
+        else:
+            subcommand.add_argument(argument)
+    return root
+
+
+def main():
+    args = parser().parse_args()
+    if args.command == "auth":
+        if args.auth_command == "start":
+            start_auth(args.client_id)
+        elif args.auth_command == "finish":
+            callback_url = args.redirect_url
+            if not callback_url:
+                callback_url = sys.stdin.readline().strip()
+            if not callback_url:
+                raise SpotifyError("Pass the complete Spotify redirect URL or provide it on stdin.")
+            finish_auth(callback_url)
+        else:
+            auth_status()
+    elif args.command == "status":
+        show_status()
+    elif args.command == "devices":
+        show_devices()
+    elif args.command == "search":
+        show_search(" ".join(args.query))
+    elif args.command == "track":
+        play_track(" ".join(args.query))
+    elif args.command == "connect":
+        choose_device(args.device)
+    elif args.command == "open":
+        open_track(args.track)
+    elif args.command == "toggle":
+        toggle_playback()
+    else:
+        playback_command(args.command)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (SpotifyError, KeyError, ValueError) as error:
+        print(f"spotify: {error}", file=sys.stderr)
+        raise SystemExit(1)

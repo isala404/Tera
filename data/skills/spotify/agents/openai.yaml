@@ -1,4 +1,0 @@
-interface:
-  display_name: "Spotify playback"
-  short_description: "Control Spotify Connect playback"
-  default_prompt: "Use $spotify for Spotify Connect playback and PKCE login."

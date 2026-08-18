@@ -3,7 +3,7 @@ use crate::memory::generations::GenerationManager;
 use crate::workspace::templates::*;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::ffi::CString;
@@ -191,8 +191,8 @@ impl WorkspaceInit {
         for skill in crate::data::BUILTIN_SKILLS {
             validate_builtin_skill(skill)?;
 
-            let source_files = embedded_skill_files(skill);
-            let source_fingerprint = fingerprint_files(&source_files);
+            let source_state = embedded_skill_state(skill);
+            let source_fingerprint = fingerprint_skill_state(&source_state);
             let destination = config.skills_dir().join(skill.name);
 
             match state.skills.get(skill.name).cloned() {
@@ -202,16 +202,20 @@ impl WorkspaceInit {
                         // file existed. An untouched package whose files are a
                         // byte-for-byte subset of the new embedded package can
                         // be migrated safely. Anything else is user-owned.
-                        if let Some(existing_files) = installed_skill_files(&destination)? {
-                            let legacy_managed = !existing_files.is_empty()
-                                && existing_files.iter().all(|(path, fingerprint)| {
-                                    source_files.get(path) == Some(fingerprint)
+                        if let Some(existing_state) = installed_skill_state(&destination)? {
+                            let legacy_managed = !existing_state.files.is_empty()
+                                && existing_state.files.iter().all(|(path, fingerprint)| {
+                                    source_state.files.get(path) == Some(fingerprint)
+                                })
+                                && existing_state.files.keys().all(|path| {
+                                    existing_state.executables.contains(path)
+                                        == source_state.executables.contains(path)
                                 });
                             if legacy_managed
                                 && Self::update_managed_skill(
                                     &config.skills_dir(),
                                     skill,
-                                    &existing_files,
+                                    &existing_state,
                                 )?
                             {
                                 info!(
@@ -220,7 +224,7 @@ impl WorkspaceInit {
                                 );
                                 state.skills.insert(
                                     skill.name.to_string(),
-                                    BuiltinSkillRecord::managed(source_fingerprint, source_files),
+                                    BuiltinSkillRecord::managed(source_fingerprint, source_state),
                                 );
                                 continue;
                             }
@@ -240,7 +244,7 @@ impl WorkspaceInit {
                         info!("Seeded built-in skill {:?} at {:?}", skill.name, destination);
                         state.skills.insert(
                             skill.name.to_string(),
-                            BuiltinSkillRecord::managed(source_fingerprint, source_files),
+                            BuiltinSkillRecord::managed(source_fingerprint, source_state),
                         );
                     } else if has_path(&destination) {
                         state.skills.insert(
@@ -262,7 +266,35 @@ impl WorkspaceInit {
                             continue;
                         }
 
-                        if installed_skill_files(&destination)? != Some(record.files.clone()) {
+                        let Some(installed_state) = installed_skill_state(&destination)? else {
+                            warn!(
+                                "Built-in skill {:?} changed at {:?}; preserving it as user-owned",
+                                skill.name, destination
+                            );
+                            record.status = BuiltinSkillStatus::UserOwned;
+                            state.skills.insert(skill.name.to_string(), record);
+                            continue;
+                        };
+
+                        // State written before executable modes were tracked can
+                        // be upgraded only when its installed modes match this
+                        // build. A mismatch may be a deliberate user edit.
+                        if record.executables.is_empty() {
+                            if installed_state.executables != source_state.executables {
+                                warn!(
+                                    "Built-in skill {:?} has untracked mode changes at {:?}; preserving it as user-owned",
+                                    skill.name, destination
+                                );
+                                record.status = BuiltinSkillStatus::UserOwned;
+                                state.skills.insert(skill.name.to_string(), record);
+                                continue;
+                            }
+                            record.executables = installed_state.executables.clone();
+                            record.fingerprint = fingerprint_skill_state(&installed_state);
+                        }
+
+                        let expected_state = record.package_state();
+                        if installed_state != expected_state {
                             warn!(
                                 "Built-in skill {:?} changed at {:?}; preserving it as user-owned",
                                 skill.name, destination
@@ -276,22 +308,20 @@ impl WorkspaceInit {
                             if Self::update_managed_skill(
                                 &config.skills_dir(),
                                 skill,
-                                &record.files,
+                                &expected_state,
                             )? {
                                 info!("Updated built-in skill {:?} at {:?}", skill.name, destination);
-                                state.skills.insert(
-                                    skill.name.to_string(),
-                                    BuiltinSkillRecord::managed(source_fingerprint, source_files),
-                                );
+                                record =
+                                    BuiltinSkillRecord::managed(source_fingerprint, source_state);
                             } else {
                                 warn!(
                                     "Built-in skill {:?} changed while updating; preserving it as user-owned",
                                     skill.name
                                 );
                                 record.status = BuiltinSkillStatus::UserOwned;
-                                state.skills.insert(skill.name.to_string(), record);
                             }
                         }
+                        state.skills.insert(skill.name.to_string(), record);
                     }
                 },
             }
@@ -336,13 +366,13 @@ impl WorkspaceInit {
     fn update_managed_skill(
         skills_dir: &Path,
         skill: &crate::data::BuiltinSkill,
-        expected_files: &BTreeMap<String, String>,
+        expected_state: &SkillPackageState,
     ) -> Result<bool> {
         let destination = skills_dir.join(skill.name);
         let staging = Self::create_skill_staging(skills_dir, skill.name)?;
         let install = (|| -> Result<bool> {
             write_skill_files(&staging, skill)?;
-            if installed_skill_files(&destination)? != Some(expected_files.clone()) {
+            if installed_skill_state(&destination)?.as_ref() != Some(expected_state) {
                 return Ok(false);
             }
 
@@ -514,17 +544,9 @@ impl WorkspaceInit {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct BuiltinSkillState {
     skills: BTreeMap<String, BuiltinSkillRecord>,
-}
-
-impl Default for BuiltinSkillState {
-    fn default() -> Self {
-        Self {
-            skills: BTreeMap::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -532,14 +554,17 @@ struct BuiltinSkillRecord {
     status: BuiltinSkillStatus,
     fingerprint: String,
     files: BTreeMap<String, String>,
+    #[serde(default)]
+    executables: BTreeSet<String>,
 }
 
 impl BuiltinSkillRecord {
-    fn managed(fingerprint: String, files: BTreeMap<String, String>) -> Self {
+    fn managed(fingerprint: String, package: SkillPackageState) -> Self {
         Self {
             status: BuiltinSkillStatus::Managed,
             fingerprint,
-            files,
+            files: package.files,
+            executables: package.executables,
         }
     }
 
@@ -548,8 +573,22 @@ impl BuiltinSkillRecord {
             status: BuiltinSkillStatus::UserOwned,
             fingerprint: String::new(),
             files: BTreeMap::new(),
+            executables: BTreeSet::new(),
         }
     }
+
+    fn package_state(&self) -> SkillPackageState {
+        SkillPackageState {
+            files: self.files.clone(),
+            executables: self.executables.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkillPackageState {
+    files: BTreeMap<String, String>,
+    executables: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -595,20 +634,29 @@ fn write_skill_files(staging: &Path, skill: &crate::data::BuiltinSkill) -> Resul
     Ok(())
 }
 
-fn embedded_skill_files(skill: &crate::data::BuiltinSkill) -> BTreeMap<String, String> {
-    skill
-        .files
-        .iter()
-        .map(|file| (file.relative_path.to_string(), fingerprint(file.contents)))
-        .collect()
+fn embedded_skill_state(skill: &crate::data::BuiltinSkill) -> SkillPackageState {
+    SkillPackageState {
+        files: skill
+            .files
+            .iter()
+            .map(|file| (file.relative_path.to_string(), fingerprint(file.contents)))
+            .collect(),
+        executables: skill
+            .files
+            .iter()
+            .filter(|file| file.executable)
+            .map(|file| file.relative_path.to_string())
+            .collect(),
+    }
 }
 
-fn fingerprint_files(files: &BTreeMap<String, String>) -> String {
+fn fingerprint_skill_state(state: &SkillPackageState) -> String {
     let mut bytes = Vec::new();
-    for (path, fingerprint) in files {
+    for (path, fingerprint) in &state.files {
         bytes.extend_from_slice(path.as_bytes());
         bytes.push(0);
         bytes.extend_from_slice(fingerprint.as_bytes());
+        bytes.push(u8::from(state.executables.contains(path)));
         bytes.push(0xff);
     }
     fingerprint(&bytes)
@@ -625,7 +673,7 @@ fn fingerprint(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
-fn installed_skill_files(path: &Path) -> Result<Option<BTreeMap<String, String>>> {
+fn installed_skill_state(path: &Path) -> Result<Option<SkillPackageState>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -635,17 +683,20 @@ fn installed_skill_files(path: &Path) -> Result<Option<BTreeMap<String, String>>
         return Ok(None);
     }
 
-    let mut files = BTreeMap::new();
-    if !collect_installed_files(path, path, &mut files)? {
+    let mut state = SkillPackageState {
+        files: BTreeMap::new(),
+        executables: BTreeSet::new(),
+    };
+    if !collect_installed_state(path, path, &mut state)? {
         return Ok(None);
     }
-    Ok(Some(files))
+    Ok(Some(state))
 }
 
-fn collect_installed_files(
+fn collect_installed_state(
     root: &Path,
     current: &Path,
-    files: &mut BTreeMap<String, String>,
+    state: &mut SkillPackageState,
 ) -> Result<bool> {
     for entry in fs::read_dir(current).with_context(|| format!("failed to read {current:?}"))? {
         let path = entry?.path();
@@ -654,7 +705,7 @@ fn collect_installed_files(
             return Ok(false);
         }
         if metadata.is_dir() {
-            if !collect_installed_files(root, &path, files)? {
+            if !collect_installed_state(root, &path, state)? {
                 return Ok(false);
             }
         } else if metadata.is_file() {
@@ -667,7 +718,10 @@ fn collect_installed_files(
                 return Ok(false);
             }
             let contents = fs::read(&path)?;
-            files.insert(relative, fingerprint(&contents));
+            state.files.insert(relative.clone(), fingerprint(&contents));
+            if metadata.permissions().mode() & 0o111 != 0 {
+                state.executables.insert(relative);
+            }
         } else {
             return Ok(false);
         }
@@ -927,6 +981,80 @@ mod tests {
         WorkspaceInit::init(&config).unwrap();
         assert_eq!(fs::read(&first_path).unwrap(), b"user-owned\n");
         assert_ne!(original, b"user-owned\n");
+    }
+
+    #[test]
+    fn test_builtin_skill_executable_mode_is_seeded_and_tracked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Config::new(tmp.path().to_path_buf(), true);
+        let builtin = crate::data::BUILTIN_SKILLS
+            .iter()
+            .find(|skill| skill.name == "spotify")
+            .unwrap();
+        let script = builtin
+            .files
+            .iter()
+            .find(|file| file.relative_path == "scripts/spotify")
+            .unwrap();
+        assert!(script.executable);
+
+        WorkspaceInit::init(&config).unwrap();
+        let installed = config
+            .skills_dir()
+            .join(builtin.name)
+            .join(script.relative_path);
+        assert_ne!(
+            fs::metadata(&installed).unwrap().permissions().mode() & 0o111,
+            0
+        );
+
+        fs::set_permissions(&installed, fs::Permissions::from_mode(0o644)).unwrap();
+        WorkspaceInit::init(&config).unwrap();
+
+        assert_eq!(
+            fs::metadata(&installed).unwrap().permissions().mode() & 0o111,
+            0
+        );
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(config.builtin_skills_state_path()).unwrap()).unwrap();
+        assert_eq!(state["skills"][builtin.name]["status"], "user-owned");
+    }
+
+    #[test]
+    fn test_untracked_skill_mode_change_is_preserved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Config::new(tmp.path().to_path_buf(), true);
+        let builtin = crate::data::BUILTIN_SKILLS
+            .iter()
+            .find(|skill| skill.name == "spotify")
+            .unwrap();
+        let skill_path = config.skills_dir().join(builtin.name);
+        fs::create_dir_all(&skill_path).unwrap();
+        write_skill_files(&skill_path, builtin).unwrap();
+        let script = skill_path.join("scripts/spotify");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).unwrap();
+
+        WorkspaceInit::init(&config).unwrap();
+
+        assert_eq!(
+            fs::metadata(&script).unwrap().permissions().mode() & 0o111,
+            0
+        );
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(config.builtin_skills_state_path()).unwrap()).unwrap();
+        assert_eq!(state["skills"][builtin.name]["status"], "user-owned");
+    }
+
+    #[test]
+    fn test_skill_fingerprint_includes_executable_mode() {
+        let mut state = SkillPackageState {
+            files: BTreeMap::from([("scripts/tool".to_string(), "contents".to_string())]),
+            executables: BTreeSet::new(),
+        };
+        let regular = fingerprint_skill_state(&state);
+        state.executables.insert("scripts/tool".to_string());
+
+        assert_ne!(fingerprint_skill_state(&state), regular);
     }
 
     #[test]

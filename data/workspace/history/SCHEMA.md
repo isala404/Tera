@@ -1,7 +1,7 @@
 <!-- generated: tera, edits are overwritten; put yours in PERSONA.md -->
 # Conversation history
 
-Two views of the same events. SQLite is canonical; the JSONL is a projection, rebuilt with `tera history rebuild-jsonl`. Both read-only to you.
+Two views of the same events. SQLite is canonical. The JSONL is a projection rebuilt with `tera history rebuild-jsonl`. Both are read only to you.
 
 ## JSONL. `history/jsonl/YYYY-MM.jsonl`
 
@@ -17,7 +17,7 @@ One object per line, event order, one file per month. The fast path for `jq`, `r
 | `id` | `msg_*` for messages, `r_*` for reactions |
 | `t` | RFC3339 UTC, milliseconds. Sorts lexically |
 | `from` | `user` or `assistant` |
-| `turn` | logical turn id; one exchange shares it |
+| `turn` | logical turn id, one exchange shares it |
 | `reply_to` | id of the message being replied to |
 | `text` | message text |
 | `assets` | `{type, path}`, path relative to `history/jsonl/` |
@@ -39,12 +39,12 @@ Asset paths resolve from `history/jsonl/`, so `cd` there before `realpath`. When
 
 ## SQLite. `history/history.sqlite3`
 
-For what the flat files cannot answer: full-text search, reply chains, attachment joins, long ranges.
+Use SQLite for what the flat files cannot answer. This includes full text search, reply chains, attachment joins and long ranges.
 
-- `conversation_events`. `seq`, `id`, `occurred_at_ms`, `kind` (`message`|`reaction`), `actor`, `text`, `reply_to_id`, `turn_id`, `reaction_target_id`, `reaction_emoji`. Append-only.
+- `conversation_events`. `seq`, `id`, `occurred_at_ms`, `kind` (`message`|`reaction`), `actor`, `text`, `reply_to_id`, `turn_id`, `reaction_target_id`, `reaction_emoji`. Append only.
 - `attachments`. `event_id`, `position`, `media_type`, `relative_path`, `mime_type`, `original_name`.
 - `provider_refs`. Event id ↔ WhatsApp message id, plus `chat_jid` and `from_me`. What `react` resolves through.
-- `delivery_events`. Per-event transport state.
+- `delivery_events`. Transport state for each event.
 - `conversation_fts`. FTS5 over event text, kept current by a trigger.
 
 ```bash
@@ -61,6 +61,6 @@ sqlite3 {{WORKSPACE}}/history/history.sqlite3 \
    ) SELECT * FROM chain;"
 ```
 
-Timestamps are epoch milliseconds: `datetime(occurred_at_ms/1000, 'unixepoch', 'localtime')`.
+Timestamps are epoch milliseconds. Convert them with `datetime(occurred_at_ms/1000, 'unixepoch', 'localtime')`.
 
-Originals live at `history/assets/YYYY/MM/<event-id>/<file>`, byte-for-byte, never rewritten.
+Originals live at `history/assets/YYYY/MM/<event-id>/<file>` as exact bytes and are never rewritten.

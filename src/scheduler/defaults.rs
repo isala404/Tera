@@ -1,7 +1,7 @@
-//! The built-in schedules tera creates for itself.
+//! The built-in schedule tera creates for itself.
 //!
-//! A fresh workspace gets a daily health pass and a nightly skill review. Each
-//! seed has its own durable marker, so cancelling one is not undone on restart.
+//! A fresh workspace gets a daily health pass. Its durable marker means
+//! cancelling it is not undone on restart.
 
 use crate::codex::tier;
 use crate::runtime::RuntimeDb;
@@ -13,73 +13,46 @@ use serde_json::json;
 use tracing::{info, warn};
 
 const SELF_CARE_NAME: &str = "Machine health check";
-const SKILL_REVIEW_NAME: &str = "Nightly skill review";
 const SEEDED_KEY: &str = "seeded_self_care_schedule";
-const SKILL_REVIEW_SEEDED_KEY: &str = "seeded_skill_review_schedule";
 const SELF_CARE_RRULE: &str = "30 9 * * *";
-const SKILL_REVIEW_RRULE: &str = "0 2 * * *";
 
 /// Create the built-in schedules the first time this workspace starts.
 ///
 /// Errors are logged, not propagated. A workspace that cannot seed housekeeping
 /// still needs to come up and answer messages.
 pub fn seed(runtime_db: &RuntimeDb) {
-    if let Err(error) = try_seed_one(
-        runtime_db,
-        SELF_CARE_NAME,
-        SEEDED_KEY,
-        SELF_CARE_RRULE,
-        crate::data::SELF_CARE_PROMPT,
-        "tasks/machine-health",
-    ) {
+    if let Err(error) = try_seed(runtime_db) {
         warn!("Could not seed the {SELF_CARE_NAME} schedule: {error:?}");
-    }
-    if let Err(error) = try_seed_one(
-        runtime_db,
-        SKILL_REVIEW_NAME,
-        SKILL_REVIEW_SEEDED_KEY,
-        SKILL_REVIEW_RRULE,
-        crate::data::SKILL_REVIEW_PROMPT,
-        "tasks/skill-review",
-    ) {
-        warn!("Could not seed the {SKILL_REVIEW_NAME} schedule: {error:?}");
     }
 }
 
-fn try_seed_one(
-    runtime_db: &RuntimeDb,
-    name: &str,
-    seeded_key: &str,
-    rrule: &str,
-    prompt: &str,
-    task_path: &str,
-) -> Result<()> {
-    if runtime_db.get_state_value(seeded_key)?.is_some() {
+fn try_seed(runtime_db: &RuntimeDb) -> Result<()> {
+    if runtime_db.get_state_value(SEEDED_KEY)?.is_some() {
         return Ok(());
     }
 
     // Adopt a schedule created by an older build rather than making a duplicate.
-    if SchedulerDb::name_was_ever_used(runtime_db, name)? {
-        runtime_db.set_state_value(seeded_key, "adopted")?;
+    if SchedulerDb::name_was_ever_used(runtime_db, SELF_CARE_NAME)? {
+        runtime_db.set_state_value(SEEDED_KEY, "adopted")?;
         return Ok(());
     }
 
     let timing = ScheduleTiming::parse(
-        &json!({ "type": "recurring", "rrule": rrule }),
+        &json!({ "type": "recurring", "rrule": SELF_CARE_RRULE }),
         Utc::now().timestamp_millis(),
     )?;
     let item = SchedulerDb::create_schedule(
         runtime_db,
-        name,
-        prompt,
+        SELF_CARE_NAME,
+        crate::data::SELF_CARE_PROMPT,
         &timing,
-        task_path,
+        "tasks/machine-health",
         tier::ROUTINE,
     )?;
-    runtime_db.set_state_value(seeded_key, &item.id)?;
+    runtime_db.set_state_value(SEEDED_KEY, &item.id)?;
     info!(
         target: "tera::scheduler",
-        "Seeded the {name} schedule ({}); first run {}",
+        "Seeded the {SELF_CARE_NAME} schedule ({}); first run {}",
         item.id,
         recurrence::local_time(timing.first_run_ms)
     );
@@ -98,21 +71,17 @@ mod tests {
     }
 
     #[test]
-    fn test_seeding_creates_daily_routines() {
+    fn test_seeding_creates_builtin_routine() {
         let runtime_db = db();
         seed(&runtime_db);
 
         let items = SchedulerDb::list_schedules(&runtime_db).unwrap();
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 1);
         let health = items.iter().find(|item| item.name == SELF_CARE_NAME).unwrap();
         assert_eq!(health.tier, tier::ROUTINE.name);
         assert_eq!(health.rrule.as_deref(), Some(SELF_CARE_RRULE));
         assert!(health.next_run_at_ms.is_some(), "it would never fire");
         assert!(health.prompt.contains("SYSTEM.md"));
-
-        let skills = items.iter().find(|item| item.name == SKILL_REVIEW_NAME).unwrap();
-        assert_eq!(skills.rrule.as_deref(), Some(SKILL_REVIEW_RRULE));
-        assert!(skills.prompt.contains("conversation history"));
     }
 
     #[test]
@@ -120,7 +89,7 @@ mod tests {
         let runtime_db = db();
         seed(&runtime_db);
         seed(&runtime_db);
-        assert_eq!(SchedulerDb::list_schedules(&runtime_db).unwrap().len(), 2);
+        assert_eq!(SchedulerDb::list_schedules(&runtime_db).unwrap().len(), 1);
     }
 
     #[test]
