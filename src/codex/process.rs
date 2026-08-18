@@ -63,11 +63,6 @@ fn num_of(v: &Value, key: &str) -> i64 {
     v.get(key).and_then(|x| x.as_i64()).unwrap_or_default()
 }
 
-/// How long a single user turn may stream before tera gives up on it.
-/// Real assistant turns run tools and can be slow; this is a liveness backstop,
-/// not a latency target.
-const TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-
 /// Streaming events tera cares about, routed per Codex thread.
 #[derive(Debug, Clone)]
 enum TurnEvent {
@@ -278,14 +273,16 @@ impl CodexProcessManager {
 
         // Reap the child so its exit is observable. Without this the handle was
         // dropped at the end of spawn and a crashed app-server looked identical to
-        // a slow one: every request waited out its timeout instead of failing.
+        // a slow one: requests and turns could wait indefinitely instead of failing.
         let dead_on_exit = dead.clone();
+        let listeners_on_exit = turn_listeners.clone();
         tokio::spawn(async move {
             match child.wait().await {
                 Ok(status) => error!("codex app-server exited: {status}"),
                 Err(e) => error!("Could not wait on codex app-server: {e}"),
             }
             dead_on_exit.store(true, Ordering::SeqCst);
+            Self::fail_listeners(&listeners_on_exit, "codex app-server exited").await;
         });
 
         // Stdout reader task
@@ -334,6 +331,7 @@ impl CodexProcessManager {
             }
             warn!("codex app-server stdout closed");
             dead_on_eof.store(true, Ordering::SeqCst);
+            Self::fail_listeners(&listeners_clone, "codex app-server stdout closed").await;
         });
 
         let mgr = Self {
@@ -774,6 +772,18 @@ impl CodexProcessManager {
         }
     }
 
+    async fn fail_listeners(
+        listeners: &Arc<Mutex<HashMap<String, TurnListener>>>,
+        reason: &str,
+    ) {
+        let lock = listeners.lock().await;
+        for listener in lock.values() {
+            let _ = listener
+                .tx
+                .try_send(TurnEvent::Failed(reason.to_string()));
+        }
+    }
+
     async fn send_notification(&self, method: &str, params: Option<Value>) -> Result<()> {
         let note = json!({
             "jsonrpc": "2.0",
@@ -902,28 +912,22 @@ impl CodexProcessManager {
 
     /// Drain turn events until completion, preferring the final `agentMessage`
     /// text over accumulated deltas (identical in practice, but the completed
-    /// item is what the app-server considers authoritative).
+    /// item is what the app-server considers authoritative). There is no wall
+    /// clock cap because a turn may be installing dependencies or waiting on a
+    /// long-running tool; process death and a closed event stream still fail it.
     async fn collect_turn(rx: &mut mpsc::Receiver<TurnEvent>) -> Result<String> {
         let mut deltas = String::new();
         let mut final_message: Option<String> = None;
-        let timeout = tokio::time::sleep(TURN_TIMEOUT);
-        tokio::pin!(timeout);
 
         loop {
-            tokio::select! {
-                maybe_event = rx.recv() => match maybe_event {
-                    Some(TurnEvent::Delta(d)) => deltas.push_str(&d),
-                    Some(TurnEvent::Message(text)) => final_message = Some(text),
-                    Some(TurnEvent::Completed) => break,
-                    Some(TurnEvent::Failed(reason)) => {
-                        return Err(anyhow!("Codex turn failed: {}", reason));
-                    }
-                    None => return Err(anyhow!("Codex event stream closed mid-turn")),
-                },
-                _ = &mut timeout => {
-                    warn!("Turn streaming timed out after {:?}", TURN_TIMEOUT);
-                    return Err(anyhow!("Codex turn timed out after {:?}", TURN_TIMEOUT));
+            match rx.recv().await {
+                Some(TurnEvent::Delta(d)) => deltas.push_str(&d),
+                Some(TurnEvent::Message(text)) => final_message = Some(text),
+                Some(TurnEvent::Completed) => break,
+                Some(TurnEvent::Failed(reason)) => {
+                    return Err(anyhow!("Codex turn failed: {}", reason));
                 }
+                None => return Err(anyhow!("Codex event stream closed mid-turn")),
             }
         }
 
@@ -1142,6 +1146,27 @@ mod tests {
         tx.send(TurnEvent::Failed("model exploded".into())).await.unwrap();
         let err = CodexProcessManager::collect_turn(&mut rx).await.unwrap_err();
         assert!(err.to_string().contains("model exploded"));
+    }
+
+    #[tokio::test]
+    async fn test_process_death_fails_waiting_turn() {
+        let listeners = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, mut rx) = mpsc::channel(8);
+        listeners.lock().await.insert(
+            "listener".to_string(),
+            TurnListener {
+                thread_id: "thread".to_string(),
+                tx,
+            },
+        );
+
+        let waiting = tokio::spawn(async move {
+            CodexProcessManager::collect_turn(&mut rx).await
+        });
+        CodexProcessManager::fail_listeners(&listeners, "codex app-server exited").await;
+
+        let error = waiting.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("codex app-server exited"));
     }
 }
 

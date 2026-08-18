@@ -1,14 +1,15 @@
 [
   {
     "name": "send_message",
-    "description": "Send a WhatsApp message to {{OWNER}}. This is the ONLY way to reach them. Text you return at the end of a turn is a fallback inside a conversation, and nothing at all from a scheduled task. Plain text, no markdown: no headings, bold, bullet lists or tables. Short. Batch several things into one message rather than sending three.",
+    "description": "Send a WhatsApp message to {{OWNER}}. This is the ONLY way to reach them. Text you return at the end of a turn is a fallback inside a conversation, and nothing at all from a scheduled task. Plain text, no markdown: no headings, bold, bullet lists or tables. Keep messages short and vary their length naturally. If an answer would be dense, send several short messages split at thought boundaries. Do not pad a short answer.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "text": { "type": "string", "description": "Message text. Plain, short, no markdown." },
         "image_path": { "type": "string", "description": "Path to an image file: absolute, or relative to the workspace root" },
         "video_path": { "type": "string", "description": "Path to a video file: absolute, or relative to the workspace root" },
-        "audio_path": { "type": "string", "description": "Path to an audio file: absolute, or relative to the workspace root" }
+        "audio_path": { "type": "string", "description": "Path to an audio file: absolute, or relative to the workspace root" },
+        "file_path": { "type": "string", "description": "Path to any other file to send as a WhatsApp document: absolute, or relative to the workspace root" }
       }
     }
   },

@@ -10,7 +10,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -191,41 +191,16 @@ impl DaemonRpcServer {
             "send_message" => {
                 let recipient = self.recipient()?;
                 let text = args["text"].as_str();
-                let img = args["image_path"].as_str();
-                let vid = args["video_path"].as_str();
-                let aud = args["audio_path"].as_str();
+                let attachment = attachment_argument(args)?;
 
-                if text.is_none() && img.is_none() && vid.is_none() && aud.is_none() {
-                    return Err(anyhow!("send_message requires at least one of text, image_path, video_path, or audio_path"));
+                if text.is_none() && attachment.is_none() {
+                    return Err(anyhow!("send_message requires at least one of text, image_path, video_path, audio_path, or file_path"));
                 }
 
-                let provider_msg_id = if let Some(media_path_str) = img.or(vid).or(aud) {
-                    let m_type = if img.is_some() {
-                        "image"
-                    } else if vid.is_some() {
-                        "video"
-                    } else {
-                        "audio"
-                    };
-                    // The agent works in the workspace and refers to files
-                    // relative to it, but the daemon's cwd is wherever it was
-                    // started, so a bare `tasks/.../clip.mp4` would not resolve.
-                    let raw = PathBuf::from(media_path_str);
-                    let path = if raw.is_absolute() {
-                        raw
-                    } else {
-                        self.config.workspace_dir.join(raw)
-                    };
-
-                    if !path.exists() {
-                        return Err(anyhow!(
-                            "media file not found at {}; give a path inside the workspace",
-                            path.display()
-                        ));
-                    }
-
+                let provider_msg_id = if let Some((media_type, media_path_str)) = attachment {
+                    let path = resolve_media_path(&self.config.workspace_dir, media_path_str)?;
                     self.transport
-                        .send_media(&recipient, m_type, &path, text, None)
+                        .send_media(&recipient, media_type, &path, text, None)
                         .await?
                 } else {
                     let text_str = text.unwrap_or_default();
@@ -397,5 +372,83 @@ impl DaemonRpcServer {
             // language than the ones it already knows.
             _ => Err(anyhow!("Unknown MCP tool name: '{}'", name)),
         }
+    }
+}
+
+fn attachment_argument(args: &Value) -> Result<Option<(&'static str, &str)>> {
+    let candidates = [
+        ("image", args["image_path"].as_str()),
+        ("video", args["video_path"].as_str()),
+        ("audio", args["audio_path"].as_str()),
+        ("document", args["file_path"].as_str()),
+    ];
+    let supplied: Vec<_> = candidates
+        .into_iter()
+        .filter_map(|(media_type, path)| path.map(|path| (media_type, path)))
+        .collect();
+
+    if supplied.len() > 1 {
+        return Err(anyhow!("send_message accepts only one attachment path per call"));
+    }
+
+    Ok(supplied.into_iter().next())
+}
+
+fn resolve_media_path(workspace: &Path, raw: &str) -> Result<PathBuf> {
+    let raw = PathBuf::from(raw);
+    let path = if raw.is_absolute() {
+        raw
+    } else {
+        workspace.join(raw)
+    };
+
+    if !path.is_file() {
+        return Err(anyhow!(
+            "media file not found at {}; give a path to a file inside the workspace",
+            path.display()
+        ));
+    }
+
+    Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    #[test]
+    fn generic_file_is_sent_as_a_document() {
+        let args = json!({"file_path": "notes.pdf"});
+        let attachment = attachment_argument(&args).unwrap();
+        assert_eq!(attachment, Some(("document", "notes.pdf")));
+    }
+
+    #[test]
+    fn send_message_rejects_multiple_attachment_paths() {
+        let error = attachment_argument(&json!({
+            "image_path": "photo.jpg",
+            "file_path": "notes.pdf"
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("only one attachment path"));
+    }
+
+    #[test]
+    fn relative_and_absolute_files_resolve() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("notes.pdf");
+        std::fs::write(&file, b"content").unwrap();
+
+        assert_eq!(resolve_media_path(dir.path(), "notes.pdf").unwrap(), file);
+        assert_eq!(resolve_media_path(dir.path(), file.to_str().unwrap()).unwrap(), file);
+    }
+
+    #[test]
+    fn directories_are_not_sendable_files() {
+        let dir = tempdir().unwrap();
+        let error = resolve_media_path(dir.path(), ".").unwrap_err();
+        assert!(error.to_string().contains("media file not found"));
     }
 }
