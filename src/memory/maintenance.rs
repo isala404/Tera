@@ -133,15 +133,15 @@ impl MaintenanceRunner {
             OptimizerOutcome::Promoted(generation) => {
                 self.runtime_db
                     .set_state_value(LAST_OPTIMIZED_KEY, &today())?;
-                info!("Nightly memory optimization promoted generation {generation}");
+                info!("Nightly compaction promoted generation {generation}");
             }
             // Deliberately does not stamp the date: an abandoned pass should be
             // retried in the next idle window, not written off for the day.
             OptimizerOutcome::Interrupted => {
-                info!("Memory optimization deferred; it will retry when idle")
+                info!("Nightly compaction deferred; it will retry when idle")
             }
             OptimizerOutcome::Rejected(reason) => {
-                warn!("Memory optimization rejected, active memory unchanged: {reason}")
+                warn!("Nightly compaction rejected, active memory unchanged: {reason}")
             }
         }
 

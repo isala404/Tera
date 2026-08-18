@@ -1,7 +1,7 @@
-//! The memory optimizer.
+//! Nightly memory and technical compaction.
 //!
 //! Rust owns the transaction. Clone the active generation into staging, run the
-//! model against the staging copy, validate the result, swap it in atomically , 
+//! model against the staging copy, validate the result, swap it in atomically ,
 //! and nothing else. Deciding what a memory tree *should say* is the model's job
 //! (PLAN.md section 2.2); the previous version did the reorganising itself in
 //! Rust with substring matches, which is exactly the intelligence that does not
@@ -79,7 +79,7 @@ impl MemoryOptimizer {
         activity: &crate::runtime::ActivityTracker,
     ) -> Result<OptimizerOutcome> {
         let staging = Self::prepare_staging(config)?;
-        info!("Optimizing memory in staging copy {:?}", staging);
+        info!("Compacting memory and technical work in {:?}", staging);
 
         let thread_id = codex.start_isolated_thread(&staging, tier::HEAVY).await?;
         let prompt = Self::prompt(config, &staging);
@@ -117,7 +117,7 @@ impl MemoryOptimizer {
 
         let generation = GenerationManager::atomic_swap_generation(config, &staging)?;
         runtime_db.set_state_value(RETRY_PENDING_KEY, "false")?;
-        info!("Memory optimization complete; generation {generation} is active");
+        info!("Nightly compaction complete; generation {generation} is active");
         Ok(OptimizerOutcome::Promoted(generation))
     }
 
@@ -128,6 +128,7 @@ impl MemoryOptimizer {
             crate::data::MEMORY_OPTIMIZER_PROMPT,
             &[
                 ("OWNER", &config.owner_name),
+                ("WORKSPACE", &config.workspace_dir.display().to_string()),
                 ("STAGING", &staging.display().to_string()),
                 ("MEMORIES", &config.memories_link().display().to_string()),
                 ("HISTORY", &config.workspace_dir.join("history").display().to_string()),
@@ -215,8 +216,9 @@ mod tests {
         let prompt = MemoryOptimizer::prompt(&config, &staging);
         assert!(prompt.contains(&staging.display().to_string()));
         assert!(prompt.contains(&config.history_db_path().display().to_string()));
-        assert!(prompt.contains("read-only"));
-        assert!(prompt.contains("Do not call send_message"));
+        assert!(prompt.contains(&config.skills_dir().display().to_string()));
+        assert!(prompt.contains("existing skill should improve"));
+        assert!(prompt.contains("Do not create or edit skills"));
         assert!(!prompt.contains("{{"), "unfilled placeholder in the optimizer prompt");
     }
 }

@@ -24,6 +24,12 @@ async fn test_workspace_init() {
     assert!(config.projects_dir().join("AGENTS.md").exists());
     assert!(config.tasks_dir().join("AGENTS.md").exists());
     assert!(config.codex_home_dir().join("config.toml").exists());
+    assert!(!tera::data::BUILTIN_SKILLS.is_empty());
+    for skill in tera::data::BUILTIN_SKILLS {
+        for file in skill.files {
+            assert!(config.skills_dir().join(skill.name).join(file.relative_path).exists());
+        }
+    }
     assert!(config.memories_link().exists());
     assert!(config.memories_link().join("INDEX.md").exists());
 }
