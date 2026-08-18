@@ -420,7 +420,8 @@ mod tests {
 
     #[test]
     fn generic_file_is_sent_as_a_document() {
-        let attachment = attachment_argument(&json!({"file_path": "notes.pdf"})).unwrap();
+        let args = json!({"file_path": "notes.pdf"});
+        let attachment = attachment_argument(&args).unwrap();
         assert_eq!(attachment, Some(("document", "notes.pdf")));
     }
 

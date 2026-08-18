@@ -95,7 +95,7 @@ Add `sudo loginctl enable-linger "$USER"` to keep it running while logged out. I
 
 - `rusqlite` is pinned at 0.39 on purpose. 0.40 needs `libsqlite3-sys` 0.38 while `whatsapp-rust-sqlite-storage` pins `^0.37`, and only one crate may link the native sqlite3 library. It moves when `whatsapp-rust` does.
 - The memory optimizer and rebuild prompts run as real Codex turns over your history and are the least-tested part of this; nobody has watched a nightly pass against a real model and confirmed the output is any good.
-- Turns time out at 300 seconds; a hung one dies there.
+- Turns have no wall-clock cap, so a hung tool can hold a worker indefinitely; process death and a closed event stream are the recovery boundaries.
 - Schedules use the host's local time, not a fixed timezone. Fly somewhere with the laptop and a 07:30 brief stays 07:30 wherever it now thinks it is.
 - History backups accumulate forever, one per daemon start, with nothing pruning them.
 - No fault-injection suite. Recovery paths have unit tests, but nothing kills a live daemon mid-write to see what happens.
