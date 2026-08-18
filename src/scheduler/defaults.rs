@@ -1,14 +1,7 @@
-//! The one schedule tera creates for itself.
+//! The built-in schedules tera creates for itself.
 //!
-//! The assistant is told to keep the machine it lives on healthy, but it only
-//! wakes when a message arrives, so without a seeded schedule the instruction is
-//! aspiration, not behaviour. A fresh workspace gets a daily health pass and looks
-//! after the host from the first start.
-//!
-//! Seeding is recorded in `daemon_state` rather than inferred from the schedules
-//! table. Cancelling it has to stick: keying off "is there an active schedule with
-//! this name" would recreate it on the very next restart, which is the assistant
-//! overruling the user once a day forever.
+//! A fresh workspace gets a daily health pass and a nightly skill review. Each
+//! seed has its own durable marker, so cancelling one is not undone on restart.
 
 use crate::codex::tier;
 use crate::runtime::RuntimeDb;
@@ -20,56 +13,73 @@ use serde_json::json;
 use tracing::{info, warn};
 
 const SELF_CARE_NAME: &str = "Machine health check";
-
-/// Marks that seeding has happened. Survives cancellation of the schedule itself.
+const SKILL_REVIEW_NAME: &str = "Nightly skill review";
 const SEEDED_KEY: &str = "seeded_self_care_schedule";
-
-/// 09:30 local, daily. A laptop is usually asleep at 4am, and a pass that is
-/// always late is a pass whose lateness stops meaning anything; mid-morning it
-/// mostly runs on time, and the prompt tells it that being late does not matter
-/// for this particular task anyway.
+const SKILL_REVIEW_SEEDED_KEY: &str = "seeded_skill_review_schedule";
 const SELF_CARE_RRULE: &str = "30 9 * * *";
+const SKILL_REVIEW_RRULE: &str = "0 2 * * *";
 
-/// Create the machine-health schedule the first time this workspace starts.
+/// Create the built-in schedules the first time this workspace starts.
 ///
-/// Errors are logged, not propagated: a workspace that cannot seed a housekeeping
-/// task is still a workspace that should come up and answer messages.
+/// Errors are logged, not propagated. A workspace that cannot seed housekeeping
+/// still needs to come up and answer messages.
 pub fn seed(runtime_db: &RuntimeDb) {
-    if let Err(e) = try_seed(runtime_db) {
-        warn!("Could not seed the {SELF_CARE_NAME} schedule: {e:?}");
+    if let Err(error) = try_seed_one(
+        runtime_db,
+        SELF_CARE_NAME,
+        SEEDED_KEY,
+        SELF_CARE_RRULE,
+        crate::data::SELF_CARE_PROMPT,
+        "tasks/machine-health",
+    ) {
+        warn!("Could not seed the {SELF_CARE_NAME} schedule: {error:?}");
+    }
+    if let Err(error) = try_seed_one(
+        runtime_db,
+        SKILL_REVIEW_NAME,
+        SKILL_REVIEW_SEEDED_KEY,
+        SKILL_REVIEW_RRULE,
+        crate::data::SKILL_REVIEW_PROMPT,
+        "tasks/skill-review",
+    ) {
+        warn!("Could not seed the {SKILL_REVIEW_NAME} schedule: {error:?}");
     }
 }
 
-fn try_seed(runtime_db: &RuntimeDb) -> Result<()> {
-    if runtime_db.get_state_value(SEEDED_KEY)?.is_some() {
+fn try_seed_one(
+    runtime_db: &RuntimeDb,
+    name: &str,
+    seeded_key: &str,
+    rrule: &str,
+    prompt: &str,
+    task_path: &str,
+) -> Result<()> {
+    if runtime_db.get_state_value(seeded_key)?.is_some() {
         return Ok(());
     }
 
-    // A workspace that predates this code already has the schedule under this name
-    // if a previous build seeded it by name. Adopt it rather than making a second.
-    if SchedulerDb::name_was_ever_used(runtime_db, SELF_CARE_NAME)? {
-        runtime_db.set_state_value(SEEDED_KEY, "adopted")?;
+    // Adopt a schedule created by an older build rather than making a duplicate.
+    if SchedulerDb::name_was_ever_used(runtime_db, name)? {
+        runtime_db.set_state_value(seeded_key, "adopted")?;
         return Ok(());
     }
 
     let timing = ScheduleTiming::parse(
-        &json!({ "type": "recurring", "rrule": SELF_CARE_RRULE }),
+        &json!({ "type": "recurring", "rrule": rrule }),
         Utc::now().timestamp_millis(),
     )?;
-
     let item = SchedulerDb::create_schedule(
         runtime_db,
-        SELF_CARE_NAME,
-        crate::data::SELF_CARE_PROMPT,
+        name,
+        prompt,
         &timing,
-        "tasks/machine-health",
+        task_path,
         tier::ROUTINE,
     )?;
-
-    runtime_db.set_state_value(SEEDED_KEY, &item.id)?;
+    runtime_db.set_state_value(seeded_key, &item.id)?;
     info!(
         target: "tera::scheduler",
-        "Seeded the {SELF_CARE_NAME} schedule ({}); first run {}",
+        "Seeded the {name} schedule ({}); first run {}",
         item.id,
         recurrence::local_time(timing.first_run_ms)
     );
@@ -83,47 +93,45 @@ mod tests {
     fn db() -> RuntimeDb {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.sqlite3");
-        // The tempdir has to outlive the connection; leaking it is fine in a test.
         std::mem::forget(dir);
         RuntimeDb::open(&path).unwrap()
     }
 
     #[test]
-    fn test_seeding_creates_one_daily_routine_schedule() {
+    fn test_seeding_creates_daily_routines() {
         let runtime_db = db();
         seed(&runtime_db);
 
         let items = SchedulerDb::list_schedules(&runtime_db).unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].name, SELF_CARE_NAME);
-        assert_eq!(items[0].tier, tier::ROUTINE.name);
-        assert_eq!(items[0].rrule.as_deref(), Some(SELF_CARE_RRULE));
-        assert!(items[0].next_run_at_ms.is_some(), "it would never fire");
-        assert!(items[0].prompt.contains("SYSTEM.md"));
+        assert_eq!(items.len(), 2);
+        let health = items.iter().find(|item| item.name == SELF_CARE_NAME).unwrap();
+        assert_eq!(health.tier, tier::ROUTINE.name);
+        assert_eq!(health.rrule.as_deref(), Some(SELF_CARE_RRULE));
+        assert!(health.next_run_at_ms.is_some(), "it would never fire");
+        assert!(health.prompt.contains("SYSTEM.md"));
+
+        let skills = items.iter().find(|item| item.name == SKILL_REVIEW_NAME).unwrap();
+        assert_eq!(skills.rrule.as_deref(), Some(SKILL_REVIEW_RRULE));
+        assert!(skills.prompt.contains("conversation history"));
     }
 
     #[test]
-    fn test_seeding_twice_does_not_make_two() {
+    fn test_seeding_twice_does_not_duplicate() {
         let runtime_db = db();
         seed(&runtime_db);
         seed(&runtime_db);
-        assert_eq!(SchedulerDb::list_schedules(&runtime_db).unwrap().len(), 1);
+        assert_eq!(SchedulerDb::list_schedules(&runtime_db).unwrap().len(), 2);
     }
 
-    /// The important one. Every start calls `seed`, so a cancellation that does not
-    /// stick means the assistant reinstates a task the user deliberately removed.
     #[test]
-    fn test_a_cancelled_seed_is_not_recreated_on_the_next_start() {
+    fn test_cancelled_built_ins_are_not_recreated() {
         let runtime_db = db();
         seed(&runtime_db);
-
-        let id = SchedulerDb::list_schedules(&runtime_db).unwrap()[0].id.clone();
-        assert!(SchedulerDb::cancel_schedule(&runtime_db, &id).unwrap());
+        for item in SchedulerDb::list_schedules(&runtime_db).unwrap() {
+            assert!(SchedulerDb::cancel_schedule(&runtime_db, &item.id).unwrap());
+        }
 
         seed(&runtime_db);
-        assert!(
-            SchedulerDb::list_schedules(&runtime_db).unwrap().is_empty(),
-            "the health schedule came back after being cancelled"
-        );
+        assert!(SchedulerDb::list_schedules(&runtime_db).unwrap().is_empty());
     }
 }

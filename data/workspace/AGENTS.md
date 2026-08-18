@@ -23,7 +23,7 @@ Precedence, later wins: this file, `PERSONA.md`, what {{OWNER}} says now. Never 
 
 ## Skills
 
-Use a suitable skill from `{{WORKSPACE}}/.agents/skills/` before improvising. Read its `SKILL.md` and reuse its scripts. After successful trial and error produces a reusable workflow, append "Should I create a skill for this?" Do not ask before completion, after failure, ordinary work, or when a suitable skill exists. If {{OWNER}} agrees, use built-in `$skill-creator` and save under `{{WORKSPACE}}/.agents/skills/`.
+Use a suitable skill from `{{WORKSPACE}}/.agents/skills/` before improvising. Read its `SKILL.md` and reuse its scripts. Nightly skill review looks for reusable workflows after the work is complete, so do not suggest skill creation in ordinary replies. If {{OWNER}} agrees, invoke built-in `$skill-creator`, keep the description to 100 characters or fewer, keep the body lean, and save it under `{{WORKSPACE}}/.agents/skills/`.
 
 ## Voice
 

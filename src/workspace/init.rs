@@ -2,6 +2,8 @@ use crate::config::Config;
 use crate::memory::generations::GenerationManager;
 use crate::workspace::templates::*;
 use anyhow::{anyhow, bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::ffi::CString;
@@ -126,8 +128,9 @@ impl WorkspaceInit {
         // from history and there is nowhere else it could have been written down.
         Self::write_file_if_missing(&config.system_notes_path(), &system_notes_template(config))?;
 
-        // Native skills are seeded as user-owned packages. A package that is
-        // already present, including a symlink, wins over the bundled copy.
+        // Native skills are seeded once. Existing paths, edits, symlinks, and
+        // deliberate deletions remain user-owned; untouched managed packages can
+        // receive a later embedded update.
         Self::seed_builtin_skills(config)?;
 
         // Codex config is regenerated every start: unlike the instruction files
@@ -179,91 +182,192 @@ impl WorkspaceInit {
         }
     }
 
-    /// Seed each bundled skill atomically and only when its package is absent.
-    ///
-    /// Codex owns the resulting .agents/skills tree. The daemon must not
-    /// rewrite an installed skill because it may contain the user's edits or
-    /// deliberately be a symlink into another checkout.
+    /// Seed, update, or remember each bundled skill without taking ownership of
+    /// a path the user already has. The state file is outside .agents/skills so
+    /// deleting a built-in remains a durable choice.
     fn seed_builtin_skills(config: &Config) -> Result<()> {
+        let mut state = Self::load_builtin_skill_state(config)?;
+
         for skill in crate::data::BUILTIN_SKILLS {
-            if !is_safe_skill_path(skill.name) {
-                bail!("invalid built-in skill name {:?}", skill.name);
-            }
-            for file in skill.files {
-                if !is_safe_skill_path(file.relative_path) {
-                    bail!(
-                        "invalid path {:?} in built-in skill {:?}",
-                        file.relative_path,
-                        skill.name
-                    );
-                }
-            }
+            validate_builtin_skill(skill)?;
 
+            let source_files = embedded_skill_files(skill);
+            let source_fingerprint = fingerprint_files(&source_files);
             let destination = config.skills_dir().join(skill.name);
-            match fs::symlink_metadata(&destination) {
-                Ok(_) => {
-                    warn!(
-                        "Built-in skill {:?} already exists at {:?}; leaving it untouched",
-                        skill.name, destination
-                    );
-                    continue;
-                }
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("Failed to inspect built-in skill {:?}", destination)
-                    });
-                }
-            }
 
-            let staging = Self::create_skill_staging(&config.skills_dir(), skill.name)?;
-            let install = (|| -> Result<()> {
-                for file in skill.files {
-                    let path = staging.join(file.relative_path);
-                    if let Some(parent) = path.parent() {
-                        fs::create_dir_all(parent).with_context(|| {
-                            format!("Failed to create skill directory {:?}", parent)
-                        })?;
+            match state.skills.get(skill.name).cloned() {
+                None => {
+                    if has_path(&destination) {
+                        warn!(
+                            "Built-in skill {:?} already exists at {:?}; treating it as user-owned",
+                            skill.name, destination
+                        );
+                        state.skills.insert(
+                            skill.name.to_string(),
+                            BuiltinSkillRecord::user_owned(),
+                        );
+                        continue;
                     }
-                    fs::write(&path, file.contents).with_context(|| {
-                        format!("Failed to write built-in skill file {:?}", path)
-                    })?;
-                    let mode = if file.executable { 0o755 } else { 0o644 };
-                    fs::set_permissions(&path, fs::Permissions::from_mode(mode))
-                        .with_context(|| format!("Failed to set permissions on {:?}", path))?;
-                }
 
-                // Check again after writing. This prevents a normal concurrent
-                // initializer from being replaced if it appeared during staging.
-                if fs::symlink_metadata(&destination).is_ok() {
-                    warn!(
-                        "Built-in skill {:?} appeared during installation; leaving it untouched",
-                        destination
-                    );
-                    let _ = fs::remove_dir_all(&staging);
-                    return Ok(());
+                    if Self::install_new_skill(&config.skills_dir(), skill)? {
+                        info!("Seeded built-in skill {:?} at {:?}", skill.name, destination);
+                        state.skills.insert(
+                            skill.name.to_string(),
+                            BuiltinSkillRecord::managed(source_fingerprint, source_files),
+                        );
+                    } else if has_path(&destination) {
+                        state.skills.insert(
+                            skill.name.to_string(),
+                            BuiltinSkillRecord::user_owned(),
+                        );
+                    }
                 }
-                if !rename_skill_without_replace(&staging, &destination)? {
-                    warn!(
-                        "Built-in skill {:?} appeared during installation; leaving it untouched",
-                        destination
-                    );
-                    let _ = fs::remove_dir_all(&staging);
-                }
-                Ok(())
-            })();
+                Some(mut record) => match record.status {
+                    BuiltinSkillStatus::Deleted | BuiltinSkillStatus::UserOwned => {}
+                    BuiltinSkillStatus::Managed => {
+                        if !has_path(&destination) {
+                            info!(
+                                "Built-in skill {:?} was deleted; preserving that choice",
+                                skill.name
+                            );
+                            record.status = BuiltinSkillStatus::Deleted;
+                            state.skills.insert(skill.name.to_string(), record);
+                            continue;
+                        }
 
-            if let Err(error) = install {
+                        if installed_skill_files(&destination)? != Some(record.files.clone()) {
+                            warn!(
+                                "Built-in skill {:?} changed at {:?}; preserving it as user-owned",
+                                skill.name, destination
+                            );
+                            record.status = BuiltinSkillStatus::UserOwned;
+                            state.skills.insert(skill.name.to_string(), record);
+                            continue;
+                        }
+
+                        if record.fingerprint != source_fingerprint {
+                            if Self::update_managed_skill(
+                                &config.skills_dir(),
+                                skill,
+                                &record.files,
+                            )? {
+                                info!("Updated built-in skill {:?} at {:?}", skill.name, destination);
+                                state.skills.insert(
+                                    skill.name.to_string(),
+                                    BuiltinSkillRecord::managed(source_fingerprint, source_files),
+                                );
+                            } else {
+                                warn!(
+                                    "Built-in skill {:?} changed while updating; preserving it as user-owned",
+                                    skill.name
+                                );
+                                record.status = BuiltinSkillStatus::UserOwned;
+                                state.skills.insert(skill.name.to_string(), record);
+                            }
+                        }
+                    }
+                },
+            }
+        }
+
+        Self::write_builtin_skill_state(config, &state)
+    }
+
+    fn install_new_skill(
+        skills_dir: &Path,
+        skill: &crate::data::BuiltinSkill,
+    ) -> Result<bool> {
+        let destination = skills_dir.join(skill.name);
+        let staging = Self::create_skill_staging(skills_dir, skill.name)?;
+        let install = (|| -> Result<bool> {
+            write_skill_files(&staging, skill)?;
+
+            // Check again after writing. This prevents a normal concurrent
+            // initializer from being replaced if it appeared during staging.
+            if has_path(&destination) {
+                return Ok(false);
+            }
+            rename_skill_without_replace(&staging, &destination)
+        })();
+
+        let installed = match install {
+            Ok(installed) => installed,
+            Err(error) => {
                 let _ = fs::remove_dir_all(&staging);
                 return Err(error);
             }
+        };
+        if !installed {
+            let _ = fs::remove_dir_all(&staging);
+        }
+        Ok(installed)
+    }
 
-            if destination.exists() {
-                info!(
-                    "Seeded built-in skill {:?} at {:?}",
-                    skill.name, destination
-                );
+    /// Replace a package only after confirming that its files still match the
+    /// last embedded version. The old managed directory is kept as a temporary
+    /// backup until the new one is in place, so a failed rename can be restored.
+    fn update_managed_skill(
+        skills_dir: &Path,
+        skill: &crate::data::BuiltinSkill,
+        expected_files: &BTreeMap<String, String>,
+    ) -> Result<bool> {
+        let destination = skills_dir.join(skill.name);
+        let staging = Self::create_skill_staging(skills_dir, skill.name)?;
+        let install = (|| -> Result<bool> {
+            write_skill_files(&staging, skill)?;
+            if installed_skill_files(&destination)? != Some(expected_files.clone()) {
+                return Ok(false);
             }
+
+            let backup = free_skill_aux_path(skills_dir, skill.name, "backup")?;
+            fs::rename(&destination, &backup)
+                .with_context(|| format!("failed to stage old built-in skill {destination:?}"))?;
+            match fs::rename(&staging, &destination) {
+                Ok(()) => {
+                    fs::remove_dir_all(&backup)
+                        .with_context(|| format!("failed to remove old built-in skill {backup:?}"))?;
+                    Ok(true)
+                }
+                Err(error) => {
+                    let _ = fs::rename(&backup, &destination);
+                    Err(error).with_context(|| {
+                        format!("failed to install updated built-in skill {destination:?}")
+                    })
+                }
+            }
+        })();
+
+        match install {
+            Ok(updated) => {
+                if !updated {
+                    let _ = fs::remove_dir_all(&staging);
+                }
+                Ok(updated)
+            }
+            Err(error) => {
+                let _ = fs::remove_dir_all(&staging);
+                Err(error)
+            }
+        }
+    }
+
+    fn load_builtin_skill_state(config: &Config) -> Result<BuiltinSkillState> {
+        match fs::read(config.builtin_skills_state_path()) {
+            Ok(bytes) => serde_json::from_slice(&bytes).context("invalid built-in skill state"),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(BuiltinSkillState::default()),
+            Err(error) => Err(error).context("failed to read built-in skill state"),
+        }
+    }
+
+    fn write_builtin_skill_state(config: &Config, state: &BuiltinSkillState) -> Result<()> {
+        let path = config.builtin_skills_state_path();
+        let temporary = path.with_extension(format!("json.tmp-{}", std::process::id()));
+        let contents = serde_json::to_vec_pretty(state).context("failed to encode built-in skill state")?;
+        fs::write(&temporary, contents)
+            .with_context(|| format!("failed to write built-in skill state {temporary:?}"))?;
+        if let Err(error) = fs::rename(&temporary, &path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error).with_context(|| format!("failed to install built-in skill state {path:?}"));
         }
         Ok(())
     }
@@ -381,6 +485,184 @@ impl WorkspaceInit {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BuiltinSkillState {
+    skills: BTreeMap<String, BuiltinSkillRecord>,
+}
+
+impl Default for BuiltinSkillState {
+    fn default() -> Self {
+        Self {
+            skills: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BuiltinSkillRecord {
+    status: BuiltinSkillStatus,
+    fingerprint: String,
+    files: BTreeMap<String, String>,
+}
+
+impl BuiltinSkillRecord {
+    fn managed(fingerprint: String, files: BTreeMap<String, String>) -> Self {
+        Self {
+            status: BuiltinSkillStatus::Managed,
+            fingerprint,
+            files,
+        }
+    }
+
+    fn user_owned() -> Self {
+        Self {
+            status: BuiltinSkillStatus::UserOwned,
+            fingerprint: String::new(),
+            files: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum BuiltinSkillStatus {
+    Managed,
+    UserOwned,
+    Deleted,
+}
+
+fn validate_builtin_skill(skill: &crate::data::BuiltinSkill) -> Result<()> {
+    if !is_safe_skill_path(skill.name) {
+        bail!("invalid built-in skill name {:?}", skill.name);
+    }
+    if skill.files.is_empty() {
+        bail!("built-in skill {:?} has no files", skill.name);
+    }
+    for file in skill.files {
+        if !is_safe_skill_path(file.relative_path) {
+            bail!(
+                "invalid path {:?} in built-in skill {:?}",
+                file.relative_path,
+                skill.name
+            );
+        }
+    }
+    Ok(())
+}
+
+fn write_skill_files(staging: &Path, skill: &crate::data::BuiltinSkill) -> Result<()> {
+    for file in skill.files {
+        let path = staging.join(file.relative_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create skill directory {parent:?}"))?;
+        }
+        fs::write(&path, file.contents)
+            .with_context(|| format!("failed to write built-in skill file {path:?}"))?;
+        let mode = if file.executable { 0o755 } else { 0o644 };
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode))
+            .with_context(|| format!("failed to set permissions on {path:?}"))?;
+    }
+    Ok(())
+}
+
+fn embedded_skill_files(skill: &crate::data::BuiltinSkill) -> BTreeMap<String, String> {
+    skill
+        .files
+        .iter()
+        .map(|file| (file.relative_path.to_string(), fingerprint(file.contents)))
+        .collect()
+}
+
+fn fingerprint_files(files: &BTreeMap<String, String>) -> String {
+    let mut bytes = Vec::new();
+    for (path, fingerprint) in files {
+        bytes.extend_from_slice(path.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(fingerprint.as_bytes());
+        bytes.push(0xff);
+    }
+    fingerprint(&bytes)
+}
+
+/// A stable, dependency-free content fingerprint. It detects accidental or
+/// user edits; it is not used as a security boundary.
+fn fingerprint(bytes: &[u8]) -> String {
+    let mut hash = 14_695_981_039_346_656_037u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(1_099_511_628_211);
+    }
+    format!("{hash:016x}")
+}
+
+fn installed_skill_files(path: &Path) -> Result<Option<BTreeMap<String, String>>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("failed to inspect {path:?}")),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(None);
+    }
+
+    let mut files = BTreeMap::new();
+    if !collect_installed_files(path, path, &mut files)? {
+        return Ok(None);
+    }
+    Ok(Some(files))
+}
+
+fn collect_installed_files(
+    root: &Path,
+    current: &Path,
+    files: &mut BTreeMap<String, String>,
+) -> Result<bool> {
+    for entry in fs::read_dir(current).with_context(|| format!("failed to read {current:?}"))? {
+        let path = entry?.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Ok(false);
+        }
+        if metadata.is_dir() {
+            if !collect_installed_files(root, &path, files)? {
+                return Ok(false);
+            }
+        } else if metadata.is_file() {
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| anyhow!("skill path escaped its root: {path:?}"))?
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            if !is_safe_skill_path(&relative) {
+                return Ok(false);
+            }
+            let contents = fs::read(&path)?;
+            files.insert(relative, fingerprint(&contents));
+        } else {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn has_path(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+fn free_skill_aux_path(skills_dir: &Path, skill_name: &str, kind: &str) -> Result<PathBuf> {
+    for attempt in 0..1000 {
+        let path = skills_dir.join(format!(
+            ".{skill_name}-{kind}-{}-{attempt}",
+            std::process::id()
+        ));
+        if !has_path(&path) {
+            return Ok(path);
+        }
+    }
+    Err(anyhow!("could not find a free {kind} path for skill {skill_name:?}"))
 }
 
 fn is_safe_skill_path(path: &str) -> bool {
@@ -605,60 +887,68 @@ mod tests {
     fn test_builtin_skill_is_seeded_atomically_and_preserved() {
         let tmp = tempfile::tempdir().unwrap();
         let config = Config::new(tmp.path().to_path_buf(), true);
+        let builtin = crate::data::BUILTIN_SKILLS.first().unwrap();
 
         WorkspaceInit::init(&config).unwrap();
-        let skill = config.skills_dir().join("spotify");
-        let script = skill.join("scripts/spotify-control");
+        let skill = config.skills_dir().join(builtin.name);
         assert!(skill.join("SKILL.md").exists());
-        assert_eq!(
-            fs::read_to_string(&script).unwrap().lines().next(),
-            Some("#!/usr/bin/env bash")
-        );
-        assert_eq!(
-            fs::metadata(&script).unwrap().permissions().mode() & 0o777,
-            0o755
-        );
+        let first_file = builtin.files.first().unwrap();
+        let first_path = skill.join(first_file.relative_path);
+        let original = fs::read(&first_path).unwrap();
 
-        fs::write(&script, "#!/bin/sh\necho user-owned\n").unwrap();
+        fs::write(&first_path, b"user-owned\n").unwrap();
         WorkspaceInit::init(&config).unwrap();
-        assert_eq!(
-            fs::read_to_string(script).unwrap(),
-            "#!/bin/sh\necho user-owned\n"
-        );
+        assert_eq!(fs::read(&first_path).unwrap(), b"user-owned\n");
+        assert_ne!(original, b"user-owned\n");
     }
 
     #[test]
     fn test_existing_skill_directory_and_dangling_symlink_are_preserved() {
         let tmp = tempfile::tempdir().unwrap();
         let config = Config::new(tmp.path().to_path_buf(), true);
-        fs::create_dir_all(config.skills_dir().join("spotify")).unwrap();
-        fs::write(config.skills_dir().join("spotify/SKILL.md"), "user skill\n").unwrap();
+        let builtin = crate::data::BUILTIN_SKILLS.first().unwrap();
+        let skill_path = config.skills_dir().join(builtin.name);
+        fs::create_dir_all(&skill_path).unwrap();
+        fs::write(skill_path.join("SKILL.md"), "user skill\n").unwrap();
         WorkspaceInit::init(&config).unwrap();
         assert_eq!(
-            fs::read_to_string(config.skills_dir().join("spotify/SKILL.md")).unwrap(),
+            fs::read_to_string(skill_path.join("SKILL.md")).unwrap(),
             "user skill\n"
         );
 
         let symlink_tmp = tempfile::tempdir().unwrap();
         let symlink_config = Config::new(symlink_tmp.path().to_path_buf(), true);
         fs::create_dir_all(&symlink_config.skills_dir()).unwrap();
+        let symlink_path = symlink_config.skills_dir().join(builtin.name);
         symlink(
             symlink_tmp.path().join("missing-target"),
-            symlink_config.skills_dir().join("spotify"),
+            &symlink_path,
         )
         .unwrap();
         WorkspaceInit::init(&symlink_config).unwrap();
-        assert!(
-            fs::symlink_metadata(symlink_config.skills_dir().join("spotify"))
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
+        assert!(fs::symlink_metadata(symlink_path).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn test_deleting_a_managed_skill_is_not_reversed_on_reinit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Config::new(tmp.path().to_path_buf(), true);
+        let builtin = crate::data::BUILTIN_SKILLS.first().unwrap();
+
+        WorkspaceInit::init(&config).unwrap();
+        fs::remove_dir_all(config.skills_dir().join(builtin.name)).unwrap();
+        WorkspaceInit::init(&config).unwrap();
+        WorkspaceInit::init(&config).unwrap();
+
+        assert!(!has_path(&config.skills_dir().join(builtin.name)));
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(config.builtin_skills_state_path()).unwrap()).unwrap();
+        assert_eq!(state["skills"][builtin.name]["status"], "deleted");
     }
 
     #[test]
     fn test_builtin_skill_paths_must_be_simple_relative_paths() {
-        assert!(is_safe_skill_path("scripts/spotify-control"));
+        assert!(is_safe_skill_path("scripts/control"));
         assert!(!is_safe_skill_path(""));
         assert!(!is_safe_skill_path("../outside"));
         assert!(!is_safe_skill_path("scripts/../outside"));
@@ -670,7 +960,7 @@ mod tests {
     fn test_skill_installation_does_not_replace_a_racing_destination() {
         let tmp = tempfile::tempdir().unwrap();
         let staging = tmp.path().join("staging");
-        let destination = tmp.path().join("spotify");
+        let destination = tmp.path().join("skill");
         fs::create_dir(&staging).unwrap();
         fs::create_dir(&destination).unwrap();
 

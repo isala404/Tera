@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+SKILL_DIR="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
+WORKSPACE="$(CDPATH= cd -- "$SKILL_DIR/../../.." && pwd)"
+ROOT="${TERA_SPOTIFY_ROOT:-$WORKSPACE/.runtime/spotify-player}"
+PLAYER="$ROOT/bin/spotify_player"
+CONFIG="$ROOT/config/app.toml"
+CACHE="$ROOT/cache"
+missing=0
+
+check() {
+  if "$@"; then
+    echo "ok: $*"
+  else
+    echo "missing: $*"
+    missing=1
+  fi
+}
+
+check command -v python3 >/dev/null
+check command -v cargo >/dev/null
+check test -x "$PLAYER"
+check test -f "$CONFIG"
+check grep -q 'login_redirect_uri = "http://127.0.0.1:8989/login"' "$CONFIG"
+check test -f "$SKILL_DIR/scripts/spotify-auth-relay.py"
+
+if [[ ! -f "$CACHE/credentials.json" || ! -f "$CACHE/user_client_token.json" ]]; then
+  echo "missing: Spotify OAuth cache"
+  echo "action: run scripts/spotify-auth start, approve the PKCE URL, and use the relay page"
+  missing=1
+else
+  echo "ok: Spotify OAuth cache files exist"
+fi
+
+if [[ "$missing" -ne 0 ]]; then
+  echo "Spotify skill is not ready. To install the helper, run:"
+  echo "cargo install spotify_player --locked --root '$ROOT'"
+  echo "Then run scripts/spotify-auth start. It uses PKCE and needs no client secret."
+  exit 1
+fi
+
+echo "Spotify skill is ready. Device availability changes when Spotify is active."
