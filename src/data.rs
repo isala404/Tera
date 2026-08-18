@@ -222,6 +222,8 @@ mod tests {
             assert!(tool["description"].is_string(), "{tool} has no description");
             assert!(tool["inputSchema"].is_object(), "{tool} has no inputSchema");
         }
+        let send_message = tools.iter().find(|t| t["name"] == "send_message").unwrap();
+        assert!(send_message["inputSchema"]["properties"]["file_path"].is_object());
     }
 
     /// The `tier` values the tool advertises are the ones `codex::tier` resolves.
