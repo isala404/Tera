@@ -62,7 +62,7 @@ Every subcommand takes `--workspace <path>`, default `/workspace`. Point it some
   PERSONA.md                yours, written once, never touched again
   SYSTEM.md                 the agent's notebook on this machine
   MEMORIES -> .memory/generations/NNNNNNNN
-  .agents/skills/           native Codex skills, seeded once when absent
+  .agents/skills/           native Codex skills, seeded and versioned from data/skills
   .codex-home/              private CODEX_HOME: config.toml, auth.json symlink
   .runtime/                 socket, state.sqlite3, whatsapp_session.db
   history/                  history.sqlite3, jsonl/, assets/, backups/
@@ -72,7 +72,7 @@ Every subcommand takes `--workspace <path>`, default `/workspace`. Point it some
 
 Generated files carry an HTML comment marker and are rewritten every start, so an improved template reaches an existing workspace. Hand-edit one and Tera backs your copy up to `<file>.md.user-backup` and installs its own, so put your instructions in `PERSONA.md`, which is written once and left alone.
 
-Built-in skills are stored under `.agents/skills/`, the native Codex repository location. Tera installs each bundled skill only when its package is absent, then leaves it user-owned. Existing skill directories and symlinks are preserved.
+Built-in skills are stored under `.agents/skills/`, the native Codex repository location. Every package in `data/skills/` is discovered at build time, with no per-skill Rust registration. Tera installs each package once, updates an untouched managed package when its embedded files change, and remembers user edits, existing paths, symlinks, and deletions. The nightly skill review can suggest a reusable workflow after the work is complete. It does not create skills without the user's approval.
 
 Codex reaches the daemon through five tools: `send_message`, `react`, `schedule`, `list_schedules` and `cancel_schedule`. Schedules name a tier rather than a model id (`src/codex/tier.rs`): `routine` is luna at low effort and the default, `default` is luna at xhigh for conversation, `heavy` is sol at high.
 

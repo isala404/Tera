@@ -49,34 +49,17 @@ pub struct BuiltinSkillFile {
     pub executable: bool,
 }
 
-const SPOTIFY_FILES: &[BuiltinSkillFile] = &[
-    BuiltinSkillFile {
-        relative_path: "SKILL.md",
-        contents: include_bytes!("../data/skills/spotify/SKILL.md"),
-        executable: false,
-    },
-    BuiltinSkillFile {
-        relative_path: "agents/openai.yaml",
-        contents: include_bytes!("../data/skills/spotify/agents/openai.yaml"),
-        executable: false,
-    },
-    BuiltinSkillFile {
-        relative_path: "scripts/spotify-control",
-        contents: include_bytes!("../data/skills/spotify/scripts/spotify-control"),
-        executable: true,
-    },
-];
-
-pub const BUILTIN_SKILLS: &[BuiltinSkill] = &[BuiltinSkill {
-    name: "spotify",
-    files: SPOTIFY_FILES,
-}];
+// The build script discovers every direct child of data/skills and generates
+// this manifest. Adding a built-in skill is therefore a data change, not a Rust
+// change.
+include!(concat!(env!("OUT_DIR"), "/builtin_skills.rs"));
 
 // Prompts sent to a model.
 pub const MEMORY_OPTIMIZER_PROMPT: &str = include_str!("../data/prompts/memory-optimizer.md");
 pub const MEMORY_REBUILD_PROMPT: &str = include_str!("../data/prompts/memory-rebuild.md");
 pub const SCHEDULED_TASK_PROMPT: &str = include_str!("../data/prompts/scheduled-task.md");
 pub const SCHEDULED_TASK_LATE_NOTE: &str = include_str!("../data/prompts/scheduled-task-late.md");
+pub const SKILL_REVIEW_PROMPT: &str = include_str!("../data/prompts/skill-review.md");
 /// The seeded machine-health schedule. Its own prompt rather than something the
 /// agent has to compose, so a fresh workspace looks after the host from day one.
 pub const SELF_CARE_PROMPT: &str = include_str!("../data/prompts/self-care.md");
@@ -118,6 +101,7 @@ mod tests {
         ("prompts/memory-rebuild.md", MEMORY_REBUILD_PROMPT),
         ("prompts/scheduled-task.md", SCHEDULED_TASK_PROMPT),
         ("prompts/scheduled-task-late.md", SCHEDULED_TASK_LATE_NOTE),
+        ("prompts/skill-review.md", SKILL_REVIEW_PROMPT),
         ("prompts/self-care.md", SELF_CARE_PROMPT),
         ("config/codex-config.toml", CODEX_CONFIG_TOML),
         ("config/mcp-tools.json", MCP_TOOLS_JSON),
@@ -262,58 +246,6 @@ mod tests {
         assert!(send_message["inputSchema"]["properties"]["file_path"].is_object());
     }
 
-    #[test]
-    fn test_builtin_skills_use_the_native_layout() {
-        use std::collections::HashSet;
-
-        let names: HashSet<_> = BUILTIN_SKILLS.iter().map(|skill| skill.name).collect();
-        assert_eq!(names.len(), BUILTIN_SKILLS.len());
-        let spotify = &BUILTIN_SKILLS[0];
-        let paths: HashSet<_> = spotify
-            .files
-            .iter()
-            .map(|file| file.relative_path)
-            .collect();
-        assert_eq!(paths.len(), spotify.files.len());
-        assert_eq!(
-            spotify
-                .files
-                .iter()
-                .filter(|file| file.relative_path == "SKILL.md")
-                .count(),
-            1
-        );
-        assert_eq!(
-            spotify
-                .files
-                .iter()
-                .filter(|file| file.relative_path == "agents/openai.yaml")
-                .count(),
-            1
-        );
-        let skill = spotify
-            .files
-            .iter()
-            .find(|file| file.relative_path == "SKILL.md")
-            .unwrap();
-        let skill_text = std::str::from_utf8(skill.contents).unwrap();
-        assert!(skill_text.starts_with("---\nname: spotify\ndescription:"));
-        let prompt = std::str::from_utf8(
-            spotify
-                .files
-                .iter()
-                .find(|file| file.relative_path == "agents/openai.yaml")
-                .unwrap()
-                .contents,
-        )
-        .unwrap();
-        assert!(prompt.contains("$spotify"));
-        assert!(spotify
-            .files
-            .iter()
-            .any(|file| file.executable && file.relative_path == "scripts/spotify-control"));
-    }
-
     /// The `tier` values the tool advertises are the ones `codex::tier` resolves.
     /// A schema offering a name `by_name` rejects turns every schedule creation
     /// into an error the agent cannot act on.
@@ -386,9 +318,9 @@ mod tests {
     fn test_the_root_instructions_teach_skill_timing_and_creation() {
         assert!(WORKSPACE_AGENTS.contains(".agents/skills"));
         assert!(WORKSPACE_AGENTS.contains("SKILL.md"));
-        assert!(WORKSPACE_AGENTS.contains("Should I create a skill for this?"));
-        assert!(WORKSPACE_AGENTS.contains("after failure"));
-        assert!(WORKSPACE_AGENTS.contains("suitable skill exists"));
+        assert!(WORKSPACE_AGENTS.contains("nightly"));
+        assert!(WORKSPACE_AGENTS.contains("100 characters"));
+        assert!(!WORKSPACE_AGENTS.contains("Should I create a skill for this?"));
         assert!(WORKSPACE_AGENTS.contains("$skill-creator"));
     }
 

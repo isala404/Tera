@@ -1,26 +1,10 @@
 ---
 name: spotify
-description: Control the active Spotify client for playback status, play, pause, toggle, next, previous, and Spotify URI requests. Use when the user asks to control Spotify already open on a local device.
+description: Control Spotify Connect playback with PKCE login and remote devices.
 ---
 
-Use this skill for the active Spotify client. It does not search Spotify or choose a remote device.
+Run `scripts/spotify-prereq` first. It reports whether this machine can use the skill and the exact missing setup.
 
-## Control playback
+Use `scripts/spotify-auth start` to begin PKCE login. Send the generated Spotify URL to the user. The redirect goes through the local relay on port 8790. Never ask the user to paste the callback URL or OAuth code into WhatsApp.
 
-Run the bundled controller from the workspace root:
-
-```bash
-.agents/skills/spotify/scripts/spotify-control status
-.agents/skills/spotify/scripts/spotify-control play
-.agents/skills/spotify/scripts/spotify-control pause
-.agents/skills/spotify/scripts/spotify-control toggle
-.agents/skills/spotify/scripts/spotify-control next
-.agents/skills/spotify/scripts/spotify-control previous
-.agents/skills/spotify/scripts/spotify-control open "spotify:track:TRACK_ID"
-```
-
-Use `open` only with a Spotify URI supplied by the user or already known from a prior result. Preserve the URI as one argument. Report the controller output after a successful command.
-
-If the script reports that Spotify or its controller is unavailable, give the short error and ask only for the missing action. Do not claim playback when the command failed.
-
-For a named song without a Spotify URI, ask for a URI or explain that this starter controls the active client and does not search. Do not guess a track.
+Use `scripts/spotify-control` for `status`, `devices`, `search QUERY`, `track NAME`, `connect NAME`, `play`, `pause`, `toggle`, `next`, `previous`, and `open spotify:track:ID`. Report success only after the command succeeds.
