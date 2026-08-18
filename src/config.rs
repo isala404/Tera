@@ -95,6 +95,12 @@ impl Config {
         self.workspace_dir.join(".codex-home")
     }
 
+    /// Native Codex skills checked into this workspace. Codex discovers these
+    /// from the thread's working directory, independently of CODEX_HOME.
+    pub fn skills_dir(&self) -> PathBuf {
+        self.workspace_dir.join(".agents").join("skills")
+    }
+
     /// The active memory generation, reached through a symlink.
     ///
     /// Uppercase like every other knowledge file in the workspace. macOS is
@@ -212,6 +218,7 @@ mod tests {
         assert_eq!(cfg.history_db_path(), root.join("history/history.sqlite3"));
         assert_eq!(cfg.runtime_db_path(), root.join(".runtime/state.sqlite3"));
         assert_eq!(cfg.codex_home_dir(), root.join(".codex-home"));
+        assert_eq!(cfg.skills_dir(), root.join(".agents/skills"));
         assert_eq!(cfg.memories_link(), root.join("MEMORIES"));
         assert_eq!(cfg.system_notes_path(), root.join("SYSTEM.md"));
         assert_eq!(cfg.generations_dir(), root.join(".memory/generations"));

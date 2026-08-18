@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+  echo "usage: spotify-control status|play|pause|toggle|next|previous|open [spotify-uri]" >&2
+  exit 2
+fi
+
+action=$1
+shift
+
+case "$action" in
+  status|play|pause|toggle|next|previous)
+    if [[ $# -ne 0 ]]; then
+      echo "spotify-control: $action takes no arguments" >&2
+      exit 2
+    fi
+    ;;
+  open)
+    if [[ $# -ne 1 || "$1" != spotify:* ]]; then
+      echo "spotify-control: open requires one spotify URI" >&2
+      exit 2
+    fi
+    ;;
+  *)
+    echo "spotify-control: unsupported action: $action" >&2
+    exit 2
+    ;;
+esac
+
+case "$(uname -s)" in
+  Linux)
+    if ! command -v playerctl >/dev/null 2>&1; then
+      echo "spotify-control: playerctl is not installed" >&2
+      exit 1
+    fi
+    playerctl_action=$action
+    if [[ "$playerctl_action" == "toggle" ]]; then
+      playerctl_action=play-pause
+    fi
+    exec playerctl --player=spotify "$playerctl_action" "$@"
+    ;;
+  Darwin)
+    if ! command -v osascript >/dev/null 2>&1; then
+      echo "spotify-control: osascript is not available" >&2
+      exit 1
+    fi
+    if ! pgrep -x Spotify >/dev/null 2>&1; then
+      echo "spotify-control: Spotify is not running" >&2
+      exit 1
+    fi
+    exec osascript - "$action" "$@" <<'APPLESCRIPT'
+on run argv
+    set action to item 1 of argv
+    tell application "Spotify"
+        if action is "status" then
+            return (player state as text)
+        else if action is "play" then
+            play
+        else if action is "pause" then
+            pause
+        else if action is "toggle" then
+            playpause
+        else if action is "next" then
+            next track
+        else if action is "previous" then
+            previous track
+        else if action is "open" then
+            if (count of argv) is not 2 then error "open requires one Spotify URI"
+            open location (item 2 of argv)
+        else
+            error "unsupported action"
+        end if
+    end tell
+end run
+APPLESCRIPT
+    ;;
+  *)
+    echo "spotify-control: unsupported platform: $(uname -s)" >&2
+    exit 1
+    ;;
+esac

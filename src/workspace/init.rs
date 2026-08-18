@@ -1,12 +1,26 @@
 use crate::config::Config;
 use crate::memory::generations::GenerationManager;
 use crate::workspace::templates::*;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
-use std::os::unix::fs::symlink;
-use std::path::Path;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::ffi::CString;
+use std::io::{self, ErrorKind};
+use std::os::unix::fs::{symlink, PermissionsExt};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use tracing::{info, warn};
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn renamex_np(
+        from: *const libc::c_char,
+        to: *const libc::c_char,
+        flags: libc::c_uint,
+    ) -> libc::c_int;
+}
 
 pub struct WorkspaceInit;
 
@@ -34,6 +48,7 @@ impl WorkspaceInit {
             config.projects_dir(),
             config.tasks_dir(),
             config.codex_home_dir(),
+            config.skills_dir(),
         ];
 
         for dir in dirs_to_create {
@@ -111,6 +126,10 @@ impl WorkspaceInit {
         // from history and there is nowhere else it could have been written down.
         Self::write_file_if_missing(&config.system_notes_path(), &system_notes_template(config))?;
 
+        // Native skills are seeded as user-owned packages. A package that is
+        // already present, including a symlink, wins over the bundled copy.
+        Self::seed_builtin_skills(config)?;
+
         // Codex config is regenerated every start: unlike the instruction files
         // it is pure derived state, and it encodes absolute paths that change
         // when the workspace or the binary moves.
@@ -133,7 +152,7 @@ impl WorkspaceInit {
     ///
     /// The link is now `MEMORIES`, matching every other knowledge file here. On
     /// macOS the two names are the same path, so this finds nothing; on Linux a
-    /// live workspace would otherwise keep both, and the stale one still resolves , 
+    /// live workspace would otherwise keep both, and the stale one still resolves ,
     /// which is worse than a broken link, because it silently keeps working while
     /// nothing updates it.
     ///
@@ -158,6 +177,115 @@ impl WorkspaceInit {
                 config.memories_link()
             ),
         }
+    }
+
+    /// Seed each bundled skill atomically and only when its package is absent.
+    ///
+    /// Codex owns the resulting .agents/skills tree. The daemon must not
+    /// rewrite an installed skill because it may contain the user's edits or
+    /// deliberately be a symlink into another checkout.
+    fn seed_builtin_skills(config: &Config) -> Result<()> {
+        for skill in crate::data::BUILTIN_SKILLS {
+            if !is_safe_skill_path(skill.name) {
+                bail!("invalid built-in skill name {:?}", skill.name);
+            }
+            for file in skill.files {
+                if !is_safe_skill_path(file.relative_path) {
+                    bail!(
+                        "invalid path {:?} in built-in skill {:?}",
+                        file.relative_path,
+                        skill.name
+                    );
+                }
+            }
+
+            let destination = config.skills_dir().join(skill.name);
+            match fs::symlink_metadata(&destination) {
+                Ok(_) => {
+                    warn!(
+                        "Built-in skill {:?} already exists at {:?}; leaving it untouched",
+                        skill.name, destination
+                    );
+                    continue;
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("Failed to inspect built-in skill {:?}", destination)
+                    });
+                }
+            }
+
+            let staging = Self::create_skill_staging(&config.skills_dir(), skill.name)?;
+            let install = (|| -> Result<()> {
+                for file in skill.files {
+                    let path = staging.join(file.relative_path);
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent).with_context(|| {
+                            format!("Failed to create skill directory {:?}", parent)
+                        })?;
+                    }
+                    fs::write(&path, file.contents).with_context(|| {
+                        format!("Failed to write built-in skill file {:?}", path)
+                    })?;
+                    let mode = if file.executable { 0o755 } else { 0o644 };
+                    fs::set_permissions(&path, fs::Permissions::from_mode(mode))
+                        .with_context(|| format!("Failed to set permissions on {:?}", path))?;
+                }
+
+                // Check again after writing. This prevents a normal concurrent
+                // initializer from being replaced if it appeared during staging.
+                if fs::symlink_metadata(&destination).is_ok() {
+                    warn!(
+                        "Built-in skill {:?} appeared during installation; leaving it untouched",
+                        destination
+                    );
+                    let _ = fs::remove_dir_all(&staging);
+                    return Ok(());
+                }
+                if !rename_skill_without_replace(&staging, &destination)? {
+                    warn!(
+                        "Built-in skill {:?} appeared during installation; leaving it untouched",
+                        destination
+                    );
+                    let _ = fs::remove_dir_all(&staging);
+                }
+                Ok(())
+            })();
+
+            if let Err(error) = install {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(error);
+            }
+
+            if destination.exists() {
+                info!(
+                    "Seeded built-in skill {:?} at {:?}",
+                    skill.name, destination
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn create_skill_staging(skills_dir: &Path, skill_name: &str) -> Result<PathBuf> {
+        for attempt in 0..1000 {
+            let suffix = format!(".{}-staging-{}-{}", skill_name, std::process::id(), attempt);
+            let path = skills_dir.join(suffix);
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(path),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("Failed to create skill staging directory {:?}", path)
+                    });
+                }
+            }
+        }
+        Err(anyhow!(
+            "Could not find a free staging directory for skill {:?}",
+            skill_name
+        ))
     }
 
     /// Point `<workspace>/.codex-home/auth.json` at the operator's real Codex
@@ -255,6 +383,83 @@ impl WorkspaceInit {
     }
 }
 
+fn is_safe_skill_path(path: &str) -> bool {
+    let path = Path::new(path);
+    !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+/// Move a fully written package into place without replacing a user path.
+/// Linux has a native no-replace rename. Other supported Unix systems retain
+/// the final existence check and report an existing destination as a skip.
+fn rename_skill_without_replace(staging: &Path, destination: &Path) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let source = CString::new(staging.as_os_str().as_bytes())
+            .context("skill staging path contains a NUL byte")?;
+        let target = CString::new(destination.as_os_str().as_bytes())
+            .context("skill destination path contains a NUL byte")?;
+        let result = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                target.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result == 0 {
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EEXIST) {
+            return Ok(false);
+        }
+        return Err(error).with_context(|| {
+            format!(
+                "Failed to install built-in skill at {:?} without replacing an existing path",
+                destination
+            )
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        const RENAME_EXCL: libc::c_uint = 0x0000_0004;
+        let source = CString::new(staging.as_os_str().as_bytes())
+            .context("skill staging path contains a NUL byte")?;
+        let target = CString::new(destination.as_os_str().as_bytes())
+            .context("skill destination path contains a NUL byte")?;
+        let result = unsafe { renamex_np(source.as_ptr(), target.as_ptr(), RENAME_EXCL) };
+        if result == 0 {
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EEXIST) {
+            return Ok(false);
+        }
+        return Err(error).with_context(|| {
+            format!(
+                "Failed to install built-in skill at {:?} without replacing an existing path",
+                destination
+            )
+        });
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        match fs::rename(staging, destination) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(error)
+                .with_context(|| format!("Failed to install built-in skill at {:?}", destination)),
+        }
+    }
+}
+
 /// The operator's home directory. Kept local instead of pulling in a crate for
 /// one lookup; the daemon only targets Unix.
 fn dirs_home() -> Option<std::path::PathBuf> {
@@ -297,7 +502,7 @@ mod tests {
         );
     }
 
-    /// Improved instructions have to reach a workspace that already exists , 
+    /// Improved instructions have to reach a workspace that already exists ,
     /// writing them only when absent froze the first generation forever.
     #[test]
     fn test_generated_instructions_are_refreshed() {
@@ -394,5 +599,83 @@ mod tests {
         let bootstrap =
             fs::read_to_string(config.codex_home_dir().join("AGENTS.md")).unwrap();
         assert!(bootstrap.contains(&config.root_agents_path().display().to_string()));
+    }
+
+    #[test]
+    fn test_builtin_skill_is_seeded_atomically_and_preserved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Config::new(tmp.path().to_path_buf(), true);
+
+        WorkspaceInit::init(&config).unwrap();
+        let skill = config.skills_dir().join("spotify");
+        let script = skill.join("scripts/spotify-control");
+        assert!(skill.join("SKILL.md").exists());
+        assert_eq!(
+            fs::read_to_string(&script).unwrap().lines().next(),
+            Some("#!/usr/bin/env bash")
+        );
+        assert_eq!(
+            fs::metadata(&script).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+
+        fs::write(&script, "#!/bin/sh\necho user-owned\n").unwrap();
+        WorkspaceInit::init(&config).unwrap();
+        assert_eq!(
+            fs::read_to_string(script).unwrap(),
+            "#!/bin/sh\necho user-owned\n"
+        );
+    }
+
+    #[test]
+    fn test_existing_skill_directory_and_dangling_symlink_are_preserved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Config::new(tmp.path().to_path_buf(), true);
+        fs::create_dir_all(config.skills_dir().join("spotify")).unwrap();
+        fs::write(config.skills_dir().join("spotify/SKILL.md"), "user skill\n").unwrap();
+        WorkspaceInit::init(&config).unwrap();
+        assert_eq!(
+            fs::read_to_string(config.skills_dir().join("spotify/SKILL.md")).unwrap(),
+            "user skill\n"
+        );
+
+        let symlink_tmp = tempfile::tempdir().unwrap();
+        let symlink_config = Config::new(symlink_tmp.path().to_path_buf(), true);
+        fs::create_dir_all(&symlink_config.skills_dir()).unwrap();
+        symlink(
+            symlink_tmp.path().join("missing-target"),
+            symlink_config.skills_dir().join("spotify"),
+        )
+        .unwrap();
+        WorkspaceInit::init(&symlink_config).unwrap();
+        assert!(
+            fs::symlink_metadata(symlink_config.skills_dir().join("spotify"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn test_builtin_skill_paths_must_be_simple_relative_paths() {
+        assert!(is_safe_skill_path("scripts/spotify-control"));
+        assert!(!is_safe_skill_path(""));
+        assert!(!is_safe_skill_path("../outside"));
+        assert!(!is_safe_skill_path("scripts/../outside"));
+        assert!(!is_safe_skill_path("/absolute"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_skill_installation_does_not_replace_a_racing_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        let destination = tmp.path().join("spotify");
+        fs::create_dir(&staging).unwrap();
+        fs::create_dir(&destination).unwrap();
+
+        assert!(!rename_skill_without_replace(&staging, &destination).unwrap());
+        assert!(staging.exists());
+        assert!(destination.exists());
     }
 }

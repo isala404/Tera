@@ -36,6 +36,42 @@ pub const SCHEDULE_AGENTS: &str = include_str!("../data/workspace/tasks/SCHEDULE
 pub const HISTORY_SCHEMA: &str = include_str!("../data/workspace/history/SCHEMA.md");
 pub const LOGS_SCHEMA: &str = include_str!("../data/workspace/logs/SCHEMA.md");
 
+/// A built-in skill package. Skill files are embedded so a released tera can
+/// initialize a workspace without depending on the source tree being present.
+pub struct BuiltinSkill {
+    pub name: &'static str,
+    pub files: &'static [BuiltinSkillFile],
+}
+
+pub struct BuiltinSkillFile {
+    pub relative_path: &'static str,
+    pub contents: &'static [u8],
+    pub executable: bool,
+}
+
+const SPOTIFY_FILES: &[BuiltinSkillFile] = &[
+    BuiltinSkillFile {
+        relative_path: "SKILL.md",
+        contents: include_bytes!("../data/skills/spotify/SKILL.md"),
+        executable: false,
+    },
+    BuiltinSkillFile {
+        relative_path: "agents/openai.yaml",
+        contents: include_bytes!("../data/skills/spotify/agents/openai.yaml"),
+        executable: false,
+    },
+    BuiltinSkillFile {
+        relative_path: "scripts/spotify-control",
+        contents: include_bytes!("../data/skills/spotify/scripts/spotify-control"),
+        executable: true,
+    },
+];
+
+pub const BUILTIN_SKILLS: &[BuiltinSkill] = &[BuiltinSkill {
+    name: "spotify",
+    files: SPOTIFY_FILES,
+}];
+
 // Prompts sent to a model.
 pub const MEMORY_OPTIMIZER_PROMPT: &str = include_str!("../data/prompts/memory-optimizer.md");
 pub const MEMORY_REBUILD_PROMPT: &str = include_str!("../data/prompts/memory-rebuild.md");
@@ -226,6 +262,58 @@ mod tests {
         assert!(send_message["inputSchema"]["properties"]["file_path"].is_object());
     }
 
+    #[test]
+    fn test_builtin_skills_use_the_native_layout() {
+        use std::collections::HashSet;
+
+        let names: HashSet<_> = BUILTIN_SKILLS.iter().map(|skill| skill.name).collect();
+        assert_eq!(names.len(), BUILTIN_SKILLS.len());
+        let spotify = &BUILTIN_SKILLS[0];
+        let paths: HashSet<_> = spotify
+            .files
+            .iter()
+            .map(|file| file.relative_path)
+            .collect();
+        assert_eq!(paths.len(), spotify.files.len());
+        assert_eq!(
+            spotify
+                .files
+                .iter()
+                .filter(|file| file.relative_path == "SKILL.md")
+                .count(),
+            1
+        );
+        assert_eq!(
+            spotify
+                .files
+                .iter()
+                .filter(|file| file.relative_path == "agents/openai.yaml")
+                .count(),
+            1
+        );
+        let skill = spotify
+            .files
+            .iter()
+            .find(|file| file.relative_path == "SKILL.md")
+            .unwrap();
+        let skill_text = std::str::from_utf8(skill.contents).unwrap();
+        assert!(skill_text.starts_with("---\nname: spotify\ndescription:"));
+        let prompt = std::str::from_utf8(
+            spotify
+                .files
+                .iter()
+                .find(|file| file.relative_path == "agents/openai.yaml")
+                .unwrap()
+                .contents,
+        )
+        .unwrap();
+        assert!(prompt.contains("$spotify"));
+        assert!(spotify
+            .files
+            .iter()
+            .any(|file| file.executable && file.relative_path == "scripts/spotify-control"));
+    }
+
     /// The `tier` values the tool advertises are the ones `codex::tier` resolves.
     /// A schema offering a name `by_name` rejects turns every schedule creation
     /// into an error the agent cannot act on.
@@ -294,6 +382,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_the_root_instructions_teach_skill_timing_and_creation() {
+        assert!(WORKSPACE_AGENTS.contains(".agents/skills"));
+        assert!(WORKSPACE_AGENTS.contains("SKILL.md"));
+        assert!(WORKSPACE_AGENTS.contains("Should I create a skill for this?"));
+        assert!(WORKSPACE_AGENTS.contains("after failure"));
+        assert!(WORKSPACE_AGENTS.contains("suitable skill exists"));
+        assert!(WORKSPACE_AGENTS.contains("$skill-creator"));
+    }
+
     /// No em dashes anywhere in shipped text.
     ///
     /// Isala's rule, and a self-consistency one: the voice section tells the agent
@@ -355,5 +453,4 @@ mod tests {
             }
         }
     }
-
 }

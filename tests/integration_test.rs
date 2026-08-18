@@ -24,6 +24,15 @@ async fn test_workspace_init() {
     assert!(config.projects_dir().join("AGENTS.md").exists());
     assert!(config.tasks_dir().join("AGENTS.md").exists());
     assert!(config.codex_home_dir().join("config.toml").exists());
+    assert!(config.skills_dir().join("spotify/SKILL.md").exists());
+    assert!(config
+        .skills_dir()
+        .join("spotify/agents/openai.yaml")
+        .exists());
+    assert!(config
+        .skills_dir()
+        .join("spotify/scripts/spotify-control")
+        .exists());
     assert!(config.memories_link().exists());
     assert!(config.memories_link().join("INDEX.md").exists());
 }
