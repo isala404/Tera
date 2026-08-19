@@ -23,6 +23,16 @@ CREATE TABLE IF NOT EXISTS main_thread_state (
     model_id                      TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS phoenix_recovery (
+    id                   INTEGER PRIMARY KEY CHECK (id = 1),
+    turn_id              TEXT NOT NULL,
+    chat_jid             TEXT NOT NULL,
+    sender               TEXT NOT NULL,
+    last_provider_msg_id TEXT NOT NULL,
+    started_at_ms        INTEGER NOT NULL,
+    notice_sent          INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS model_observations (
     model_id        TEXT PRIMARY KEY,
     display_name    TEXT,
@@ -95,6 +105,16 @@ pub struct MainThreadState {
     pub last_activity_at_ms: i64,
     pub estimated_cache_warm_until_ms: i64,
     pub model_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhoenixRecovery {
+    pub turn_id: String,
+    pub chat_jid: String,
+    pub sender: String,
+    pub last_provider_msg_id: String,
+    pub started_at_ms: i64,
+    pub notice_sent: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,6 +233,58 @@ impl RuntimeDb {
         Ok(res)
     }
 
+    pub fn begin_phoenix_recovery(&self, recovery: &PhoenixRecovery) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO phoenix_recovery (
+                id, turn_id, chat_jid, sender, last_provider_msg_id, started_at_ms, notice_sent
+            ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                recovery.turn_id,
+                recovery.chat_jid,
+                recovery.sender,
+                recovery.last_provider_msg_id,
+                recovery.started_at_ms,
+                recovery.notice_sent as i32,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_phoenix_recovery(&self) -> Result<Option<PhoenixRecovery>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT turn_id, chat_jid, sender, last_provider_msg_id, started_at_ms, notice_sent
+             FROM phoenix_recovery WHERE id = 1",
+        )?;
+        let result = stmt
+            .query_row([], |row| {
+                let notice_sent: i32 = row.get(5)?;
+                Ok(PhoenixRecovery {
+                    turn_id: row.get(0)?,
+                    chat_jid: row.get(1)?,
+                    sender: row.get(2)?,
+                    last_provider_msg_id: row.get(3)?,
+                    started_at_ms: row.get(4)?,
+                    notice_sent: notice_sent != 0,
+                })
+            })
+            .optional()?;
+        Ok(result)
+    }
+
+    pub fn mark_phoenix_notice_sent(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE phoenix_recovery SET notice_sent = 1 WHERE id = 1", [])?;
+        Ok(())
+    }
+
+    pub fn clear_phoenix_recovery(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM phoenix_recovery WHERE id = 1", [])?;
+        Ok(())
+    }
+
     pub fn record_model_observation(&self, obs: &ModelObservation) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -247,5 +319,35 @@ impl RuntimeDb {
             })
             .optional()?;
         Ok(res)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_phoenix_recovery_marker_round_trips_and_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = RuntimeDb::open(&dir.path().join("state.sqlite3")).unwrap();
+        db.begin_phoenix_recovery(&PhoenixRecovery {
+            turn_id: "turn_1".to_string(),
+            chat_jid: "947@s.whatsapp.net".to_string(),
+            sender: "947:1@s.whatsapp.net".to_string(),
+            last_provider_msg_id: "wamid.1".to_string(),
+            started_at_ms: 123,
+            notice_sent: false,
+        })
+        .unwrap();
+
+        let stored = db.get_phoenix_recovery().unwrap().unwrap();
+        assert_eq!(stored.turn_id, "turn_1");
+        assert_eq!(stored.chat_jid, "947@s.whatsapp.net");
+        assert!(!stored.notice_sent);
+
+        db.mark_phoenix_notice_sent().unwrap();
+        assert!(db.get_phoenix_recovery().unwrap().unwrap().notice_sent);
+        db.clear_phoenix_recovery().unwrap();
+        assert!(db.get_phoenix_recovery().unwrap().is_none());
     }
 }

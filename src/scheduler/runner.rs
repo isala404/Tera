@@ -62,6 +62,9 @@ impl SchedulerRunner {
     pub fn start_loop(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             info!("Starting background scheduler runner loop...");
+            if let Err(e) = self.recover_stale_runs() {
+                error!("Could not recover stale scheduled runs: {:?}", e);
+            }
             loop {
                 let now_ms = Utc::now().timestamp_millis();
                 match SchedulerDb::get_due_schedules(&self.runtime_db, now_ms) {
@@ -86,6 +89,54 @@ impl SchedulerRunner {
                 sleep(TICK_INTERVAL).await;
             }
         })
+    }
+
+    /// A process crash leaves schedule_runs in `running` after the schedule has
+    /// already been advanced. Put that work back on the queue once and leave a
+    /// note for the worker so it checks existing artifacts before repeating it.
+    fn recover_stale_runs(&self) -> Result<()> {
+        let now_ms = Utc::now().timestamp_millis();
+        for run in SchedulerDb::running_runs(&self.runtime_db)? {
+            let Some(item) = SchedulerDb::get_schedule(&self.runtime_db, &run.schedule_id)? else {
+                let _ = SchedulerDb::finish_run(
+                    &self.runtime_db,
+                    &run.id,
+                    "failed",
+                    Some("Phoenix found a run whose schedule no longer exists"),
+                );
+                continue;
+            };
+
+            let task_dir = self.config.workspace_dir.join(&item.task_path);
+            fs::create_dir_all(&task_dir)?;
+            fs::write(
+                task_dir.join("PHOENIX_RECOVERY.md"),
+                format!(
+                    "Phoenix recovered schedule {} at {}. The previous process crashed while this run was marked running. Read MEMORY.md, RUNS.jsonl and artifacts before acting. Tell {} you recovered the run and continue only what remains.\n",
+                    item.name,
+                    Local::now().to_rfc3339(),
+                    self.config.owner_name,
+                ),
+            )?;
+
+            SchedulerDb::finish_run(
+                &self.runtime_db,
+                &run.id,
+                "failed",
+                Some("Phoenix recovered this run after a daemon restart"),
+            )?;
+
+            if item.status == "active" || item.status == "completed" {
+                SchedulerDb::update_next_run(
+                    &self.runtime_db,
+                    &item.id,
+                    Some(now_ms),
+                    Some("active"),
+                )?;
+                warn!("Phoenix re-queued stale schedule '{}'", item.name);
+            }
+        }
+        Ok(())
     }
 
     /// Reserve a schedule for this tick; false if a run is already in flight.
@@ -141,9 +192,10 @@ impl SchedulerRunner {
             schedule_agents_template(&self.config),
         )?;
 
-        // 3. Reschedule BEFORE running. A task that runs for minutes must not be
-        //    re-fired by the ticks that happen while it works, and a crash
-        //    mid-run must not leave it due forever.
+        // 3. Claim the run durably before advancing the schedule. A task that
+        //    runs for minutes must not be re-fired by the ticks that happen
+        //    while it works, and a crash in this small window must still leave
+        //    Phoenix a running row to recover.
         //
         //    Computing the next run from *now* rather than from the missed slot is
         //    also what coalesces a backlog: after an outage a daily job fires once
@@ -155,14 +207,6 @@ impl SchedulerRunner {
             item.rrule.as_deref(),
             now_ms,
         )?;
-
-        let status = if next_run.is_none() {
-            Some("completed")
-        } else {
-            None
-        };
-
-        SchedulerDb::update_next_run(&self.runtime_db, &item.id, next_run, status)?;
 
         let lateness = Self::lateness(item, now_ms);
         if let Some(late) = &lateness {
@@ -183,6 +227,14 @@ impl SchedulerRunner {
             &item.id,
             item.next_run_at_ms.unwrap_or(now_ms),
         )?;
+
+        let status = if next_run.is_none() {
+            Some("completed")
+        } else {
+            None
+        };
+        SchedulerDb::update_next_run(&self.runtime_db, &item.id, next_run, status)?;
+
         let prompt = Self::build_task_prompt(&self.config.owner_name, item, &task_dir, lateness.as_ref());
 
         let tier = tier::by_name(&item.tier).unwrap_or_else(|e| {
@@ -196,6 +248,7 @@ impl SchedulerRunner {
             Ok(summary) => {
                 self.append_run_log(&task_dir, item, "completed", &summary);
                 let _ = SchedulerDb::finish_run(&self.runtime_db, &run_id, "completed", None);
+                let _ = fs::remove_file(task_dir.join("PHOENIX_RECOVERY.md"));
                 info!(
                     "Schedule {} ('{}') completed. Next run: {:?}",
                     item.id, item.name, next_run
@@ -211,6 +264,7 @@ impl SchedulerRunner {
                     "failed",
                     Some(&e.to_string()),
                 );
+                let _ = fs::remove_file(task_dir.join("PHOENIX_RECOVERY.md"));
                 error!("Schedule {} ('{}') failed: {:?}", item.id, item.name, e);
             }
         }

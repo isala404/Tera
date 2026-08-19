@@ -366,6 +366,72 @@ impl HistoryDb {
         Ok(events)
     }
 
+    /// Return the most recent messages in conversation order. This is the small
+    /// recovery window used when a Codex thread has expired, so a new thread can
+    /// rejoin the conversation without receiving the whole history database.
+    pub fn recent_messages(&self, limit: usize) -> Result<Vec<ConversationEvent>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT seq, id, occurred_at_ms, kind, actor, text, reply_to_id, turn_id, reaction_target_id, reaction_emoji
+             FROM conversation_events
+             WHERE kind = 'message'
+             ORDER BY seq DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok(ConversationEvent {
+                seq: Some(row.get(0)?),
+                id: row.get(1)?,
+                occurred_at_ms: row.get(2)?,
+                kind: row.get(3)?,
+                actor: row.get(4)?,
+                text: row.get(5)?,
+                reply_to_id: row.get(6)?,
+                turn_id: row.get(7)?,
+                reaction_target_id: row.get(8)?,
+                reaction_emoji: row.get(9)?,
+                attachments: vec![],
+            })
+        })?;
+
+        let mut events = Vec::new();
+        for row in rows {
+            let mut event = row?;
+            let mut att_stmt = conn.prepare(
+                "SELECT id, event_id, position, media_type, relative_path, mime_type, original_name
+                 FROM attachments WHERE event_id = ?1 ORDER BY position ASC",
+            )?;
+            let attachments = att_stmt.query_map(params![event.id], |row| {
+                Ok(Attachment {
+                    id: Some(row.get(0)?),
+                    event_id: row.get(1)?,
+                    position: row.get(2)?,
+                    media_type: row.get(3)?,
+                    relative_path: row.get(4)?,
+                    mime_type: row.get(5)?,
+                    original_name: row.get(6)?,
+                })
+            })?;
+            for attachment in attachments {
+                event.attachments.push(attachment?);
+            }
+            events.push(event);
+        }
+
+        events.reverse();
+        Ok(events)
+    }
+
+    pub fn has_assistant_message_for_turn(&self, turn_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let exists: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM conversation_events
+             WHERE kind = 'message' AND actor = 'assistant' AND turn_id = ?1",
+            params![turn_id],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    }
+
 }
 
 #[cfg(test)]
@@ -482,5 +548,38 @@ mod migration_tests {
         let projected = std::fs::read_to_string(jsonl.join("2026-08.jsonl")).unwrap();
         assert_eq!(projected.lines().count(), 2, "{projected}");
         assert!(projected.contains(r#""from":"assistant""#));
+    }
+
+    #[test]
+    fn test_recent_messages_returns_ten_messages_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HistoryDb::open(
+            &dir.path().join("history.sqlite3"),
+            &dir.path().join("jsonl"),
+        )
+        .unwrap();
+
+        for index in 0..12 {
+            db.insert_event(ConversationEvent {
+                seq: None,
+                id: format!("m_{index}"),
+                occurred_at_ms: 1_786_962_664_000 + index,
+                kind: "message".to_string(),
+                actor: if index % 2 == 0 { "user" } else { "assistant" }.to_string(),
+                text: Some(format!("message {index}")),
+                reply_to_id: None,
+                turn_id: None,
+                reaction_target_id: None,
+                reaction_emoji: None,
+                attachments: vec![],
+            })
+            .unwrap();
+        }
+
+        let recent = db.recent_messages(10).unwrap();
+        assert_eq!(recent.len(), 10);
+        assert_eq!(recent.first().unwrap().id, "m_2");
+        assert_eq!(recent.last().unwrap().id, "m_11");
+        assert_eq!(recent[1].actor, "assistant");
     }
 }

@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 pub struct ConversationSession {
     sends: Arc<AtomicU64>,
     chat_jid: Arc<Mutex<Option<String>>>,
+    turn_id: Arc<Mutex<Option<String>>>,
 }
 
 impl ConversationSession {
@@ -34,6 +35,14 @@ impl ConversationSession {
 
     pub fn chat(&self) -> Option<String> {
         self.chat_jid.lock().unwrap().clone()
+    }
+
+    pub fn set_turn(&self, turn_id: Option<&str>) {
+        *self.turn_id.lock().unwrap() = turn_id.map(str::to_string);
+    }
+
+    pub fn turn(&self) -> Option<String> {
+        self.turn_id.lock().unwrap().clone()
     }
 
     /// Called after a `send_message` tool call actually reaches the provider.

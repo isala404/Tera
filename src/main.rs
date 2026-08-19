@@ -473,7 +473,8 @@ async fn main() -> Result<()> {
             let activity = ActivityTracker::new();
 
             // One app-server process, shared by the conversation and the scheduler.
-            let codex = CodexSupervisor::new(config.clone(), runtime_db.clone());
+            let codex = CodexSupervisor::new(config.clone(), runtime_db.clone())
+                .with_history_db(history_db.clone());
             codex.warm_in_background();
 
             // 3. Initialize transport & spawn bot loop
@@ -488,11 +489,24 @@ async fn main() -> Result<()> {
                 let turn_engine = Arc::new(TurnEngine::new(
                     config.clone(),
                     history_db.clone(),
+                    runtime_db.clone(),
                     wa_transport.clone(),
                     session.clone(),
                     codex.clone(),
                     activity.clone(),
                 ));
+
+                let phoenix_engine = turn_engine.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match phoenix_engine.recover_pending().await {
+                            Ok(true) => break,
+                            Ok(false) => {}
+                            Err(e) => warn!("Phoenix recovery is waiting to retry: {:?}", e),
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    }
+                });
 
                 // Reconnect rather than going quiet. `start_bot` returns when the
                 // bot stops for any reason, and a daemon that keeps running with

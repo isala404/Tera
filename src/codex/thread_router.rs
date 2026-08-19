@@ -65,21 +65,18 @@ impl ThreadRouter {
             };
         }
 
-        // A thread that is already loaded in this process costs nothing to keep
-        // using, cache or no cache: rotating would throw away conversation the
-        // user can still see on their phone.
-        if live_thread_id == Some(state.thread_id.as_str()) {
-            return ThreadDecision::Continue {
-                thread_id: state.thread_id,
-            };
-        }
-
         if now_ms >= state.estimated_cache_warm_until_ms {
             return ThreadDecision::Rotate {
                 reason: format!(
                     "thread {} has been idle past its cache window",
                     state.thread_id
                 ),
+            };
+        }
+
+        if live_thread_id == Some(state.thread_id.as_str()) {
+            return ThreadDecision::Continue {
+                thread_id: state.thread_id,
             };
         }
 
@@ -173,10 +170,10 @@ mod tests {
         assert!(matches!(decision, ThreadDecision::Rotate { .. }));
     }
 
-    /// Rotating a thread the user is actively talking on would silently drop the
-    /// conversation they can still see in front of them.
+    /// A loaded thread still rotates after its cache window expires. The caller
+    /// supplies recent canonical history to the replacement thread.
     #[test]
-    fn test_loaded_thread_is_kept_even_when_cold() {
+    fn test_loaded_thread_is_rotated_when_cold() {
         let decision = ThreadRouter::decide_at(
             persisted(NOW - 1, "gpt-5.6-sol"),
             Some("thread_real"),
@@ -184,12 +181,7 @@ mod tests {
             NOW,
             TTL,
         );
-        assert_eq!(
-            decision,
-            ThreadDecision::Continue {
-                thread_id: "thread_real".to_string()
-            }
-        );
+        assert!(matches!(decision, ThreadDecision::Rotate { .. }));
     }
 
     #[test]

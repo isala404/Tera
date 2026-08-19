@@ -16,6 +16,8 @@ use crate::codex::thread_router::{ThreadDecision, ThreadRouter};
 use crate::codex::tier::{self, ModelTier};
 use crate::codex::CodexProcessManager;
 use crate::config::Config;
+use crate::conversation::renderer::InputRenderer;
+use crate::history::db::HistoryDb;
 use crate::runtime::{MainThreadState, RuntimeDb};
 use anyhow::Result;
 use chrono::Utc;
@@ -28,6 +30,7 @@ use tracing::{error, info, warn};
 pub struct CodexSupervisor {
     config: Config,
     runtime_db: RuntimeDb,
+    history_db: Option<HistoryDb>,
     mgr: Arc<Mutex<Option<Arc<CodexProcessManager>>>>,
 }
 
@@ -36,8 +39,14 @@ impl CodexSupervisor {
         Self {
             config,
             runtime_db,
+            history_db: None,
             mgr: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn with_history_db(mut self, history_db: HistoryDb) -> Self {
+        self.history_db = Some(history_db);
+        self
     }
 
     /// Start connecting now so the first message does not pay the spawn cost.
@@ -82,18 +91,21 @@ impl CodexSupervisor {
             .await?;
 
         let now_ms = Utc::now().timestamp_millis();
-        let started_at_ms = persisted
-            .as_ref()
-            .filter(|p| p.thread_id == info.id)
-            .map(|p| p.started_at_ms)
+        let existing = persisted.as_ref().filter(|p| p.thread_id == info.id);
+        let started_at_ms = existing.map(|p| p.started_at_ms).unwrap_or(now_ms);
+        let last_activity_at_ms = existing
+            .map(|p| p.last_activity_at_ms)
             .unwrap_or(now_ms);
+        let estimated_cache_warm_until_ms = existing
+            .map(|p| p.estimated_cache_warm_until_ms)
+            .unwrap_or(now_ms + self.config.cache_ttl_ms());
 
         self.runtime_db.save_main_thread(&MainThreadState {
             thread_id: info.id.clone(),
             turn_id: None,
             started_at_ms,
-            last_activity_at_ms: now_ms,
-            estimated_cache_warm_until_ms: now_ms + self.config.cache_ttl_ms(),
+            last_activity_at_ms,
+            estimated_cache_warm_until_ms,
             model_id: info.model.clone(),
         })?;
 
@@ -158,6 +170,12 @@ impl CodexSupervisor {
         if started_fresh {
             let mut with_bootstrap =
                 vec![TurnInput::Text(ThreadRouter::build_bootstrap_context(&self.config))];
+            if let Some(history_db) = &self.history_db {
+                let recent = history_db.recent_messages(10)?;
+                if !recent.is_empty() {
+                    with_bootstrap.push(TurnInput::Text(InputRenderer::render_history(&recent)));
+                }
+            }
             with_bootstrap.extend_from_slice(inputs);
             return mgr
                 .run_turn_inputs(&with_bootstrap, tier::CONVERSATION)

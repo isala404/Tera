@@ -59,6 +59,7 @@ pub const MEMORY_OPTIMIZER_PROMPT: &str = include_str!("../data/prompts/memory-o
 pub const MEMORY_REBUILD_PROMPT: &str = include_str!("../data/prompts/memory-rebuild.md");
 pub const SCHEDULED_TASK_PROMPT: &str = include_str!("../data/prompts/scheduled-task.md");
 pub const SCHEDULED_TASK_LATE_NOTE: &str = include_str!("../data/prompts/scheduled-task-late.md");
+pub const PHOENIX_RECOVERY_PROMPT: &str = include_str!("../data/prompts/phoenix-recovery.md");
 /// The seeded machine-health schedule. Its own prompt rather than something the
 /// agent has to compose, so a fresh workspace looks after the host from day one.
 pub const SELF_CARE_PROMPT: &str = include_str!("../data/prompts/self-care.md");
@@ -101,6 +102,7 @@ mod tests {
         ("prompts/memory-rebuild.md", MEMORY_REBUILD_PROMPT),
         ("prompts/scheduled-task.md", SCHEDULED_TASK_PROMPT),
         ("prompts/scheduled-task-late.md", SCHEDULED_TASK_LATE_NOTE),
+        ("prompts/phoenix-recovery.md", PHOENIX_RECOVERY_PROMPT),
         ("prompts/self-care.md", SELF_CARE_PROMPT),
         ("skills/spotify/SKILL.md", include_str!("../data/skills/spotify/SKILL.md")),
         ("config/codex-config.toml", CODEX_CONFIG_TOML),
@@ -111,7 +113,7 @@ mod tests {
     const SUPPLIED: &[&str] = &[
         "WORKSPACE", "STAGING", "MEMORIES", "HISTORY", "JSONL", "SQLITE", "ASSETS", "SCHEMA",
         "EVENTS", "TASK_NAME", "SCHEDULE_ID", "NOW", "TASK_DIR", "LATE_NOTE", "TASK_PROMPT",
-        "LATE_MINUTES", "MISSED", "BIN", "SOCKET", "MODEL", "EFFORT", "OWNER",
+        "LATE_MINUTES", "MISSED", "BIN", "SOCKET", "MODEL", "EFFORT", "OWNER", "TURN_ID", "RECENT_CONTEXT",
     ];
 
     fn placeholders_in(text: &str) -> Vec<String> {
