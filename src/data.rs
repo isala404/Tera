@@ -113,7 +113,8 @@ mod tests {
     const SUPPLIED: &[&str] = &[
         "WORKSPACE", "STAGING", "MEMORIES", "HISTORY", "JSONL", "SQLITE", "ASSETS", "SCHEMA",
         "EVENTS", "TASK_NAME", "SCHEDULE_ID", "NOW", "TASK_DIR", "LATE_NOTE", "TASK_PROMPT",
-        "LATE_MINUTES", "MISSED", "BIN", "SOCKET", "MODEL", "EFFORT", "OWNER", "TURN_ID", "RECENT_CONTEXT",
+        "LATE_MINUTES", "MISSED", "BIN", "SOCKET", "MODEL", "EFFORT", "OWNER", "WHAT_HAPPENED",
+        "PENDING_REQUEST",
     ];
 
     fn placeholders_in(text: &str) -> Vec<String> {

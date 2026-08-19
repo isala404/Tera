@@ -1,7 +1,7 @@
 use crate::codex::tier;
 use crate::codex::CodexSupervisor;
 use crate::config::Config;
-use crate::runtime::{ActivityTracker, RuntimeDb, ScheduleItem};
+use crate::runtime::{ActivityTracker, RuntimeDb, ScheduleItem, ScheduleRun};
 use crate::scheduler::db::SchedulerDb;
 use crate::scheduler::recurrence::RecurrenceEngine;
 use crate::workspace::templates::schedule_agents_template;
@@ -94,48 +94,53 @@ impl SchedulerRunner {
     /// A process crash leaves schedule_runs in `running` after the schedule has
     /// already been advanced. Put that work back on the queue once and leave a
     /// note for the worker so it checks existing artifacts before repeating it.
+    ///
+    /// A run that cannot be recovered is logged and stepped over. One unwritable
+    /// task directory must not strand every other stale run behind it.
     fn recover_stale_runs(&self) -> Result<()> {
         let now_ms = Utc::now().timestamp_millis();
         for run in SchedulerDb::running_runs(&self.runtime_db)? {
-            let Some(item) = SchedulerDb::get_schedule(&self.runtime_db, &run.schedule_id)? else {
-                let _ = SchedulerDb::finish_run(
-                    &self.runtime_db,
-                    &run.id,
-                    "failed",
-                    Some("Phoenix found a run whose schedule no longer exists"),
-                );
-                continue;
-            };
+            if let Err(e) = self.recover_stale_run(&run, now_ms) {
+                error!("Could not recover stale run {}: {:?}", run.id, e);
+            }
+        }
+        Ok(())
+    }
 
-            let task_dir = self.config.workspace_dir.join(&item.task_path);
-            fs::create_dir_all(&task_dir)?;
-            fs::write(
-                task_dir.join("PHOENIX_RECOVERY.md"),
-                format!(
-                    "Phoenix recovered schedule {} at {}. The previous process crashed while this run was marked running. Read MEMORY.md, RUNS.jsonl and artifacts before acting. Tell {} you recovered the run and continue only what remains.\n",
-                    item.name,
-                    Local::now().to_rfc3339(),
-                    self.config.owner_name,
-                ),
-            )?;
-
-            SchedulerDb::finish_run(
+    fn recover_stale_run(&self, run: &ScheduleRun, now_ms: i64) -> Result<()> {
+        let Some(item) = SchedulerDb::get_schedule(&self.runtime_db, &run.schedule_id)? else {
+            return SchedulerDb::finish_run(
                 &self.runtime_db,
                 &run.id,
                 "failed",
-                Some("Phoenix recovered this run after a daemon restart"),
-            )?;
+                Some("Phoenix found a run whose schedule no longer exists"),
+            );
+        };
 
-            if item.status == "active" || item.status == "completed" {
-                SchedulerDb::update_next_run(
-                    &self.runtime_db,
-                    &item.id,
-                    Some(now_ms),
-                    Some("active"),
-                )?;
-                warn!("Phoenix re-queued stale schedule '{}'", item.name);
-            }
+        let task_dir = self.config.workspace_dir.join(&item.task_path);
+        fs::create_dir_all(&task_dir)?;
+        fs::write(
+            task_dir.join("PHOENIX_RECOVERY.md"),
+            format!(
+                "Phoenix recovered schedule {} at {}. The previous process crashed while this run was marked running. Read MEMORY.md, RUNS.jsonl and artifacts before acting. Tell {} you recovered the run and continue only what remains.\n",
+                item.name,
+                Local::now().to_rfc3339(),
+                self.config.owner_name,
+            ),
+        )?;
+
+        SchedulerDb::finish_run(
+            &self.runtime_db,
+            &run.id,
+            "failed",
+            Some("Phoenix recovered this run after a daemon restart"),
+        )?;
+
+        if item.status == "active" || item.status == "completed" {
+            SchedulerDb::update_next_run(&self.runtime_db, &item.id, Some(now_ms), Some("active"))?;
+            warn!("Phoenix re-queued stale schedule '{}'", item.name);
         }
+
         Ok(())
     }
 

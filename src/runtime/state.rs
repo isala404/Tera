@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -23,14 +24,18 @@ CREATE TABLE IF NOT EXISTS main_thread_state (
     model_id                      TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS phoenix_recovery (
-    id                   INTEGER PRIMARY KEY CHECK (id = 1),
-    turn_id              TEXT NOT NULL,
+-- One row per foreground turn, the same shape `schedule_runs` already uses for
+-- background work. A row with no `finished_at_ms` at startup is a turn the last
+-- process did not live to answer, and `attempts` is what keeps a request that
+-- crashes us from crashing us forever.
+CREATE TABLE IF NOT EXISTS conversation_turns (
+    turn_id              TEXT PRIMARY KEY,
     chat_jid             TEXT NOT NULL,
-    sender               TEXT NOT NULL,
     last_provider_msg_id TEXT NOT NULL,
     started_at_ms        INTEGER NOT NULL,
-    notice_sent          INTEGER NOT NULL DEFAULT 0
+    finished_at_ms       INTEGER,
+    attempts             INTEGER NOT NULL DEFAULT 0,
+    state                TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS model_observations (
@@ -107,14 +112,21 @@ pub struct MainThreadState {
     pub model_id: String,
 }
 
+/// A foreground turn's lifecycle, mirroring [`ScheduleRun`].
+///
+/// The scheduler already models "work a crash can interrupt" as a row with a
+/// state; a conversation turn is the same thing with a person waiting on it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PhoenixRecovery {
+pub struct ConversationTurn {
     pub turn_id: String,
     pub chat_jid: String,
-    pub sender: String,
     pub last_provider_msg_id: String,
     pub started_at_ms: i64,
-    pub notice_sent: bool,
+    pub finished_at_ms: Option<i64>,
+    /// Recovery attempts spent on this turn. Zero until Phoenix picks it up.
+    pub attempts: i64,
+    /// "running" | "completed" | "failed" | "abandoned"
+    pub state: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,56 +245,93 @@ impl RuntimeDb {
         Ok(res)
     }
 
-    pub fn begin_phoenix_recovery(&self, recovery: &PhoenixRecovery) -> Result<()> {
+    /// Open a turn, or refresh the reply target of one already open.
+    ///
+    /// Steering messages join a turn that is already running, and a recovery
+    /// should answer the newest of them rather than the one that opened the
+    /// burst. Attempts and start time belong to the turn, so they survive.
+    pub fn start_turn(
+        &self,
+        turn_id: &str,
+        chat_jid: &str,
+        last_provider_msg_id: &str,
+    ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO phoenix_recovery (
-                id, turn_id, chat_jid, sender, last_provider_msg_id, started_at_ms, notice_sent
-            ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO conversation_turns (
+                turn_id, chat_jid, last_provider_msg_id, started_at_ms, attempts, state
+            ) VALUES (?1, ?2, ?3, ?4, 0, 'running')
+            ON CONFLICT(turn_id) DO UPDATE SET last_provider_msg_id = excluded.last_provider_msg_id",
             params![
-                recovery.turn_id,
-                recovery.chat_jid,
-                recovery.sender,
-                recovery.last_provider_msg_id,
-                recovery.started_at_ms,
-                recovery.notice_sent as i32,
+                turn_id,
+                chat_jid,
+                last_provider_msg_id,
+                Utc::now().timestamp_millis()
             ],
         )?;
         Ok(())
     }
 
-    pub fn get_phoenix_recovery(&self) -> Result<Option<PhoenixRecovery>> {
+    pub fn finish_turn(&self, turn_id: &str, state: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE conversation_turns SET finished_at_ms = ?1, state = ?2 WHERE turn_id = ?3",
+            params![Utc::now().timestamp_millis(), state, turn_id],
+        )?;
+        Ok(())
+    }
+
+    /// Turns with no terminal state, oldest first.
+    ///
+    /// At startup this is exactly the set of turns the previous process accepted
+    /// and never answered.
+    pub fn unfinished_turns(&self) -> Result<Vec<ConversationTurn>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT turn_id, chat_jid, sender, last_provider_msg_id, started_at_ms, notice_sent
-             FROM phoenix_recovery WHERE id = 1",
+            "SELECT turn_id, chat_jid, last_provider_msg_id, started_at_ms, finished_at_ms, attempts, state
+             FROM conversation_turns WHERE finished_at_ms IS NULL ORDER BY started_at_ms ASC",
         )?;
-        let result = stmt
-            .query_row([], |row| {
-                let notice_sent: i32 = row.get(5)?;
-                Ok(PhoenixRecovery {
-                    turn_id: row.get(0)?,
-                    chat_jid: row.get(1)?,
-                    sender: row.get(2)?,
-                    last_provider_msg_id: row.get(3)?,
-                    started_at_ms: row.get(4)?,
-                    notice_sent: notice_sent != 0,
-                })
+        let rows = stmt.query_map([], |row| {
+            Ok(ConversationTurn {
+                turn_id: row.get(0)?,
+                chat_jid: row.get(1)?,
+                last_provider_msg_id: row.get(2)?,
+                started_at_ms: row.get(3)?,
+                finished_at_ms: row.get(4)?,
+                attempts: row.get(5)?,
+                state: row.get(6)?,
             })
-            .optional()?;
-        Ok(result)
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    pub fn mark_phoenix_notice_sent(&self) -> Result<()> {
+    /// The chat the last turn happened in.
+    ///
+    /// Phoenix needs somewhere to speak after a crash that left no turn open,
+    /// and the owner's JID is not always configured: the default owner is
+    /// whichever account this daemon is paired to. The last conversation is the
+    /// one fact that is always right.
+    pub fn last_known_chat(&self) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("UPDATE phoenix_recovery SET notice_sent = 1 WHERE id = 1", [])?;
-        Ok(())
+        let mut stmt = conn.prepare(
+            "SELECT chat_jid FROM conversation_turns ORDER BY started_at_ms DESC LIMIT 1",
+        )?;
+        Ok(stmt.query_row([], |row| row.get(0)).optional()?)
     }
 
-    pub fn clear_phoenix_recovery(&self) -> Result<()> {
+    /// Count a recovery attempt against a turn and return the new total.
+    pub fn record_turn_attempt(&self, turn_id: &str) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM phoenix_recovery WHERE id = 1", [])?;
-        Ok(())
+        conn.execute(
+            "UPDATE conversation_turns SET attempts = attempts + 1 WHERE turn_id = ?1",
+            params![turn_id],
+        )?;
+        let attempts: i64 = conn.query_row(
+            "SELECT attempts FROM conversation_turns WHERE turn_id = ?1",
+            params![turn_id],
+            |row| row.get(0),
+        )?;
+        Ok(attempts)
     }
 
     pub fn record_model_observation(&self, obs: &ModelObservation) -> Result<()> {
@@ -326,28 +375,43 @@ impl RuntimeDb {
 mod tests {
     use super::*;
 
+    /// The whole recovery contract: an open turn is visible after a restart, a
+    /// finished one is not, and a steering message moves the reply target
+    /// without resetting the turn.
     #[test]
-    fn test_phoenix_recovery_marker_round_trips_and_clears() {
+    fn test_unfinished_turns_survive_until_finished() {
         let dir = tempfile::tempdir().unwrap();
         let db = RuntimeDb::open(&dir.path().join("state.sqlite3")).unwrap();
-        db.begin_phoenix_recovery(&PhoenixRecovery {
-            turn_id: "turn_1".to_string(),
-            chat_jid: "947@s.whatsapp.net".to_string(),
-            sender: "947:1@s.whatsapp.net".to_string(),
-            last_provider_msg_id: "wamid.1".to_string(),
-            started_at_ms: 123,
-            notice_sent: false,
-        })
-        .unwrap();
 
-        let stored = db.get_phoenix_recovery().unwrap().unwrap();
-        assert_eq!(stored.turn_id, "turn_1");
-        assert_eq!(stored.chat_jid, "947@s.whatsapp.net");
-        assert!(!stored.notice_sent);
+        db.start_turn("turn_1", "947@s.whatsapp.net", "wamid.1").unwrap();
+        db.start_turn("turn_2", "947@s.whatsapp.net", "wamid.2").unwrap();
+        db.finish_turn("turn_2", "completed").unwrap();
 
-        db.mark_phoenix_notice_sent().unwrap();
-        assert!(db.get_phoenix_recovery().unwrap().unwrap().notice_sent);
-        db.clear_phoenix_recovery().unwrap();
-        assert!(db.get_phoenix_recovery().unwrap().is_none());
+        let open = db.unfinished_turns().unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].turn_id, "turn_1");
+        assert_eq!(open[0].attempts, 0);
+
+        // A steering message answers to the newest message, not the first.
+        db.start_turn("turn_1", "947@s.whatsapp.net", "wamid.3").unwrap();
+        let open = db.unfinished_turns().unwrap();
+        assert_eq!(open.len(), 1, "steering must not open a second turn");
+        assert_eq!(open[0].last_provider_msg_id, "wamid.3");
+        assert_eq!(open[0].started_at_ms, db.unfinished_turns().unwrap()[0].started_at_ms);
+    }
+
+    /// A request that keeps killing the process has to stop being retried, so
+    /// the attempt count is per turn rather than per boot.
+    #[test]
+    fn test_turn_attempts_accumulate_across_recoveries() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = RuntimeDb::open(&dir.path().join("state.sqlite3")).unwrap();
+
+        db.start_turn("turn_1", "947@s.whatsapp.net", "wamid.1").unwrap();
+        assert_eq!(db.record_turn_attempt("turn_1").unwrap(), 1);
+        assert_eq!(db.record_turn_attempt("turn_1").unwrap(), 2);
+
+        db.finish_turn("turn_1", "abandoned").unwrap();
+        assert!(db.unfinished_turns().unwrap().is_empty());
     }
 }

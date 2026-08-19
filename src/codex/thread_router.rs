@@ -26,7 +26,6 @@ impl ThreadRouter {
     pub fn decide(
         config: &Config,
         runtime_db: &RuntimeDb,
-        live_thread_id: Option<&str>,
         current_model_id: &str,
     ) -> Result<ThreadDecision> {
         Ok(Self::decide_at(
@@ -35,7 +34,6 @@ impl ThreadRouter {
                 estimated_cache_warm_until_ms: s.estimated_cache_warm_until_ms,
                 model_id: s.model_id.clone(),
             }),
-            live_thread_id,
             current_model_id,
             Utc::now().timestamp_millis(),
             config.cache_ttl_ms(),
@@ -45,7 +43,6 @@ impl ThreadRouter {
     /// The policy itself, with time and state passed in so it is testable.
     fn decide_at(
         persisted: Option<PersistedThread>,
-        live_thread_id: Option<&str>,
         current_model_id: &str,
         now_ms: i64,
         _ttl_ms: i64,
@@ -74,18 +71,13 @@ impl ThreadRouter {
             };
         }
 
-        if live_thread_id == Some(state.thread_id.as_str()) {
-            return ThreadDecision::Continue {
-                thread_id: state.thread_id,
-            };
-        }
-
         ThreadDecision::Continue {
             thread_id: state.thread_id,
         }
     }
 
-    /// Context handed to a thread that starts with nothing.
+    /// Pointers handed to a thread that starts with nothing. The caller adds
+    /// the recent conversation itself.
     ///
     /// Kept deliberately small. PLAN.md section 12.4 is explicit that a fresh
     /// thread should not receive a synthesized context blob. `AGENTS.md` tells
@@ -146,7 +138,7 @@ mod tests {
     #[test]
     fn test_first_ever_turn_starts_a_thread() {
         assert!(matches!(
-            ThreadRouter::decide_at(None, None, "gpt-5.6-sol", NOW, TTL),
+            ThreadRouter::decide_at(None, "gpt-5.6-sol", NOW, TTL),
             ThreadDecision::Rotate { .. }
         ));
     }
@@ -154,7 +146,7 @@ mod tests {
     #[test]
     fn test_warm_persisted_thread_is_continued() {
         let decision =
-            ThreadRouter::decide_at(persisted(NOW + TTL, "gpt-5.6-sol"), None, "gpt-5.6-sol", NOW, TTL);
+            ThreadRouter::decide_at(persisted(NOW + TTL, "gpt-5.6-sol"), "gpt-5.6-sol", NOW, TTL);
         assert_eq!(
             decision,
             ThreadDecision::Continue {
@@ -163,36 +155,20 @@ mod tests {
         );
     }
 
+    /// Including a thread that is still loaded in this process: the replacement
+    /// is handed recent canonical history, so rotating no longer drops the
+    /// conversation the user can still see.
     #[test]
     fn test_cold_thread_is_rotated() {
         let decision =
-            ThreadRouter::decide_at(persisted(NOW - 1, "gpt-5.6-sol"), None, "gpt-5.6-sol", NOW, TTL);
-        assert!(matches!(decision, ThreadDecision::Rotate { .. }));
-    }
-
-    /// A loaded thread still rotates after its cache window expires. The caller
-    /// supplies recent canonical history to the replacement thread.
-    #[test]
-    fn test_loaded_thread_is_rotated_when_cold() {
-        let decision = ThreadRouter::decide_at(
-            persisted(NOW - 1, "gpt-5.6-sol"),
-            Some("thread_real"),
-            "gpt-5.6-sol",
-            NOW,
-            TTL,
-        );
+            ThreadRouter::decide_at(persisted(NOW - 1, "gpt-5.6-sol"), "gpt-5.6-sol", NOW, TTL);
         assert!(matches!(decision, ThreadDecision::Rotate { .. }));
     }
 
     #[test]
-    fn test_model_change_rotates_even_when_warm_and_loaded() {
-        let decision = ThreadRouter::decide_at(
-            persisted(NOW + TTL, "gpt-5.6-sol"),
-            Some("thread_real"),
-            "gpt-6",
-            NOW,
-            TTL,
-        );
+    fn test_model_change_rotates_even_when_warm() {
+        let decision =
+            ThreadRouter::decide_at(persisted(NOW + TTL, "gpt-5.6-sol"), "gpt-6", NOW, TTL);
         match decision {
             ThreadDecision::Rotate { reason } => assert!(reason.contains("gpt-6"), "{reason}"),
             other => panic!("expected rotation, got {other:?}"),
@@ -203,7 +179,7 @@ mod tests {
     #[test]
     fn test_unknown_model_does_not_force_rotation() {
         let decision =
-            ThreadRouter::decide_at(persisted(NOW + TTL, "gpt-5.6-sol"), None, "", NOW, TTL);
+            ThreadRouter::decide_at(persisted(NOW + TTL, "gpt-5.6-sol"), "", NOW, TTL);
         assert!(matches!(decision, ThreadDecision::Continue { .. }));
     }
 }

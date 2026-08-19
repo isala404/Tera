@@ -420,18 +420,6 @@ impl HistoryDb {
         events.reverse();
         Ok(events)
     }
-
-    pub fn has_assistant_message_for_turn(&self, turn_id: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
-        let exists: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM conversation_events
-             WHERE kind = 'message' AND actor = 'assistant' AND turn_id = ?1",
-            params![turn_id],
-            |row| row.get(0),
-        )?;
-        Ok(exists)
-    }
-
 }
 
 #[cfg(test)]

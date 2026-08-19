@@ -30,23 +30,18 @@ use tracing::{error, info, warn};
 pub struct CodexSupervisor {
     config: Config,
     runtime_db: RuntimeDb,
-    history_db: Option<HistoryDb>,
+    history_db: HistoryDb,
     mgr: Arc<Mutex<Option<Arc<CodexProcessManager>>>>,
 }
 
 impl CodexSupervisor {
-    pub fn new(config: Config, runtime_db: RuntimeDb) -> Self {
+    pub fn new(config: Config, runtime_db: RuntimeDb, history_db: HistoryDb) -> Self {
         Self {
             config,
             runtime_db,
-            history_db: None,
+            history_db,
             mgr: Arc::new(Mutex::new(None)),
         }
-    }
-
-    pub fn with_history_db(mut self, history_db: HistoryDb) -> Self {
-        self.history_db = Some(history_db);
-        self
     }
 
     /// Start connecting now so the first message does not pay the spawn cost.
@@ -165,16 +160,15 @@ impl CodexSupervisor {
         let started_fresh = self.rotate_main_thread_if_stale(&mgr).await?;
 
         // A thread that starts empty does not know who it is talking to. It is
-        // pointed at the files rather than handed a synthesized context blob:
-        // the agent reads them better than we can summarize them (PLAN.md 12.4).
+        // pointed at the workspace files rather than handed a summary of them
+        // (PLAN.md 12.4), then given the last few messages verbatim so the
+        // rotation does not read as amnesia to the person on the other end.
         if started_fresh {
             let mut with_bootstrap =
                 vec![TurnInput::Text(ThreadRouter::build_bootstrap_context(&self.config))];
-            if let Some(history_db) = &self.history_db {
-                let recent = history_db.recent_messages(10)?;
-                if !recent.is_empty() {
-                    with_bootstrap.push(TurnInput::Text(InputRenderer::render_history(&recent)));
-                }
+            let recent = self.history_db.recent_messages(10)?;
+            if !recent.is_empty() {
+                with_bootstrap.push(TurnInput::Text(InputRenderer::render_history(&recent)));
             }
             with_bootstrap.extend_from_slice(inputs);
             return mgr
@@ -196,12 +190,7 @@ impl CodexSupervisor {
             .map(|s| s.model_id)
             .unwrap_or_default();
 
-        match ThreadRouter::decide(
-            &self.config,
-            &self.runtime_db,
-            live_thread.as_deref(),
-            &model_id,
-        )? {
+        match ThreadRouter::decide(&self.config, &self.runtime_db, &model_id)? {
             ThreadDecision::Continue { thread_id } => {
                 if live_thread.as_deref() != Some(thread_id.as_str()) {
                     // Persisted but not loaded in this process yet. If the resume

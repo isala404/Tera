@@ -5,10 +5,10 @@ use crate::conversation::buffer::MessageBurst;
 use crate::conversation::renderer::InputRenderer;
 use crate::conversation::session::ConversationSession;
 use crate::conversation::typing::TypingGuard;
-use crate::data;
 use crate::history::assets::AssetStorage;
+use crate::conversation::record_assistant_message;
 use crate::history::db::{Attachment, ConversationEvent, HistoryDb, ProviderRef};
-use crate::runtime::{ActivityTracker, PhoenixRecovery, RuntimeDb};
+use crate::runtime::{ActivityTracker, RuntimeDb};
 use crate::transport::{InboundMessage, OwnerPolicy, Transport, Verdict};
 use anyhow::Result;
 use std::collections::HashMap;
@@ -61,7 +61,6 @@ pub struct TurnEngine {
     owner_policy: OwnerPolicy,
     session: ConversationSession,
     activity: ActivityTracker,
-    turn_lock: Arc<Mutex<()>>,
 }
 
 impl TurnEngine {
@@ -84,7 +83,6 @@ impl TurnEngine {
             codex,
             session,
             activity,
-            turn_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -142,18 +140,6 @@ impl TurnEngine {
                 msg.from_own_account,
             ))?;
 
-        // Persist the pending turn before waiting for the burst quiet period.
-        // A daemon crash during buffering must still leave Phoenix something
-        // durable to resume on the next start.
-        self.runtime_db.begin_phoenix_recovery(&PhoenixRecovery {
-            turn_id: logical_turn.clone(),
-            chat_jid: msg.chat_jid.clone(),
-            sender: sender.clone(),
-            last_provider_msg_id: msg.provider_msg_id.clone(),
-            started_at_ms: chrono::Utc::now().timestamp_millis(),
-            notice_sent: false,
-        })?;
-
         info!("Recorded inbound message from {}: {:?}", sender, msg.text);
 
         match route {
@@ -165,7 +151,8 @@ impl TurnEngine {
                 // The turn finished in the gap. Fall through and treat this as the
                 // start of a new one rather than dropping the message.
                 info!("Nothing to steer after all; starting a new turn for this message");
-                self.begin_burst(&sender, conv_ev, &msg.provider_msg_id).await;
+                self.begin_burst(&sender, &msg.chat_jid, conv_ev, &msg.provider_msg_id)
+                    .await;
             }
             Route::JoinBurst => {
                 let mut state = self.state.lock().await;
@@ -174,11 +161,13 @@ impl TurnEngine {
                 } else {
                     // Its timer fired while we were writing to history.
                     drop(state);
-                    self.begin_burst(&sender, conv_ev, &msg.provider_msg_id).await;
+                    self.begin_burst(&sender, &msg.chat_jid, conv_ev, &msg.provider_msg_id)
+                        .await;
                 }
             }
             Route::StartBurst => {
-                self.begin_burst(&sender, conv_ev, &msg.provider_msg_id).await;
+                self.begin_burst(&sender, &msg.chat_jid, conv_ev, &msg.provider_msg_id)
+                    .await;
             }
         }
 
@@ -208,128 +197,6 @@ impl TurnEngine {
         }
     }
 
-    /// Finish a Phoenix recovery left behind by a daemon or app-server crash.
-    /// Returns true when there is no pending recovery, or when this attempt
-    /// completed it. Errors leave the marker for a later retry.
-    pub async fn recover_pending(&self) -> Result<bool> {
-        let _turn_lock = self.turn_lock.lock().await;
-        let Some(recovery) = self.runtime_db.get_phoenix_recovery()? else {
-            return Ok(true);
-        };
-
-        if self
-            .history_db
-            .has_assistant_message_for_turn(&recovery.turn_id)?
-        {
-            info!(
-                "Phoenix found a completed assistant message for interrupted turn {}; clearing marker",
-                recovery.turn_id
-            );
-            self.runtime_db.clear_phoenix_recovery()?;
-            return Ok(true);
-        }
-
-        self.session.set_chat(&recovery.chat_jid);
-        if !recovery.notice_sent {
-            let notice = "Phoenix mode recovered an interrupted turn. I’m checking it now.";
-            let provider_msg_id = self
-                .transport
-                .send_text(
-                    &recovery.chat_jid,
-                    notice,
-                    Some(&recovery.last_provider_msg_id),
-                )
-                .await?;
-            self.record_assistant_message(&provider_msg_id, notice, None, None)?;
-            self.runtime_db.mark_phoenix_notice_sent()?;
-        }
-
-        let recent_context = InputRenderer::render_history(&self.history_db.recent_messages(10)?);
-        let prompt = data::render(
-            data::PHOENIX_RECOVERY_PROMPT,
-            &[
-                ("OWNER", &self.config.owner_name),
-                ("NOW", &chrono::Local::now().to_rfc3339()),
-                ("TURN_ID", &recovery.turn_id),
-                ("RECENT_CONTEXT", &recent_context),
-            ],
-        );
-
-        let _active = self.activity.begin();
-        let recovery_turn_id = format!("phoenix_{}", recovery.turn_id);
-        self.session.set_turn(Some(&recovery_turn_id));
-        let sends_before = self.session.count();
-        let result = async {
-            let reply_text = self
-                .codex
-                .run_main_turn(&[TurnInput::Text(prompt)])
-                .await?;
-            self.codex.note_main_activity();
-
-            if self.session.sends_since(sends_before) == 0 {
-                let reply_text = if reply_text.trim().is_empty() {
-                    "Phoenix recovered the turn but it did not produce a final reply. I’m leaving the recovery marker in place to retry."
-                        .to_string()
-                } else {
-                    reply_text
-                };
-                let provider_msg_id = self
-                    .transport
-                    .send_text(
-                        &recovery.chat_jid,
-                        &reply_text,
-                        Some(&recovery.last_provider_msg_id),
-                    )
-                    .await?;
-                self.record_assistant_message(
-                    &provider_msg_id,
-                    &reply_text,
-                    Some(recovery_turn_id.clone()),
-                    None,
-                )?;
-            }
-
-            self.runtime_db.clear_phoenix_recovery()?;
-            Ok::<(), anyhow::Error>(())
-        }
-        .await;
-        self.session.set_turn(None);
-        result.map(|()| true)
-    }
-
-    fn record_assistant_message(
-        &self,
-        provider_msg_id: &str,
-        text: &str,
-        turn_id: Option<String>,
-        reply_to_id: Option<String>,
-    ) -> Result<String> {
-        let event_id = format!("msg_{}", Uuid::new_v4().simple());
-        let saved = self.history_db.insert_event(ConversationEvent {
-            seq: None,
-            id: event_id,
-            occurred_at_ms: chrono::Utc::now().timestamp_millis(),
-            kind: "message".to_string(),
-            actor: "assistant".to_string(),
-            text: Some(text.to_string()),
-            reply_to_id,
-            turn_id,
-            reaction_target_id: None,
-            reaction_emoji: None,
-            attachments: vec![],
-        })?;
-        self.history_db
-            .record_provider_ref(&ProviderRef::whatsapp(
-                &saved.id,
-                provider_msg_id,
-                self.session.chat().unwrap_or_default(),
-                true,
-            ))?;
-        self.history_db
-            .record_delivery_event(&saved.id, "sent", None)?;
-        Ok(saved.id)
-    }
-
     /// Where an inbound message belongs, and under which logical turn id.
     async fn route(&self, sender: &str) -> (Route, String) {
         let state = self.state.lock().await;
@@ -354,11 +221,26 @@ impl TurnEngine {
     }
 
     /// Open a burst for `sender` and arm its quiet-period timer.
-    async fn begin_burst(&self, sender: &str, event: ConversationEvent, last_provider_msg_id: &str) {
+    async fn begin_burst(
+        &self,
+        sender: &str,
+        chat_jid: &str,
+        event: ConversationEvent,
+        last_provider_msg_id: &str,
+    ) {
         let turn_id = event
             .turn_id
             .clone()
             .unwrap_or_else(|| format!("turn_{}", Uuid::new_v4().simple()));
+
+        // Durable before the quiet period, not after: a crash while buffering
+        // still leaves a turn Phoenix can see and answer.
+        if let Err(e) = self
+            .runtime_db
+            .start_turn(&turn_id, chat_jid, last_provider_msg_id)
+        {
+            warn!("Could not record turn {turn_id}; a crash now would lose it: {e:?}");
+        }
 
         {
             let mut state = self.state.lock().await;
@@ -475,15 +357,22 @@ impl TurnEngine {
         burst: MessageBurst,
         last_provider_msg_id: &str,
     ) -> Result<()> {
-        let _turn_lock = self.turn_lock.lock().await;
-
         // Registers the conversation as busy for the duration, which is what
         // defers memory maintenance and interrupts it if it is already running.
         let _active = self.activity.begin();
 
-        self.set_running(Some(burst.turn_id.clone())).await;
+        let turn_id = burst.turn_id.clone();
+        self.set_running(Some(turn_id.clone())).await;
         let outcome = self.execute_turn(sender, burst, last_provider_msg_id).await;
         self.set_running(None).await;
+
+        // Closed either way. This process is still alive, so a failure here is a
+        // logged failure, not something for Phoenix to resurrect at a restart
+        // that might be days away.
+        let state = if outcome.is_ok() { "completed" } else { "failed" };
+        if let Err(e) = self.runtime_db.finish_turn(&turn_id, state) {
+            warn!("Could not close turn {turn_id}: {e:?}");
+        }
         outcome
     }
 
@@ -505,19 +394,9 @@ impl TurnEngine {
         // Held for the whole turn; clears itself however this function exits.
         let _typing = TypingGuard::start(self.transport.clone(), sender.to_string());
         let chat_jid = self.session.chat().unwrap_or_default();
-        let turn_id = burst.turn_id.clone();
-        self.session.set_turn(Some(&turn_id));
+        self.session.set_turn(Some(&burst.turn_id));
 
         let result = async {
-            self.runtime_db.begin_phoenix_recovery(&PhoenixRecovery {
-                turn_id: turn_id.clone(),
-                chat_jid,
-                sender: sender.to_string(),
-                last_provider_msg_id: last_provider_msg_id.to_string(),
-                started_at_ms: chrono::Utc::now().timestamp_millis(),
-                notice_sent: false,
-            })?;
-
             // Render events into a structured prompt, then hand any images and voice
             // notes to Codex as real media rather than a text description of media.
             let inputs = self.turn_inputs(&burst.events);
@@ -539,7 +418,6 @@ impl TurnEngine {
             // deliver every answer twice. Only fall back when the turn produced no
             // user-visible message of its own (PLAN.md section 54.1).
             if self.session.sends_since(sends_before) > 0 {
-                self.runtime_db.clear_phoenix_recovery()?;
                 info!("Turn replied via send_message; skipping final-text fallback");
                 return Ok(());
             }
@@ -559,13 +437,14 @@ impl TurnEngine {
                 .send_text(sender, &reply_text, Some(last_provider_msg_id))
                 .await?;
 
-            self.record_assistant_message(
+            record_assistant_message(
+                &self.history_db,
+                &chat_jid,
                 &outbound_msg_id,
                 &reply_text,
                 Some(burst.turn_id.clone()),
                 burst.events.last().map(|e| e.id.clone()),
             )?;
-            self.runtime_db.clear_phoenix_recovery()?;
 
             info!("Sent reply to {}: {}", sender, reply_text);
             Ok(())
