@@ -6,8 +6,9 @@ use crate::conversation::renderer::InputRenderer;
 use crate::conversation::session::ConversationSession;
 use crate::conversation::typing::TypingGuard;
 use crate::history::assets::AssetStorage;
+use crate::conversation::record_assistant_message;
 use crate::history::db::{Attachment, ConversationEvent, HistoryDb, ProviderRef};
-use crate::runtime::ActivityTracker;
+use crate::runtime::{ActivityTracker, RuntimeDb};
 use crate::transport::{InboundMessage, OwnerPolicy, Transport, Verdict};
 use anyhow::Result;
 use std::collections::HashMap;
@@ -53,6 +54,7 @@ enum Route {
 pub struct TurnEngine {
     config: Config,
     history_db: HistoryDb,
+    runtime_db: RuntimeDb,
     transport: Arc<dyn Transport>,
     state: Arc<Mutex<ConversationState>>,
     codex: CodexSupervisor,
@@ -65,6 +67,7 @@ impl TurnEngine {
     pub fn new(
         config: Config,
         history_db: HistoryDb,
+        runtime_db: RuntimeDb,
         transport: Arc<dyn Transport>,
         session: ConversationSession,
         codex: CodexSupervisor,
@@ -74,6 +77,7 @@ impl TurnEngine {
             owner_policy: OwnerPolicy::new(config.whatsapp_owner_number.clone()),
             config,
             history_db,
+            runtime_db,
             transport,
             state: Arc::new(Mutex::new(ConversationState::default())),
             codex,
@@ -147,7 +151,8 @@ impl TurnEngine {
                 // The turn finished in the gap. Fall through and treat this as the
                 // start of a new one rather than dropping the message.
                 info!("Nothing to steer after all; starting a new turn for this message");
-                self.begin_burst(&sender, conv_ev, &msg.provider_msg_id).await;
+                self.begin_burst(&sender, &msg.chat_jid, conv_ev, &msg.provider_msg_id)
+                    .await;
             }
             Route::JoinBurst => {
                 let mut state = self.state.lock().await;
@@ -156,11 +161,13 @@ impl TurnEngine {
                 } else {
                     // Its timer fired while we were writing to history.
                     drop(state);
-                    self.begin_burst(&sender, conv_ev, &msg.provider_msg_id).await;
+                    self.begin_burst(&sender, &msg.chat_jid, conv_ev, &msg.provider_msg_id)
+                        .await;
                 }
             }
             Route::StartBurst => {
-                self.begin_burst(&sender, conv_ev, &msg.provider_msg_id).await;
+                self.begin_burst(&sender, &msg.chat_jid, conv_ev, &msg.provider_msg_id)
+                    .await;
             }
         }
 
@@ -214,11 +221,26 @@ impl TurnEngine {
     }
 
     /// Open a burst for `sender` and arm its quiet-period timer.
-    async fn begin_burst(&self, sender: &str, event: ConversationEvent, last_provider_msg_id: &str) {
+    async fn begin_burst(
+        &self,
+        sender: &str,
+        chat_jid: &str,
+        event: ConversationEvent,
+        last_provider_msg_id: &str,
+    ) {
         let turn_id = event
             .turn_id
             .clone()
             .unwrap_or_else(|| format!("turn_{}", Uuid::new_v4().simple()));
+
+        // Durable before the quiet period, not after: a crash while buffering
+        // still leaves a turn Phoenix can see and answer.
+        if let Err(e) = self
+            .runtime_db
+            .start_turn(&turn_id, chat_jid, last_provider_msg_id)
+        {
+            warn!("Could not record turn {turn_id}; a crash now would lose it: {e:?}");
+        }
 
         {
             let mut state = self.state.lock().await;
@@ -339,9 +361,18 @@ impl TurnEngine {
         // defers memory maintenance and interrupts it if it is already running.
         let _active = self.activity.begin();
 
-        self.set_running(Some(burst.turn_id.clone())).await;
+        let turn_id = burst.turn_id.clone();
+        self.set_running(Some(turn_id.clone())).await;
         let outcome = self.execute_turn(sender, burst, last_provider_msg_id).await;
         self.set_running(None).await;
+
+        // Closed either way. This process is still alive, so a failure here is a
+        // logged failure, not something for Phoenix to resurrect at a restart
+        // that might be days away.
+        let state = if outcome.is_ok() { "completed" } else { "failed" };
+        if let Err(e) = self.runtime_db.finish_turn(&turn_id, state) {
+            warn!("Could not close turn {turn_id}: {e:?}");
+        }
         outcome
     }
 
@@ -362,77 +393,65 @@ impl TurnEngine {
 
         // Held for the whole turn; clears itself however this function exits.
         let _typing = TypingGuard::start(self.transport.clone(), sender.to_string());
+        let chat_jid = self.session.chat().unwrap_or_default();
+        self.session.set_turn(Some(&burst.turn_id));
 
-        // Render events into a structured prompt, then hand any images and voice
-        // notes to Codex as real media rather than a text description of media.
-        let inputs = self.turn_inputs(&burst.events);
+        let result = async {
+            // Render events into a structured prompt, then hand any images and voice
+            // notes to Codex as real media rather than a text description of media.
+            let inputs = self.turn_inputs(&burst.events);
 
-        // A degraded turn must read as degraded. Echoing a canned "I'm ready to
-        // assist" makes a dead Codex backend indistinguishable from a real reply.
-        let reply_text = match self.codex.run_main_turn(&inputs).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                error!("Codex turn failed: {:?}", e);
-                format!("⚠️ I couldn't complete that turn, the Codex backend errored: {e}")
+            // A degraded turn must read as degraded. Echoing a canned "I'm ready to
+            // assist" makes a dead Codex backend indistinguishable from a real reply.
+            let reply_text = match self.codex.run_main_turn(&inputs).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    error!("Codex turn failed: {:?}", e);
+                    format!("⚠️ I couldn't complete that turn, the Codex backend errored: {e}")
+                }
+            };
+
+            self.codex.note_main_activity();
+
+            // The agent is instructed to reply through the send_message MCP tool, and
+            // usually does. Sending the final agent text unconditionally would then
+            // deliver every answer twice. Only fall back when the turn produced no
+            // user-visible message of its own (PLAN.md section 54.1).
+            if self.session.sends_since(sends_before) > 0 {
+                info!("Turn replied via send_message; skipping final-text fallback");
+                return Ok(());
             }
-        };
 
-        self.codex.note_main_activity();
+            // Nothing was sent and there is nothing to send: the user asked something
+            // and would otherwise get an answer, so say so rather than leave them waiting.
+            let reply_text = if reply_text.trim().is_empty() {
+                warn!("Turn produced neither a send_message nor any final text");
+                "⚠️ I finished working on that but didn't produce a reply. Try asking again."
+                    .to_string()
+            } else {
+                reply_text
+            };
 
-        // The agent is instructed to reply through the send_message MCP tool, and
-        // usually does. Sending the final agent text unconditionally would then
-        // deliver every answer twice. Only fall back when the turn produced no
-        // user-visible message of its own (PLAN.md section 54.1).
-        if self.session.sends_since(sends_before) > 0 {
-            info!("Turn replied via send_message; skipping final-text fallback");
-            return Ok(());
-        }
+            let outbound_msg_id = self
+                .transport
+                .send_text(sender, &reply_text, Some(last_provider_msg_id))
+                .await?;
 
-        // Nothing was sent and there is nothing to send: the user asked something
-        // and would otherwise get silence, so say so rather than leave them
-        // waiting on a turn that quietly produced nothing.
-        let reply_text = if reply_text.trim().is_empty() {
-            warn!("Turn produced neither a send_message nor any final text");
-            "⚠️ I finished working on that but didn't produce a reply. Try asking again."
-                .to_string()
-        } else {
-            reply_text
-        };
-
-        let outbound_msg_id = self
-            .transport
-            .send_text(sender, &reply_text, Some(last_provider_msg_id))
-            .await?;
-
-        // Record assistant response event into canonical history. The reply
-        // target is our own event id for the message being answered, not the
-        // WhatsApp id: provider ids belong in provider_refs and nowhere else.
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let assistant_ev_id = format!("msg_{}", Uuid::new_v4().simple());
-        let assistant_ev = ConversationEvent {
-            seq: None,
-            id: assistant_ev_id.clone(),
-            occurred_at_ms: now_ms,
-            kind: "message".to_string(),
-            actor: "assistant".to_string(),
-            text: Some(reply_text.clone()),
-            reply_to_id: burst.events.last().map(|e| e.id.clone()),
-            turn_id: Some(burst.turn_id.clone()),
-            reaction_target_id: None,
-            reaction_emoji: None,
-            attachments: vec![],
-        };
-
-        self.history_db.insert_event(assistant_ev.clone())?;
-        self.history_db
-            .record_provider_ref(&ProviderRef::whatsapp(
-                &assistant_ev_id,
+            record_assistant_message(
+                &self.history_db,
+                &chat_jid,
                 &outbound_msg_id,
-                self.session.chat().unwrap_or_default(),
-                true,
-            ))?;
+                &reply_text,
+                Some(burst.turn_id.clone()),
+                burst.events.last().map(|e| e.id.clone()),
+            )?;
 
-        info!("Sent reply to {}: {}", sender, reply_text);
-        Ok(())
+            info!("Sent reply to {}: {}", sender, reply_text);
+            Ok(())
+        }
+        .await;
+
+        self.session.set_turn(None);
+        result
     }
 }

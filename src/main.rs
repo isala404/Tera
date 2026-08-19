@@ -1,14 +1,14 @@
 use tera::config::Config;
 use tera::codex::tier;
 use tera::codex::CodexSupervisor;
-use tera::conversation::{ConversationSession, TurnEngine};
+use tera::conversation::{ConversationSession, Phoenix, TurnEngine};
 use tera::history::{backup, HistoryDb, ProjectionEngine};
 use tera::memory::generations::GenerationManager;
 use tera::scheduler::db::SchedulerDb;
 use tera::mcp::{DaemonRpcServer, StdioMcpProxy};
 use tera::memory::optimizer::OptimizerOutcome;
 use tera::memory::{MaintenanceRunner, MemoryOptimizer, MemoryRebuilder};
-use tera::runtime::{ActivityTracker, DaemonLock, RuntimeDb};
+use tera::runtime::{self, ActivityTracker, DaemonLock, RuntimeDb};
 use tera::scheduler::SchedulerRunner;
 use tera::transport::{InboundEvent, MockTransport, Transport, WhatsAppWebTransport};
 use tera::workspace::WorkspaceInit;
@@ -16,7 +16,12 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{info, warn};
+
+/// How many times Phoenix retries before giving up on reaching the owner. Ten
+/// tries at ten-second spacing outlasts any normal WhatsApp reconnect.
+const PHOENIX_REPORT_ATTEMPTS: u32 = 10;
+
+use tracing::{error, info, warn};
 
 #[derive(Parser)]
 #[command(name = "tera")]
@@ -350,7 +355,8 @@ async fn main() -> Result<()> {
                 WorkspaceInit::init(&config)?;
                 let history_db = HistoryDb::open_for(&config)?;
                 let runtime_db = RuntimeDb::open(&config.runtime_db_path())?;
-                let codex = CodexSupervisor::new(config.clone(), runtime_db.clone());
+                let codex =
+                    CodexSupervisor::new(config.clone(), runtime_db.clone(), history_db.clone());
                 let generation =
                     MemoryRebuilder::run(&config, &history_db, &runtime_db, &codex).await?;
                 println!("Memory rebuilt; generation {generation} is active");
@@ -360,7 +366,8 @@ async fn main() -> Result<()> {
                 let config = Config::new(workspace, false);
                 WorkspaceInit::init(&config)?;
                 let runtime_db = RuntimeDb::open(&config.runtime_db_path())?;
-                let codex = CodexSupervisor::new(config.clone(), runtime_db.clone());
+                let history_db = HistoryDb::open_for(&config)?;
+                let codex = CodexSupervisor::new(config.clone(), runtime_db.clone(), history_db);
                 // No other work can be in flight in a one-shot command, so an
                 // empty tracker is the honest answer to "is anything active".
                 let activity = ActivityTracker::new();
@@ -424,6 +431,13 @@ async fn main() -> Result<()> {
             // 1. Acquire singleton daemon lock
             let _lock = DaemonLock::acquire(&config.lock_file_path())?;
 
+            // Armed before anything else can fail, and removed only by a clean
+            // exit further down. Whatever this returns is the previous life.
+            let crashed = runtime::phoenix::arm(&config.runtime_dir())?;
+            if let Some(mark) = &crashed {
+                warn!("Previous tera {} (started {})", mark.describe(), mark.started_at_ms);
+            }
+
             // 2. Initialize workspace & databases
             WorkspaceInit::init(&config)?;
             let history_db = HistoryDb::open_for(&config)?;
@@ -473,7 +487,8 @@ async fn main() -> Result<()> {
             let activity = ActivityTracker::new();
 
             // One app-server process, shared by the conversation and the scheduler.
-            let codex = CodexSupervisor::new(config.clone(), runtime_db.clone());
+            let codex =
+                CodexSupervisor::new(config.clone(), runtime_db.clone(), history_db.clone());
             codex.warm_in_background();
 
             // 3. Initialize transport & spawn bot loop
@@ -488,11 +503,36 @@ async fn main() -> Result<()> {
                 let turn_engine = Arc::new(TurnEngine::new(
                     config.clone(),
                     history_db.clone(),
+                    runtime_db.clone(),
                     wa_transport.clone(),
                     session.clone(),
                     codex.clone(),
                     activity.clone(),
                 ));
+
+                // Phoenix speaks before it repairs, and it cannot speak until the
+                // transport is up, which happens below. Retrying the whole job is
+                // safe: nothing is recorded until the owner has been told.
+                let phoenix = Phoenix::new(
+                    config.clone(),
+                    history_db.clone(),
+                    runtime_db.clone(),
+                    wa_transport.clone(),
+                    codex.clone(),
+                    activity.clone(),
+                );
+                tokio::spawn(async move {
+                    for attempt in 1..=PHOENIX_REPORT_ATTEMPTS {
+                        match phoenix.run(crashed.clone()).await {
+                            Ok(()) => return,
+                            Err(e) => {
+                                warn!("Phoenix could not run (attempt {attempt}): {e:?}");
+                                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                            }
+                        }
+                    }
+                    error!("Phoenix gave up; an interrupted turn is still open in the database");
+                });
 
                 // Reconnect rather than going quiet. `start_bot` returns when the
                 // bot stops for any reason, and a daemon that keeps running with
@@ -586,6 +626,9 @@ async fn main() -> Result<()> {
                     warn!("Could not remove the runtime socket: {:?}", e);
                 }
             }
+
+            // Last thing, so anything that stops us before here reads as a crash.
+            runtime::phoenix::disarm(&config.runtime_dir());
             info!("tera stopped.");
         }
     }

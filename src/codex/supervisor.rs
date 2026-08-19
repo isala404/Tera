@@ -16,6 +16,8 @@ use crate::codex::thread_router::{ThreadDecision, ThreadRouter};
 use crate::codex::tier::{self, ModelTier};
 use crate::codex::CodexProcessManager;
 use crate::config::Config;
+use crate::conversation::renderer::InputRenderer;
+use crate::history::db::HistoryDb;
 use crate::runtime::{MainThreadState, RuntimeDb};
 use anyhow::Result;
 use chrono::Utc;
@@ -28,14 +30,16 @@ use tracing::{error, info, warn};
 pub struct CodexSupervisor {
     config: Config,
     runtime_db: RuntimeDb,
+    history_db: HistoryDb,
     mgr: Arc<Mutex<Option<Arc<CodexProcessManager>>>>,
 }
 
 impl CodexSupervisor {
-    pub fn new(config: Config, runtime_db: RuntimeDb) -> Self {
+    pub fn new(config: Config, runtime_db: RuntimeDb, history_db: HistoryDb) -> Self {
         Self {
             config,
             runtime_db,
+            history_db,
             mgr: Arc::new(Mutex::new(None)),
         }
     }
@@ -82,18 +86,21 @@ impl CodexSupervisor {
             .await?;
 
         let now_ms = Utc::now().timestamp_millis();
-        let started_at_ms = persisted
-            .as_ref()
-            .filter(|p| p.thread_id == info.id)
-            .map(|p| p.started_at_ms)
+        let existing = persisted.as_ref().filter(|p| p.thread_id == info.id);
+        let started_at_ms = existing.map(|p| p.started_at_ms).unwrap_or(now_ms);
+        let last_activity_at_ms = existing
+            .map(|p| p.last_activity_at_ms)
             .unwrap_or(now_ms);
+        let estimated_cache_warm_until_ms = existing
+            .map(|p| p.estimated_cache_warm_until_ms)
+            .unwrap_or(now_ms + self.config.cache_ttl_ms());
 
         self.runtime_db.save_main_thread(&MainThreadState {
             thread_id: info.id.clone(),
             turn_id: None,
             started_at_ms,
-            last_activity_at_ms: now_ms,
-            estimated_cache_warm_until_ms: now_ms + self.config.cache_ttl_ms(),
+            last_activity_at_ms,
+            estimated_cache_warm_until_ms,
             model_id: info.model.clone(),
         })?;
 
@@ -153,11 +160,16 @@ impl CodexSupervisor {
         let started_fresh = self.rotate_main_thread_if_stale(&mgr).await?;
 
         // A thread that starts empty does not know who it is talking to. It is
-        // pointed at the files rather than handed a synthesized context blob:
-        // the agent reads them better than we can summarize them (PLAN.md 12.4).
+        // pointed at the workspace files rather than handed a summary of them
+        // (PLAN.md 12.4), then given the last few messages verbatim so the
+        // rotation does not read as amnesia to the person on the other end.
         if started_fresh {
             let mut with_bootstrap =
                 vec![TurnInput::Text(ThreadRouter::build_bootstrap_context(&self.config))];
+            let recent = self.history_db.recent_messages(10)?;
+            if !recent.is_empty() {
+                with_bootstrap.push(TurnInput::Text(InputRenderer::render_history(&recent)));
+            }
             with_bootstrap.extend_from_slice(inputs);
             return mgr
                 .run_turn_inputs(&with_bootstrap, tier::CONVERSATION)
@@ -178,12 +190,7 @@ impl CodexSupervisor {
             .map(|s| s.model_id)
             .unwrap_or_default();
 
-        match ThreadRouter::decide(
-            &self.config,
-            &self.runtime_db,
-            live_thread.as_deref(),
-            &model_id,
-        )? {
+        match ThreadRouter::decide(&self.config, &self.runtime_db, &model_id)? {
             ThreadDecision::Continue { thread_id } => {
                 if live_thread.as_deref() != Some(thread_id.as_str()) {
                     // Persisted but not loaded in this process yet. If the resume

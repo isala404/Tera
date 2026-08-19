@@ -216,7 +216,7 @@ impl DaemonRpcServer {
                     actor: "assistant".to_string(),
                     text: text.map(|s| s.to_string()),
                     reply_to_id: None,
-                    turn_id: None,
+                    turn_id: self.session.turn(),
                     reaction_target_id: None,
                     reaction_emoji: None,
                     attachments: vec![],

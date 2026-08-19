@@ -3,7 +3,7 @@ use crate::runtime::{RuntimeDb, ScheduleItem, ScheduleRun};
 use crate::scheduler::recurrence::ScheduleTiming;
 use anyhow::Result;
 use chrono::{Local, Utc};
-use rusqlite::{params, Row};
+use rusqlite::{params, OptionalExtension, Row};
 use uuid::Uuid;
 
 /// Both schedule queries select the same columns in the same order; sharing the
@@ -114,6 +114,15 @@ impl SchedulerDb {
         Ok(items)
     }
 
+    pub fn get_schedule(runtime_db: &RuntimeDb, schedule_id: &str) -> Result<Option<ScheduleItem>> {
+        let conn = runtime_db.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, prompt, schedule_type, one_shot_at_ms, dtstart_local, rrule, timezone, task_path, status, next_run_at_ms, created_at_ms, cancelled_at_ms, tier
+             FROM schedules WHERE id = ?1",
+        )?;
+        Ok(stmt.query_row(params![schedule_id], schedule_from_row).optional()?)
+    }
+
     /// Whether any schedule with this name has ever existed, in any state.
     ///
     /// Used to keep the seeded machine-health schedule from being recreated on
@@ -214,6 +223,28 @@ impl SchedulerDb {
             runs.push(r?);
         }
         Ok(runs)
+    }
+
+    pub fn running_runs(runtime_db: &RuntimeDb) -> Result<Vec<ScheduleRun>> {
+        let conn = runtime_db.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, schedule_id, scheduled_for_ms, started_at_ms, finished_at_ms, state, codex_thread_id, error
+             FROM schedule_runs WHERE state = 'running' ORDER BY started_at_ms ASC",
+        )?;
+        let rows = stmt.query_map([], |row: &Row| {
+            Ok(ScheduleRun {
+                id: row.get(0)?,
+                schedule_id: row.get(1)?,
+                scheduled_for_ms: row.get(2)?,
+                started_at_ms: row.get(3)?,
+                finished_at_ms: row.get(4)?,
+                state: row.get(5)?,
+                codex_thread_id: row.get(6)?,
+                error: row.get(7)?,
+            })
+        })?;
+
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn update_next_run(
