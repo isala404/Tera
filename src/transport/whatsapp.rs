@@ -447,8 +447,12 @@ impl Transport for WhatsAppWebTransport {
     }
 }
 
+/// Recipient, text, and the provider id it replied to.
+type SentMessage = (String, String, Option<String>);
+
+#[derive(Default)]
 pub struct MockTransport {
-    pub sent_messages: Arc<Mutex<Vec<(String, String, Option<String>)>>>,
+    pub sent_messages: Arc<Mutex<Vec<SentMessage>>>,
     pub sent_reactions: Arc<Mutex<Vec<(String, String, String)>>>,
     pub typing_states: Arc<Mutex<Vec<(String, bool)>>>,
     pub inbound_queue: Arc<Mutex<VecDeque<InboundEvent>>>,
@@ -456,12 +460,7 @@ pub struct MockTransport {
 
 impl MockTransport {
     pub fn new() -> Self {
-        Self {
-            sent_messages: Arc::new(Mutex::new(Vec::new())),
-            sent_reactions: Arc::new(Mutex::new(Vec::new())),
-            typing_states: Arc::new(Mutex::new(Vec::new())),
-            inbound_queue: Arc::new(Mutex::new(VecDeque::new())),
-        }
+        Self::default()
     }
 
     pub fn push_inbound(&self, event: InboundEvent) {

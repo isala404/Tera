@@ -781,12 +781,12 @@ fn rename_skill_without_replace(staging: &Path, destination: &Path) -> Result<bo
         if error.raw_os_error() == Some(libc::EEXIST) {
             return Ok(false);
         }
-        return Err(error).with_context(|| {
+        Err(error).with_context(|| {
             format!(
                 "Failed to install built-in skill at {:?} without replacing an existing path",
                 destination
             )
-        });
+        })
     }
 
     #[cfg(target_os = "macos")]
@@ -804,12 +804,12 @@ fn rename_skill_without_replace(staging: &Path, destination: &Path) -> Result<bo
         if error.raw_os_error() == Some(libc::EEXIST) {
             return Ok(false);
         }
-        return Err(error).with_context(|| {
+        Err(error).with_context(|| {
             format!(
                 "Failed to install built-in skill at {:?} without replacing an existing path",
                 destination
             )
-        });
+        })
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1073,7 +1073,7 @@ mod tests {
 
         let symlink_tmp = tempfile::tempdir().unwrap();
         let symlink_config = Config::new(symlink_tmp.path().to_path_buf(), true);
-        fs::create_dir_all(&symlink_config.skills_dir()).unwrap();
+        fs::create_dir_all(symlink_config.skills_dir()).unwrap();
         let symlink_path = symlink_config.skills_dir().join(builtin.name);
         symlink(
             symlink_tmp.path().join("missing-target"),
