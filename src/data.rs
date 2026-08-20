@@ -299,7 +299,14 @@ mod tests {
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert_eq!(
             names,
-            ["send_message", "react", "schedule", "list_schedules", "cancel_schedule"]
+            [
+                "send_message",
+                "react",
+                "schedule",
+                "list_schedules",
+                "cancel_schedule",
+                "request_secret"
+            ]
         );
         for tool in &tools {
             assert!(tool["description"].is_string(), "{tool} has no description");

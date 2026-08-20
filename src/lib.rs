@@ -8,5 +8,6 @@ pub mod memory;
 pub mod observability;
 pub mod runtime;
 pub mod scheduler;
+pub mod secrets;
 pub mod transport;
 pub mod workspace;

@@ -5,6 +5,8 @@ use tera::conversation::{ConversationSession, Phoenix, TurnEngine};
 use tera::history::{backup, HistoryDb, ProjectionEngine};
 use tera::memory::generations::GenerationManager;
 use tera::scheduler::db::SchedulerDb;
+use tera::scheduler::recurrence;
+use tera::secrets::SecretStore;
 use tera::mcp::{DaemonRpcServer, StdioMcpProxy};
 use tera::memory::optimizer::OptimizerOutcome;
 use tera::memory::{MaintenanceRunner, MemoryOptimizer, MemoryRebuilder};
@@ -65,6 +67,11 @@ enum Commands {
         #[command(subcommand)]
         sub: MemorySubcommands,
     },
+    /// Credentials skills read. Normally set from chat, not here.
+    Secret {
+        #[command(subcommand)]
+        sub: SecretSubcommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -111,6 +118,40 @@ enum MemorySubcommands {
     },
 }
 
+#[derive(Subcommand)]
+enum SecretSubcommands {
+    /// List stored names and when each was set. Never prints a value.
+    List {
+        #[arg(long, default_value = "/workspace")]
+        workspace: PathBuf,
+    },
+    /// Store a credential, read from stdin.
+    ///
+    /// Stdin rather than an argument, so the value does not end up in shell
+    /// history or in the process list of every other account on the machine.
+    Set {
+        #[arg(long, default_value = "/workspace")]
+        workspace: PathBuf,
+        name: String,
+    },
+    /// Forget a credential.
+    Rm {
+        #[arg(long, default_value = "/workspace")]
+        workspace: PathBuf,
+        name: String,
+    },
+}
+
+impl SecretSubcommands {
+    fn workspace(&self) -> &PathBuf {
+        match self {
+            SecretSubcommands::List { workspace }
+            | SecretSubcommands::Set { workspace, .. }
+            | SecretSubcommands::Rm { workspace, .. } => workspace,
+        }
+    }
+}
+
 impl Commands {
     /// The workspace this invocation acts on. `mcp` is a child process addressed
     /// by socket and has none, so it logs to stderr only, which is also the only
@@ -122,6 +163,7 @@ impl Commands {
             | Commands::Status { workspace } => Some(workspace),
             Commands::History { sub } => Some(sub.workspace()),
             Commands::Memory { sub } => Some(sub.workspace()),
+            Commands::Secret { sub } => Some(sub.workspace()),
             Commands::Mcp { .. } => None,
         }
     }
@@ -420,6 +462,38 @@ async fn main() -> Result<()> {
                 println!("Active memory rolled back to generation {generation:08}");
             }
         },
+
+        Commands::Secret { sub } => {
+            let store = SecretStore::new(Config::new(sub.workspace().clone(), false).secrets_path());
+            match sub {
+                SecretSubcommands::List { .. } => {
+                    let names = store.names()?;
+                    if names.is_empty() {
+                        println!("No secrets are stored.");
+                    }
+                    for (name, set_at_ms) in names {
+                        println!("{name}  set {}", recurrence::local_time(set_at_ms));
+                    }
+                }
+
+                SecretSubcommands::Set { name, .. } => {
+                    // Stdin, so the value never reaches the shell history or the
+                    // argv every other account on this machine can read.
+                    let mut value = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut value)?;
+                    store.set(&name, value.trim(), chrono::Utc::now().timestamp_millis())?;
+                    println!("Stored {name}");
+                }
+
+                SecretSubcommands::Rm { name, .. } => {
+                    if store.remove(&name)? {
+                        println!("Removed {name}");
+                    } else {
+                        println!("No secret named {name}");
+                    }
+                }
+            }
+        }
 
         Commands::Daemon {
             workspace,

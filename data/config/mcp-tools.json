@@ -67,5 +67,17 @@
       },
       "required": ["schedule_id"]
     }
+  },
+  {
+    "name": "request_secret",
+    "description": "Ask {{OWNER}} for a credential a skill needs: an API key, client ID or token. Sends them a short message and claims their next message as the value, which Tera stores where skills read it. You never see the value, not now and not later. It is taken out of the message before it reaches you, so there is no point asking for it in plain conversation and no point reading it back to check. Always use this rather than asking in your own words: a credential typed into an ordinary message ends up in history, in the JSONL projection, and in every memory generation built from it. Check `.runtime/secrets.json` first, it may already be stored. The request expires in 15 minutes.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "description": "Env-var shaped name: A-Z, digits and underscore, starting with an uppercase letter, e.g. SPOTIFY_CLIENT_ID" },
+        "reason": { "type": "string", "description": "What it is for, as a short phrase completing 'I need NAME to ...'. Shown to {{OWNER}} verbatim, e.g. 'control your Spotify'." }
+      },
+      "required": ["name", "reason"]
+    }
   }
 ]

@@ -18,6 +18,10 @@ AUTHORIZE_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 API_URL = "https://api.spotify.com/v1"
 REDIRECT_URI = "http://127.0.0.1:8989/login"
+
+# The name this skill asks for, and the one tera stores it under. They have to
+# match exactly, so it is written once.
+CLIENT_ID_SECRET = "SPOTIFY_CLIENT_ID"
 SCOPES = (
     "user-read-playback-state",
     "user-modify-playback-state",
@@ -32,13 +36,41 @@ class SpotifyError(Exception):
         self.status = status
 
 
+def workspace_root():
+    # .../<workspace>/.agents/skills/spotify/scripts/spotify
+    return Path(__file__).resolve().parents[4]
+
+
 def runtime_root():
     configured = os.environ.get("TERA_SPOTIFY_ROOT")
     if configured:
         return Path(configured)
-    skill_dir = Path(__file__).resolve().parent.parent
-    workspace = skill_dir.parents[2]
-    return workspace / ".runtime" / "spotify"
+    return workspace_root() / ".runtime" / "spotify"
+
+
+def secrets_file():
+    """Where tera keeps credentials the owner sent through chat.
+
+    Read directly rather than through the tera binary: a skill script should work
+    from a shell with nothing else on the PATH. The file is written by the daemon,
+    so this only ever reads it.
+    """
+    configured = os.environ.get("TERA_SECRETS_FILE")
+    if configured:
+        return Path(configured)
+    return workspace_root() / ".runtime" / "secrets.json"
+
+
+def stored_secret(name):
+    try:
+        with secrets_file().open(encoding="utf-8") as handle:
+            entry = (json.load(handle).get("secrets") or {}).get(name) or {}
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as error:
+        raise SpotifyError(f"Cannot read {secrets_file()}: {error}") from error
+    value = str(entry.get("value") or "").strip()
+    return value or None
 
 
 def state_path(name):
@@ -82,21 +114,28 @@ def write_json(name, value):
         raise SpotifyError(f"Cannot write {path}: {error}") from error
 
 
-def configured_client_id(explicit=None):
+def configured_client_id():
+    """The owner's Spotify app, from the secret store.
+
+    Taking no argument is the point. The client ID reaches this machine through
+    tera's secret store, which the model running this script cannot read, so
+    there is no caller who could pass it in and no command line for it to leak
+    into. `SPOTIFY_CLIENT_ID` in the environment stays supported for running the
+    script by hand outside a workspace.
+    """
+
     def valid(value):
         value = str(value or "").strip()
         return value if value and not any(character.isspace() for character in value) else None
 
-    if explicit is not None:
-        client_id = valid(explicit)
-        if not client_id:
-            raise SpotifyError("Spotify client ID must be one non-empty value.")
-        return client_id
+    for candidate in (os.environ.get("SPOTIFY_CLIENT_ID"), stored_secret(CLIENT_ID_SECRET)):
+        client_id = valid(candidate)
+        if client_id:
+            return client_id
 
-    environment = valid(os.environ.get("SPOTIFY_CLIENT_ID"))
-    if environment:
-        return environment
-
+    # Logins from before the secret store carry their own copy. Refreshing has to
+    # use the id the token was issued to, so an existing login keeps working
+    # rather than being invalidated by an upgrade.
     for name in ("token.json", "pending.json"):
         state = read_json(name, required=False) or {}
         client_id = valid(state.get("client_id"))
@@ -104,8 +143,11 @@ def configured_client_id(explicit=None):
             return client_id
 
     raise SpotifyError(
-        "Spotify client ID is missing. Create a Spotify developer app, register "
-        f"{REDIRECT_URI}, then run: scripts/spotify auth start CLIENT_ID"
+        f"No {CLIENT_ID_SECRET} is stored. Ask the owner for it with the request_secret "
+        f"tool, under exactly that name. Tell them to create a Spotify app at "
+        f"developer.spotify.com/dashboard, add exactly {REDIRECT_URI} as a redirect URI, "
+        f"tick the Web API, and send the Client ID. Not the client secret: this skill "
+        f"never needs one."
     )
 
 
@@ -114,8 +156,8 @@ def pkce_challenge(verifier):
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
 
-def start_auth(client_id=None):
-    client_id = configured_client_id(client_id)
+def start_auth():
+    client_id = configured_client_id()
     verifier = secrets.token_urlsafe(64)
     state = secrets.token_urlsafe(24)
     write_json(
@@ -420,8 +462,11 @@ def open_track(value):
 def auth_status():
     token = read_json("token.json", required=False)
     pending = read_json("pending.json", required=False)
-    client_id = os.environ.get("SPOTIFY_CLIENT_ID") or (token or {}).get("client_id")
-    client_id = client_id or (pending or {}).get("client_id")
+    try:
+        configured_client_id()
+        client_id = True
+    except SpotifyError:
+        client_id = False
     print(f"client-id: {'configured' if client_id else 'missing'}")
     print(f"authorization: {'complete' if token else 'missing'}")
     print(f"pending-login: {'yes' if pending else 'no'}")
@@ -433,8 +478,7 @@ def parser():
 
     auth = commands.add_parser("auth")
     auth_commands = auth.add_subparsers(dest="auth_command", required=True)
-    auth_start = auth_commands.add_parser("start")
-    auth_start.add_argument("client_id", nargs="?")
+    auth_commands.add_parser("start")
     auth_finish = auth_commands.add_parser("finish")
     auth_finish.add_argument("redirect_url", nargs="?")
     auth_commands.add_parser("status")
@@ -459,7 +503,7 @@ def main():
     args = parser().parse_args()
     if args.command == "auth":
         if args.auth_command == "start":
-            start_auth(args.client_id)
+            start_auth()
         elif args.auth_command == "finish":
             callback_url = args.redirect_url
             if not callback_url:

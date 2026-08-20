@@ -7,6 +7,11 @@ use tera::runtime::RuntimeDb;
 use tera::codex::tier;
 use tera::scheduler::db::SchedulerDb;
 use tera::scheduler::recurrence::ScheduleTiming;
+use tera::secrets::SecretStore;
+use tera::codex::CodexSupervisor;
+use tera::conversation::{ConversationSession, TurnEngine};
+use tera::runtime::ActivityTracker;
+use tera::transport::InboundMessage;
 use tera::workspace::init::WorkspaceInit;
 use chrono::Utc;
 use rusqlite::Connection;
@@ -297,4 +302,65 @@ async fn test_invalid_generation_is_refused() {
         before
     );
     assert!(config.memories_link().join("INDEX.md").is_file());
+}
+
+/// A credential typed into the chat must never reach canonical history.
+///
+/// This is the whole point of `tera::secrets`, and it holds only because the
+/// capture happens before the insert. That ordering is one line in
+/// `TurnEngine::handle_inbound_message` and nothing about moving it would look
+/// wrong in review, so the guarantee is pinned here rather than described in a
+/// comment. History is the strictest place to check: everything else the model
+/// ever sees, the JSONL projection, a resumed thread, a rebuilt memory
+/// generation, is derived from it.
+#[tokio::test]
+async fn test_a_secret_sent_through_chat_never_lands_in_history() {
+    const VALUE: &str = "65b708073fc0480ea92a077233ca87bd";
+
+    let temp_dir = TempDir::new().unwrap();
+    let config = Config::new(temp_dir.path().to_path_buf(), true);
+    WorkspaceInit::init(&config).unwrap();
+
+    let history_db = HistoryDb::open_for(&config).unwrap();
+    let runtime_db = RuntimeDb::open(&config.runtime_db_path()).unwrap();
+    let transport = std::sync::Arc::new(tera::transport::MockTransport::new());
+    let engine = TurnEngine::new(
+        config.clone(),
+        history_db.clone(),
+        runtime_db.clone(),
+        transport.clone(),
+        ConversationSession::new(),
+        CodexSupervisor::new(config.clone(), runtime_db, history_db.clone()),
+        ActivityTracker::new(),
+    );
+
+    engine
+        .handle_inbound_message(InboundMessage {
+            provider_msg_id: "wa_1".to_string(),
+            sender: "owner@s.whatsapp.net".to_string(),
+            text: Some(format!("/secret SPOTIFY_CLIENT_ID {VALUE}")),
+            timestamp_ms: Utc::now().timestamp_millis(),
+            reply_to_provider_msg_id: None,
+            media_attachment: None,
+            chat_jid: "owner@s.whatsapp.net".to_string(),
+            // No explicit owner is configured here, so the policy accepts the
+            // paired account and nobody else.
+            from_own_account: true,
+            is_group: false,
+        })
+        .await
+        .unwrap();
+
+    let events = history_db.list_events_all().unwrap();
+    assert_eq!(events.len(), 1, "the message should still be recorded");
+    let recorded = events[0].text.as_deref().unwrap();
+    assert!(!recorded.contains(VALUE), "history holds the secret: {recorded}");
+    assert!(
+        recorded.contains("SPOTIFY_CLIENT_ID"),
+        "the agent still has to learn which credential arrived: {recorded}"
+    );
+
+    // And the value went somewhere a skill can actually read it.
+    let store = SecretStore::new(config.secrets_path());
+    assert_eq!(store.get("SPOTIFY_CLIENT_ID").unwrap().as_deref(), Some(VALUE));
 }

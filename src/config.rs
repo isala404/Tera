@@ -101,6 +101,16 @@ impl Config {
         self.workspace_dir.join(".agents").join("skills")
     }
 
+    /// Credentials the owner sent through chat, for skills to read.
+    ///
+    /// Under `.runtime/` rather than beside the skill that wants it: a release
+    /// updates the files of a built-in skill it still owns, and `WorkspaceInit`
+    /// treats any edit inside one as the user adopting it, which would freeze
+    /// that skill at its current version. See [`crate::secrets`].
+    pub fn secrets_path(&self) -> PathBuf {
+        self.runtime_dir().join("secrets.json")
+    }
+
     /// Machine-owned state for built-in skills. It records deliberate deletion
     /// and the last embedded file set, so a release can update an untouched
     /// installed skill without resurrecting one the user removed.
@@ -230,6 +240,7 @@ mod tests {
             cfg.builtin_skills_state_path(),
             root.join(".runtime/builtin-skills.json")
         );
+        assert_eq!(cfg.secrets_path(), root.join(".runtime/secrets.json"));
         assert_eq!(cfg.memories_link(), root.join("MEMORIES"));
         assert_eq!(cfg.system_notes_path(), root.join("SYSTEM.md"));
         assert_eq!(cfg.generations_dir(), root.join(".memory/generations"));

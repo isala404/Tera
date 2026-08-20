@@ -23,12 +23,20 @@ LOADER.exec_module(SPOTIFY)
 class SpotifySkillTest(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
+        self.secrets = Path(self.tempdir.name) / "secrets.json"
         self.environment = mock.patch.dict(
             os.environ,
-            {"SPOTIFY_CLIENT_ID": "", "TERA_SPOTIFY_ROOT": self.tempdir.name},
+            {
+                "SPOTIFY_CLIENT_ID": "",
+                "TERA_SPOTIFY_ROOT": self.tempdir.name,
+                "TERA_SECRETS_FILE": str(self.secrets),
+            },
             clear=False,
         )
         self.environment.start()
+
+    def write_secret(self, name, value):
+        self.secrets.write_text(json.dumps({"secrets": {name: {"value": value, "set_at_ms": 0}}}))
 
     def tearDown(self):
         self.environment.stop()
@@ -49,9 +57,10 @@ class SpotifySkillTest(unittest.TestCase):
         SPOTIFY.write_json("pending.json", pending)
 
     def test_auth_start_generates_pkce_url_and_private_state(self):
+        self.write_secret("SPOTIFY_CLIENT_ID", "client-id")
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            SPOTIFY.start_auth("client-id")
+            SPOTIFY.start_auth()
 
         parsed = urlparse(output.getvalue().strip())
         query = parse_qs(parsed.query)
@@ -74,6 +83,35 @@ class SpotifySkillTest(unittest.TestCase):
         self.assertEqual(root_mode, 0o700)
         self.assertEqual(pending_mode, 0o600)
         self.assertFalse((Path(self.tempdir.name) / "config.json").exists())
+
+    def test_client_id_comes_from_the_secret_store(self):
+        self.write_secret("SPOTIFY_CLIENT_ID", "from-the-store")
+        self.assertEqual(SPOTIFY.configured_client_id(), "from-the-store")
+
+    def test_missing_client_id_names_the_secret_and_the_tool(self):
+        with self.assertRaises(SPOTIFY.SpotifyError) as raised:
+            SPOTIFY.configured_client_id()
+        message = str(raised.exception)
+        self.assertIn("SPOTIFY_CLIENT_ID", message)
+        self.assertIn("request_secret", message)
+
+    def test_an_existing_login_keeps_its_own_client_id(self):
+        """A login made before the secret store must survive an upgrade.
+
+        Refreshing has to present the id the token was issued to, so falling back
+        to what the token carries is what keeps a working setup working.
+        """
+        SPOTIFY.write_json("token.json", {"client_id": "older-login", "refresh_token": "r"})
+        self.assertEqual(SPOTIFY.configured_client_id(), "older-login")
+
+    def test_environment_overrides_the_secret_store(self):
+        self.write_secret("SPOTIFY_CLIENT_ID", "from-the-store")
+        with mock.patch.dict(os.environ, {"SPOTIFY_CLIENT_ID": "from-the-environment"}):
+            self.assertEqual(SPOTIFY.configured_client_id(), "from-the-environment")
+
+    def test_a_missing_secrets_file_is_not_an_error(self):
+        """Most workspaces have no secrets at all. That is not a failure."""
+        self.assertIsNone(SPOTIFY.stored_secret("SPOTIFY_CLIENT_ID"))
 
     def test_auth_finish_validates_redirect_and_saves_tokens(self):
         self.write_pending()

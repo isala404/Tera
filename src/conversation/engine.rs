@@ -9,6 +9,7 @@ use crate::history::assets::AssetStorage;
 use crate::conversation::record_assistant_message;
 use crate::history::db::{Attachment, ConversationEvent, HistoryDb, ProviderRef};
 use crate::runtime::{ActivityTracker, RuntimeDb};
+use crate::secrets::{Capture, SecretStore};
 use crate::transport::{InboundMessage, OwnerPolicy, Transport, Verdict};
 use anyhow::Result;
 use std::collections::HashMap;
@@ -61,6 +62,7 @@ pub struct TurnEngine {
     owner_policy: OwnerPolicy,
     session: ConversationSession,
     activity: ActivityTracker,
+    secrets: SecretStore,
 }
 
 impl TurnEngine {
@@ -75,6 +77,7 @@ impl TurnEngine {
     ) -> Self {
         Self {
             owner_policy: OwnerPolicy::new(config.whatsapp_owner_number.clone()),
+            secrets: SecretStore::new(config.secrets_path()),
             config,
             history_db,
             runtime_db,
@@ -99,6 +102,12 @@ impl TurnEngine {
             );
             return Ok(());
         }
+
+        // Before the message is recorded, executed or even looked at: if it
+        // carried a credential, take the value out and leave a note in its place.
+        // Everything downstream, history, the JSONL projection, the thread and
+        // every memory generation built from it, stores whatever survives here.
+        let msg = self.capture_secret(msg);
 
         let sender = msg.sender.clone();
         let event_id = format!("msg_{}", Uuid::new_v4().simple());
@@ -172,6 +181,71 @@ impl TurnEngine {
         }
 
         Ok(())
+    }
+
+    /// Swap a credential out of an inbound message for a note about it.
+    ///
+    /// The owner has one channel to this daemon and it feeds a model, so a key
+    /// typed into the chat would otherwise be permanent context. Substitution
+    /// rather than a second code path: the message still routes, still starts a
+    /// turn, still steers a running one. Only its text is different, so the agent
+    /// learns the credential arrived and can carry on with whatever needed it.
+    ///
+    /// See [`crate::secrets`] for what this does and does not protect against.
+    fn capture_secret(&self, mut msg: InboundMessage) -> InboundMessage {
+        let Some(text) = msg.text.as_deref() else {
+            return msg;
+        };
+
+        let outcome = match self.secrets.capture(text, msg.timestamp_ms) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // The store is unreadable, so whether a request was armed is
+                // unknown. An explicit command is the one case where the message
+                // is known to hold a credential, so that must not fall through;
+                // swallowing every other message over a bad file would turn a
+                // broken extra into a broken daemon.
+                error!("Cannot reach the secret store: {error:?}");
+                if text.trim_start().starts_with("/secret") {
+                    Capture::Rejected {
+                        reason: format!("the secret store could not be read: {error}"),
+                    }
+                } else {
+                    Capture::Passthrough
+                }
+            }
+        };
+
+        let note = match outcome {
+            Capture::Passthrough => return msg,
+            Capture::Stored { name } => {
+                info!("Captured secret {name} from an inbound message");
+                format!(
+                    "[Tera took this message before you saw it, because it carried a credential. \
+                     {name} is stored now, and skills read it from the secret store. You cannot see \
+                     the value and asking for it will not work. Tell {owner} it is saved, ask them \
+                     to delete the message they just sent from this chat, and carry on with \
+                     whatever needed it.]",
+                    owner = self.config.owner_name
+                )
+            }
+            Capture::Rejected { reason } => {
+                warn!("Discarded a secret-bearing message: {reason}");
+                format!(
+                    "[Tera took this message before you saw it, because it looked like a \
+                     credential. It could not be stored: {reason}. The text was discarded either \
+                     way. Tell {owner} what went wrong and ask them to send it again.]",
+                    owner = self.config.owner_name
+                )
+            }
+        };
+
+        msg.text = Some(note);
+        // A message carrying a credential has no business also carrying a file
+        // into history, and a screenshot of a dashboard is exactly what would
+        // arrive here.
+        msg.media_attachment = None;
+        msg
     }
 
     /// Translate a WhatsApp reply target into our own event id.

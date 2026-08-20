@@ -5,6 +5,7 @@ use crate::history::db::{ConversationEvent, HistoryDb, ProviderRef};
 use crate::runtime::RuntimeDb;
 use crate::scheduler::db::SchedulerDb;
 use crate::scheduler::recurrence::{self as recurrence, ScheduleTiming};
+use crate::secrets::SecretStore;
 use crate::transport::{ReactionTarget, Transport};
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
@@ -47,6 +48,7 @@ pub struct DaemonRpcServer {
     runtime_db: RuntimeDb,
     transport: Arc<dyn Transport>,
     session: ConversationSession,
+    secrets: SecretStore,
 }
 
 impl DaemonRpcServer {
@@ -58,6 +60,7 @@ impl DaemonRpcServer {
         session: ConversationSession,
     ) -> Self {
         Self {
+            secrets: SecretStore::new(config.secrets_path()),
             config,
             history_db,
             runtime_db,
@@ -190,8 +193,16 @@ impl DaemonRpcServer {
         match name {
             "send_message" => {
                 let recipient = self.recipient()?;
-                let text = args["text"].as_str();
                 let attachment = attachment_argument(args)?;
+
+                // The agent is never shown a stored credential, but it does have
+                // a shell and could have read the file itself. Rewrite any value
+                // it is about to send back to the owner, who would then have it
+                // in the chat, which is where it must never be.
+                let text = args["text"]
+                    .as_str()
+                    .map(|raw| self.secrets.redact(raw));
+                let text = text.as_deref();
 
                 if text.is_none() && attachment.is_none() {
                     return Err(anyhow!("send_message requires at least one of text, image_path, video_path, audio_path, or file_path"));
@@ -364,6 +375,38 @@ impl DaemonRpcServer {
                     .ok_or_else(|| anyhow!("Missing schedule_id"))?;
                 let success = SchedulerDb::cancel_schedule(&self.runtime_db, id)?;
                 Ok(json!({ "cancelled": success, "schedule_id": id }))
+            }
+
+            "request_secret" => {
+                let name = args["name"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("Missing secret name"))?;
+                let reason = args["reason"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("Missing reason"))?;
+                let recipient = self.recipient()?;
+
+                self.secrets
+                    .request(name, reason, Utc::now().timestamp_millis())?;
+
+                // The tool asks rather than returning instructions for the agent
+                // to relay. The wording has to be exact, the owner's reply must be
+                // the value and nothing else, and a paraphrase that invites "sure,
+                // here you go: ..." stores the whole sentence as the credential.
+                let ask = format!(
+                    "I need {name} to {reason}. Send it as your next message, on its own with \
+                     nothing else. I won't see it, it goes straight into the secret store. Then \
+                     delete your message from this chat."
+                );
+                self.transport.send_text(&recipient, &ask, None).await?;
+                self.session.record_send();
+
+                Ok(json!({
+                    "status": "requested",
+                    "name": name,
+                    "note": "The owner's next message becomes this value and you will not see it. \
+                             You will get a note saying it arrived. The request expires in 15 minutes."
+                }))
             }
 
             // Reading history is deliberately NOT a tool. The agent has a shell,
