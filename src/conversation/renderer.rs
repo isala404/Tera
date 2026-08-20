@@ -40,7 +40,10 @@ impl InputRenderer {
                 other => other,
             };
 
-            rendered.push_str(&format!("[{}] {}", t_str, speaker));
+            // The id is the handle for `react` and for send_message's reply_to.
+            // Without it in the transcript the agent can see that something was
+            // replied to but has no way to name anything itself.
+            rendered.push_str(&format!("[{}] {} {}", t_str, speaker, event.id));
 
             if let Some(ref reply_to) = event.reply_to_id {
                 rendered.push_str(&format!(" (replying to {})", reply_to));
@@ -87,7 +90,7 @@ mod tests {
         };
 
         let rendered = InputRenderer::render_burst(&[ev]);
-        assert!(rendered.contains("User:"));
+        assert!(rendered.contains("User m_test:"), "{rendered}");
         assert!(rendered.contains("Test query"));
     }
 

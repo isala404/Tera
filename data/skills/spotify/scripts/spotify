@@ -172,7 +172,6 @@ def start_auth():
     )
     query = urlencode(
         {
-            "client_id": client_id,
             "code_challenge": pkce_challenge(verifier),
             "code_challenge_method": "S256",
             "redirect_uri": REDIRECT_URI,
@@ -181,7 +180,11 @@ def start_auth():
             "state": state,
         }
     )
-    print(f"{AUTHORIZE_URL}?{query}")
+    # The client id is printed as a placeholder, not a value. Whoever reads this
+    # is about to paste the URL into a message, and send_message fills it in on
+    # the way out. Printing the real id would put it in the agent's context, and
+    # then redaction would rewrite it back out and hand the owner a broken link.
+    print(f"{AUTHORIZE_URL}?client_id=${{SPOTIFY_CLIENT_ID}}&{query}")
 
 
 def callback_values(callback_url, pending):

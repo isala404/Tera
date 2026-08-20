@@ -195,27 +195,56 @@ impl DaemonRpcServer {
                 let recipient = self.recipient()?;
                 let attachment = attachment_argument(args)?;
 
-                // The agent is never shown a stored credential, but it does have
-                // a shell and could have read the file itself. Rewrite any value
-                // it is about to send back to the owner, who would then have it
-                // in the chat, which is where it must never be.
-                let text = args["text"]
-                    .as_str()
-                    .map(|raw| self.secrets.redact(raw));
-                let text = text.as_deref();
+                // Two versions of the same message. `authored` is what the agent
+                // wrote, with any credential it pasted rewritten out, and it is
+                // what history keeps. `outgoing` has `${NAME}` filled in and goes
+                // only to the wire, so an authorize URL reaches the owner working
+                // while the value in it stays out of the transcript.
+                //
+                // Redact first, expand second. The other order would rewrite the
+                // value straight back out of the message it just put there.
+                let authored = args["text"].as_str().map(|raw| self.secrets.redact(raw));
+                let outgoing = authored.as_deref().map(|text| self.secrets.expand(text));
 
-                if text.is_none() && attachment.is_none() {
+                if authored.is_none() && attachment.is_none() {
                     return Err(anyhow!("send_message requires at least one of text, image_path, video_path, audio_path, or file_path"));
                 }
+
+                // Replying needs the provider's own id for the target, which is
+                // what the provider ref table exists to translate back to.
+                let reply_to = args["reply_to"].as_str();
+                let reply_to_provider_id = match reply_to {
+                    Some(event_id) => Some(
+                        self.history_db
+                            .lookup_provider_ref_by_event_id(event_id, "whatsapp")?
+                            .ok_or_else(|| {
+                                anyhow!("no WhatsApp message is recorded for event {event_id}; cannot reply to it")
+                            })?
+                            .provider_msg_id,
+                    ),
+                    None => None,
+                };
+                let reply_to_provider_id = reply_to_provider_id.as_deref();
 
                 let provider_msg_id = if let Some((media_type, media_path_str)) = attachment {
                     let path = resolve_media_path(&self.config.workspace_dir, media_path_str)?;
                     self.transport
-                        .send_media(&recipient, media_type, &path, text, None)
+                        .send_media(
+                            &recipient,
+                            media_type,
+                            &path,
+                            outgoing.as_deref(),
+                            reply_to_provider_id,
+                        )
                         .await?
                 } else {
-                    let text_str = text.unwrap_or_default();
-                    self.transport.send_text(&recipient, text_str, None).await?
+                    self.transport
+                        .send_text(
+                            &recipient,
+                            outgoing.as_deref().unwrap_or_default(),
+                            reply_to_provider_id,
+                        )
+                        .await?
                 };
 
                 // Save assistant event to history
@@ -225,8 +254,8 @@ impl DaemonRpcServer {
                     occurred_at_ms: Utc::now().timestamp_millis(),
                     kind: "message".to_string(),
                     actor: "assistant".to_string(),
-                    text: text.map(|s| s.to_string()),
-                    reply_to_id: None,
+                    text: authored,
+                    reply_to_id: reply_to.map(|id| id.to_string()),
                     turn_id: self.session.turn(),
                     reaction_target_id: None,
                     reaction_emoji: None,
@@ -458,6 +487,7 @@ fn resolve_media_path(workspace: &Path, raw: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::MockTransport;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -493,5 +523,124 @@ mod tests {
         let dir = tempdir().unwrap();
         let error = resolve_media_path(dir.path(), ".").unwrap_err();
         assert!(error.to_string().contains("media file not found"));
+    }
+
+    /// A `DaemonRpcServer` wired to a mock transport, with a chat already open
+    /// so `send_message` has somewhere to send.
+    fn test_server(dir: &Path) -> (Arc<MockTransport>, DaemonRpcServer) {
+        let config = Config::new(dir.to_path_buf(), true);
+        for path in [config.history_db_path(), config.runtime_db_path(), config.secrets_path()] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        let history_db = HistoryDb::open_for(&config).unwrap();
+        let runtime_db = RuntimeDb::open(&config.runtime_db_path()).unwrap();
+        let transport = Arc::new(MockTransport::new());
+        let session = ConversationSession::new();
+        session.set_chat("owner@s.whatsapp.net");
+
+        let server = DaemonRpcServer::new(config, history_db, runtime_db, transport.clone(), session);
+        (transport, server)
+    }
+
+    /// The whole point of `${NAME}`: the owner gets a link that works, and the
+    /// transcript the model reads back keeps only the placeholder.
+    #[tokio::test]
+    async fn a_secret_placeholder_is_filled_in_on_the_wire_but_not_in_history() {
+        let dir = tempdir().unwrap();
+        let (transport, server) = test_server(dir.path());
+        server.secrets.set("SPOTIFY_CLIENT_ID", "abc123def456", 0).unwrap();
+
+        server
+            .execute_tool(
+                "send_message",
+                &json!({"text": "Log in: https://accounts.spotify.com/authorize?client_id=${SPOTIFY_CLIENT_ID}&state=x"}),
+            )
+            .await
+            .unwrap();
+
+        let sent = transport.sent_messages.lock().unwrap();
+        assert!(sent[0].1.contains("client_id=abc123def456"), "{}", sent[0].1);
+
+        let events = server.history_db.list_events_all().unwrap();
+        let recorded = events[0].text.clone().unwrap();
+        assert!(recorded.contains("client_id=${SPOTIFY_CLIENT_ID}"), "{recorded}");
+        assert!(!recorded.contains("abc123def456"), "history kept the value: {recorded}");
+    }
+
+    /// A value the agent pasted itself still gets rewritten out on both paths.
+    #[tokio::test]
+    async fn a_pasted_secret_never_reaches_the_wire() {
+        let dir = tempdir().unwrap();
+        let (transport, server) = test_server(dir.path());
+        server.secrets.set("SPOTIFY_CLIENT_ID", "abc123def456", 0).unwrap();
+
+        server
+            .execute_tool("send_message", &json!({"text": "your id is abc123def456"}))
+            .await
+            .unwrap();
+
+        let sent = transport.sent_messages.lock().unwrap();
+        assert_eq!(sent[0].1, "your id is [redacted SPOTIFY_CLIENT_ID]");
+    }
+
+    #[tokio::test]
+    async fn reply_to_is_translated_into_the_provider_id() {
+        let dir = tempdir().unwrap();
+        let (transport, server) = test_server(dir.path());
+
+        let incoming = server
+            .history_db
+            .insert_event(ConversationEvent {
+                seq: None,
+                id: String::new(),
+                occurred_at_ms: 0,
+                kind: "message".to_string(),
+                actor: "user".to_string(),
+                text: Some("which one?".to_string()),
+                reply_to_id: None,
+                turn_id: None,
+                reaction_target_id: None,
+                reaction_emoji: None,
+                attachments: vec![],
+            })
+            .unwrap();
+        server
+            .history_db
+            .record_provider_ref(&ProviderRef::whatsapp(
+                &incoming.id,
+                "wamid.incoming",
+                "owner@s.whatsapp.net",
+                false,
+            ))
+            .unwrap();
+
+        server
+            .execute_tool("send_message", &json!({"text": "that one", "reply_to": incoming.id}))
+            .await
+            .unwrap();
+
+        let sent = transport.sent_messages.lock().unwrap();
+        assert_eq!(sent[0].2.as_deref(), Some("wamid.incoming"));
+
+        let reply = server
+            .history_db
+            .list_events_all()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.actor == "assistant")
+            .unwrap();
+        assert_eq!(reply.reply_to_id, Some(incoming.id));
+    }
+
+    #[tokio::test]
+    async fn replying_to_an_unknown_message_is_an_error() {
+        let dir = tempdir().unwrap();
+        let (_transport, server) = test_server(dir.path());
+
+        let error = server
+            .execute_tool("send_message", &json!({"text": "hi", "reply_to": "m_nope"}))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot reply to it"), "{error}");
     }
 }

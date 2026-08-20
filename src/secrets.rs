@@ -274,6 +274,40 @@ impl SecretStore {
         Ok(outcome)
     }
 
+    /// Fill `${NAME}` references in `text` with the values they name.
+    ///
+    /// The mirror of [`SecretStore::redact`], and the reason that one can stay
+    /// strict. Some credentials are meant to be sent: an OAuth authorize URL is
+    /// useless to the owner without the client id in it, and redaction rewriting
+    /// that id turned a link they were supposed to click into a broken one.
+    ///
+    /// So the agent writes the placeholder and never the value. Expansion happens
+    /// on the way to the transport, after the message has been recorded, which
+    /// keeps the value out of the model's context and out of history while the
+    /// owner still receives something that works.
+    ///
+    /// Shell syntax rather than `{{NAME}}`, which the install-time template
+    /// system already owns, and which reads right for names that are env-var
+    /// shaped anyway. An unknown name is left alone: ordinary prose containing
+    /// braces is not this feature's business to rewrite.
+    pub fn expand(&self, text: &str) -> String {
+        if !text.contains("${") {
+            return text.to_string();
+        }
+        let Ok(contents) = self.load() else {
+            return text.to_string();
+        };
+
+        let mut expanded = text.to_string();
+        for (name, secret) in contents.secrets {
+            let placeholder = format!("${{{name}}}");
+            if expanded.contains(&placeholder) {
+                expanded = expanded.replace(&placeholder, &secret.value);
+            }
+        }
+        expanded
+    }
+
     /// Replace every stored value in `text` with its name.
     ///
     /// The backstop, not the mechanism. Capture keeps secrets out of the model's
@@ -385,6 +419,39 @@ mod tests {
         store.set("SPOTIFY_CLIENT_ID", "abc123", 10).unwrap();
         assert_eq!(store.get("SPOTIFY_CLIENT_ID").unwrap().as_deref(), Some("abc123"));
         assert_eq!(store.names().unwrap(), vec![("SPOTIFY_CLIENT_ID".to_string(), 10)]);
+    }
+
+    #[test]
+    fn test_expand_fills_a_placeholder() {
+        let (_dir, store) = store();
+        store.set("SPOTIFY_CLIENT_ID", "abc123", 0).unwrap();
+        assert_eq!(
+            store.expand("https://accounts.spotify.com/authorize?client_id=${SPOTIFY_CLIENT_ID}&x=1"),
+            "https://accounts.spotify.com/authorize?client_id=abc123&x=1"
+        );
+    }
+
+    #[test]
+    fn test_expand_leaves_unknown_names_alone() {
+        let (_dir, store) = store();
+        store.set("KNOWN", "value1", 0).unwrap();
+        assert_eq!(store.expand("${UNKNOWN} and ${KNOWN}"), "${UNKNOWN} and value1");
+    }
+
+    /// The pair has to compose in one direction only. Redaction runs first on
+    /// what the agent wrote, expansion second on the way to the wire; doing it
+    /// the other way round would rewrite the value straight back out again.
+    #[test]
+    fn test_redact_then_expand_leaves_a_usable_link() {
+        let (_dir, store) = store();
+        store.set("SPOTIFY_CLIENT_ID", "abc123def456", 0).unwrap();
+        let authored = "Log in: https://spotify.com/auth?client_id=${SPOTIFY_CLIENT_ID}";
+        let recorded = store.redact(authored);
+        assert_eq!(recorded, authored, "a placeholder is not a value to redact");
+        assert_eq!(
+            store.expand(&recorded),
+            "Log in: https://spotify.com/auth?client_id=abc123def456"
+        );
     }
 
     /// The whole point of the file. A secret that lands world-readable has

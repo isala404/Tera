@@ -68,7 +68,10 @@ class SpotifySkillTest(unittest.TestCase):
 
         self.assertEqual(parsed.scheme, "https")
         self.assertEqual(parsed.netloc, "accounts.spotify.com")
-        self.assertEqual(query["client_id"], ["client-id"])
+        # The client id is printed as a placeholder, not a value. send_message
+        # fills it in on the way out, which keeps it out of the agent's context.
+        self.assertEqual(query["client_id"], ["${SPOTIFY_CLIENT_ID}"])
+        self.assertNotIn("client-id", output.getvalue())
         self.assertEqual(query["redirect_uri"], [SPOTIFY.REDIRECT_URI])
         self.assertEqual(query["state"], [pending["state"]])
         self.assertEqual(query["code_challenge_method"], ["S256"])
