@@ -20,27 +20,31 @@ const MAX_GENERATION_BYTES: u64 = 64 * 1024 * 1024;
 /// How many generations to keep for rollback.
 const GENERATIONS_TO_KEEP: usize = 14;
 
+/// Every generation directory, numbered, oldest first. A name that is not a
+/// number is not one of ours, so it is neither counted nor pruned.
+fn numbered_generations(config: &Config) -> Result<Vec<(u64, PathBuf)>> {
+    let dir = config.generations_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut found: Vec<(u64, PathBuf)> = fs::read_dir(&dir)?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let num = entry.file_name().to_str()?.parse::<u64>().ok()?;
+            Some((num, entry.path()))
+        })
+        .collect();
+    found.sort_by_key(|(num, _)| *num);
+    Ok(found)
+}
+
 pub struct GenerationManager;
 
 impl GenerationManager {
     pub fn get_current_generation_num(config: &Config) -> Result<u64> {
-        let generations_dir = config.generations_dir();
-        if !generations_dir.exists() {
-            return Ok(1);
-        }
-
-        let mut max_gen = 1u64;
-        for entry in fs::read_dir(&generations_dir)? {
-            let entry = entry?;
-            if let Some(name) = entry.file_name().to_str() {
-                if let Ok(num) = name.parse::<u64>() {
-                    if num > max_gen {
-                        max_gen = num;
-                    }
-                }
-            }
-        }
-        Ok(max_gen)
+        Ok(numbered_generations(config)?
+            .last()
+            .map_or(1, |(num, _)| *num))
     }
 
     /// The generation actually in use, read from the symlink.
@@ -197,31 +201,12 @@ impl GenerationManager {
     }
 
     pub fn prune_old_generations(config: &Config, keep_count: usize) -> Result<()> {
-        let generations_dir = config.generations_dir();
-        if !generations_dir.exists() {
-            return Ok(());
+        let generations = numbered_generations(config)?;
+        let excess = generations.len().saturating_sub(keep_count);
+        for (num, path) in generations.iter().take(excess) {
+            info!("Pruning old memory generation {num:08}");
+            let _ = fs::remove_dir_all(path);
         }
-
-        let mut nums = Vec::new();
-        for entry in fs::read_dir(&generations_dir)? {
-            let entry = entry?;
-            if let Some(name) = entry.file_name().to_str() {
-                if let Ok(num) = name.parse::<u64>() {
-                    nums.push((num, entry.path()));
-                }
-            }
-        }
-
-        nums.sort_by_key(|k| k.0);
-
-        if nums.len() > keep_count {
-            let remove_count = nums.len() - keep_count;
-            for (num, path) in nums.iter().take(remove_count) {
-                info!("Pruning old memory generation {:08}", num);
-                let _ = fs::remove_dir_all(path);
-            }
-        }
-
         Ok(())
     }
 }

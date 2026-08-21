@@ -209,6 +209,17 @@ impl SecretStore {
         Ok(())
     }
 
+    /// The one place a validation failure becomes a message for the owner, so
+    /// the two ways in cannot report the same rejection differently.
+    fn store(&self, name: String, value: &str, now_ms: i64) -> Capture {
+        match self.set(&name, value, now_ms) {
+            Ok(()) => Capture::Stored { name },
+            Err(error) => Capture::Rejected {
+                reason: error.to_string(),
+            },
+        }
+    }
+
     /// Decide what an inbound message is, and store the value if it is a secret.
     ///
     /// Two ways in, one path out. `/secret NAME value` is unambiguous and always
@@ -218,12 +229,7 @@ impl SecretStore {
     pub fn capture(&self, text: &str, now_ms: i64) -> Result<Capture> {
         if let Some(rest) = command_argument(text) {
             let outcome = match parse_command(rest) {
-                Ok((name, value)) => match self.set(&name, &value, now_ms) {
-                    Ok(()) => Capture::Stored { name },
-                    Err(error) => Capture::Rejected {
-                        reason: error.to_string(),
-                    },
-                },
+                Ok((name, value)) => self.store(name, &value, now_ms),
                 Err(reason) => Capture::Rejected { reason },
             };
             // Whatever happened, an explicit /secret ends any guided request:
@@ -242,14 +248,7 @@ impl SecretStore {
                 reason: format!("The message held no value for {}", request.name),
             }
         } else {
-            match self.set(&request.name, value, now_ms) {
-                Ok(()) => Capture::Stored {
-                    name: request.name.clone(),
-                },
-                Err(error) => Capture::Rejected {
-                    reason: error.to_string(),
-                },
-            }
+            self.store(request.name, value, now_ms)
         };
         self.clear_pending()?;
         Ok(outcome)
