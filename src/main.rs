@@ -590,14 +590,14 @@ async fn main() -> Result<()> {
 
             // Armed before anything else can fail, and removed only by a clean
             // exit further down. Whatever this returns is the previous life.
-            let crashed = runtime::phoenix::arm(&config.runtime_dir())?;
+            let crashed = runtime::crash_mark::arm(&config.runtime_dir())?;
             if let Some(mark) = &crashed {
                 warn!("Previous tera {} (started {})", mark.describe(), mark.started_at_ms);
             }
             let update_notice = match tera::update::startup_action(&config, crashed.is_some())? {
                 tera::update::StartupAction::Continue(notice) => notice.map(|notice| *notice),
                 tera::update::StartupAction::RestartAfterRollback => {
-                    runtime::phoenix::disarm(&config.runtime_dir());
+                    runtime::crash_mark::disarm(&config.runtime_dir());
                     return Err(anyhow::anyhow!(
                         "the failed update was rolled back; restarting the restored binary"
                     ));
@@ -804,7 +804,7 @@ async fn main() -> Result<()> {
             }
 
             // Last thing, so anything that stops us before here reads as a crash.
-            runtime::phoenix::disarm(&config.runtime_dir());
+            runtime::crash_mark::disarm(&config.runtime_dir());
             info!("tera stopped.");
         }
     }

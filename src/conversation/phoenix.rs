@@ -21,7 +21,7 @@ use crate::conversation::record_assistant_message;
 use crate::conversation::renderer::InputRenderer;
 use crate::data;
 use crate::history::db::HistoryDb;
-use crate::runtime::phoenix::CrashMark;
+use crate::runtime::crash_mark::CrashMark;
 use crate::runtime::{ActivityTracker, ConversationTurn, RuntimeDb};
 use crate::transport::Transport;
 use crate::update::UpdateNotice;

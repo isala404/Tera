@@ -60,7 +60,7 @@ Every subcommand takes `--workspace <path>`, default `/workspace`. Point it some
 
 Ask the assistant to update itself, or run `tera update --workspace ~/assistant-workspace`. The bundled update skill calls the native updater directly without MCP. Codex updates through its own `codex update` command. Tera downloads the release binary and checksum, verifies both the target and embedded version details, keeps the current executable as a rollback copy, and replaces it atomically.
 
-The daemon restarts only after the update command returns. A systemd service comes back through `Restart=always`. A daemon started by hand uses a small detached restarter. The update journal is committed only after Tera initializes the workspace and completes a real Codex app server handshake. If the replacement crashes before that point, the next Phoenix start restores the prior Tera and Codex executables and reports the rollback to the owner.
+The daemon exits only after the update command returns, so the turn that asked for the update still gets its reply. A systemd service comes back through `Restart=always`. A daemon started by hand stays down until you start it again. The update journal is committed only after Tera initializes the workspace and completes a real Codex app server handshake. If the replacement crashes before that point, the next Phoenix start restores the prior Tera and Codex executables and reports the rollback to the owner.
 
 Official release assets are `tera-x86_64-unknown-linux-gnu` and `tera-aarch64-apple-darwin`, each with a matching `.sha256` file. Builds made outside Git carry `unknown` as the commit SHA. Set `TERA_GIT_SHA` in the build environment when packaging from an exported source tree.
 
