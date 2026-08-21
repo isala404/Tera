@@ -36,21 +36,6 @@ pub struct InboundMedia {
     pub data: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InboundReaction {
-    pub provider_msg_id: String,
-    pub sender: String,
-    pub target_provider_msg_id: String,
-    pub emoji: String,
-    pub timestamp_ms: i64,
-}
-
-#[derive(Debug, Clone)]
-pub enum InboundEvent {
-    Message(InboundMessage),
-    Reaction(InboundReaction),
-}
-
 /// Everything needed to address a reaction at an existing message.
 ///
 /// A provider message id alone is not enough: WhatsApp keys a reaction by chat,

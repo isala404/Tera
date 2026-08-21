@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::runtime::{ActivityTracker, RuntimeDb, ScheduleItem, ScheduleRun};
 use crate::scheduler::db::SchedulerDb;
 use crate::scheduler::recurrence::RecurrenceEngine;
-use crate::workspace::templates::schedule_agents_template;
+use crate::workspace::templates;
 use anyhow::Result;
 use chrono::{Local, Utc};
 use std::collections::HashSet;
@@ -194,7 +194,7 @@ impl SchedulerRunner {
         // live in the task directory itself (PLAN.md section 62).
         fs::write(
             task_dir.join("AGENTS.md"),
-            schedule_agents_template(&self.config),
+            templates::render(crate::data::SCHEDULE_AGENTS, &self.config),
         )?;
 
         // 3. Claim the run durably before advancing the schedule. A task that

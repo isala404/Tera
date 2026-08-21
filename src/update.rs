@@ -10,8 +10,8 @@ use crate::version::{codex_version, BuildInfo};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -20,7 +20,6 @@ use tracing::{info, warn};
 
 const RELEASE_BASE_URL: &str = "https://github.com/isala404/Tera/releases/latest/download";
 const RESTART_DELAY: Duration = Duration::from_secs(15);
-const MANUAL_RESTART_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Component {
@@ -627,21 +626,9 @@ fn read_journal(config: &Config) -> Result<Option<UpdateJournal>> {
 }
 
 fn write_journal(config: &Config, journal: &UpdateJournal) -> Result<()> {
-    let path = journal_path(config);
-    let parent = path.parent().expect("journal path has a parent");
-    fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!(".update-{}.tmp", std::process::id()));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(&temporary)?;
-    serde_json::to_writer_pretty(&mut file, journal)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    fs::rename(&temporary, &path)?;
-    sync_parent(&path);
-    Ok(())
+    let mut serialized = serde_json::to_vec_pretty(journal)?;
+    serialized.push(b'\n');
+    crate::runtime::write_atomic(&journal_path(config), &serialized, 0o600)
 }
 
 fn copy_atomic(source: &Path, destination: &Path) -> Result<()> {
@@ -733,59 +720,6 @@ pub fn signal_update(lock_path: &Path, pid: u32) -> Result<()> {
         return Err(std::io::Error::last_os_error()).context("could not signal the daemon");
     }
     Ok(())
-}
-
-/// A manually launched daemon has no service manager to bring it back. Systemd
-/// already has Restart=always and must remain the only supervisor in that case.
-pub fn spawn_manual_restart(config: &Config, old_pid: u32) -> Result<()> {
-    if std::env::var_os("INVOCATION_ID").is_some() {
-        return Ok(());
-    }
-    Command::new(current_executable()?)
-        .arg("__restart-daemon")
-        .arg("--workspace")
-        .arg(&config.workspace_dir)
-        .arg("--old-pid")
-        .arg(old_pid.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("could not start the manual daemon restarter")?;
-    Ok(())
-}
-
-pub fn restart_daemon(workspace: PathBuf, old_pid: u32) -> Result<()> {
-    for _ in 0..300 {
-        if unsafe { libc::kill(old_pid as libc::pid_t, 0) } != 0 {
-            break;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-
-    let binary = current_executable()?;
-    let config = Config::new(workspace.clone(), false);
-    for _ in 0..MANUAL_RESTART_ATTEMPTS {
-        let mut child = Command::new(&binary)
-            .arg("daemon")
-            .arg("--workspace")
-            .arg(&workspace)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-
-        for _ in 0..600 {
-            if !journal_path(&config).exists() {
-                return Ok(());
-            }
-            if child.try_wait()?.is_some() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-    }
-    bail!("the daemon did not become healthy after the update")
 }
 
 #[cfg(test)]

@@ -10,8 +10,7 @@ use crate::codex::models::{ModelDescriptor, ModelDiscovery};
 use crate::codex::CodexSupervisor;
 use crate::config::Config;
 use crate::history::db::HistoryDb;
-use crate::memory::optimizer::{MemoryOptimizer, OptimizerOutcome, RETRY_PENDING_KEY};
-use crate::memory::rebuild::{MemoryRebuilder, REBUILD_PENDING_KEY};
+use crate::memory::pass::{Outcome, Pass, NIGHTLY, REBUILD};
 use crate::runtime::{ActivityTracker, RuntimeDb};
 use anyhow::Result;
 use chrono::{Local, Timelike};
@@ -94,54 +93,49 @@ impl MaintenanceRunner {
 
     async fn tick(&self) -> Result<()> {
         // Nothing runs while the assistant is doing real work. Not "wait for a
-        // gap and hope", the optimizer itself also aborts if work arrives after
-        // it starts.
+        // gap and hope", the pass itself also aborts if work arrives after it
+        // starts.
         if !self.activity.is_idle() {
             return Ok(());
         }
 
-        if self.flag_is_set(REBUILD_PENDING_KEY)? {
+        let pass: &Pass = if self.flag_is_set(REBUILD.pending_key)? {
             info!("Memory rebuild is pending; running it now that the system is idle");
-            match MemoryRebuilder::run(
+            &REBUILD
+        } else if self.optimizer_is_due()? {
+            &NIGHTLY
+        } else {
+            return Ok(());
+        };
+
+        let outcome = pass
+            .run(
                 &self.config,
                 &self.history_db,
                 &self.runtime_db,
                 &self.codex,
+                Some(&self.activity),
             )
-            .await
-            {
-                Ok(generation) => info!("Rebuild promoted generation {generation}"),
-                // Leave the flag set: a failed rebuild should be retried, and
-                // active memory is untouched either way.
-                Err(e) => error!("Memory rebuild failed; active memory unchanged: {e:?}"),
-            }
-            return Ok(());
-        }
+            .await?;
 
-        if !self.optimizer_is_due()? {
-            return Ok(());
-        }
-
-        match MemoryOptimizer::run(
-            &self.config,
-            &self.runtime_db,
-            &self.codex,
-            &self.activity,
-        )
-        .await?
-        {
-            OptimizerOutcome::Promoted(generation) => {
-                self.runtime_db
-                    .set_state_value(LAST_OPTIMIZED_KEY, &today())?;
-                info!("Nightly compaction promoted generation {generation}");
+        match outcome {
+            // A rebuild counts as the day's compaction too. It re-derives the
+            // whole tree from history, which is strictly more than the nightly
+            // pass does, so running one straight after would be busywork.
+            Outcome::Promoted(generation) => {
+                self.runtime_db.set_state_value(LAST_OPTIMIZED_KEY, &today())?;
+                info!("Memory {} pass promoted generation {generation}", pass.label);
             }
             // Deliberately does not stamp the date: an abandoned pass should be
             // retried in the next idle window, not written off for the day.
-            OptimizerOutcome::Interrupted => {
-                info!("Nightly compaction deferred; it will retry when idle")
+            Outcome::Interrupted => {
+                info!("Memory {} pass deferred; it will retry when idle", pass.label)
             }
-            OptimizerOutcome::Rejected(reason) => {
-                warn!("Nightly compaction rejected, active memory unchanged: {reason}")
+            Outcome::Rejected(reason) => {
+                warn!(
+                    "Memory {} pass rejected, active memory unchanged: {reason}",
+                    pass.label
+                )
             }
         }
 
@@ -151,7 +145,7 @@ impl MaintenanceRunner {
     /// Due once per local day after the nightly hour, or immediately if a
     /// previous pass was abandoned.
     fn optimizer_is_due(&self) -> Result<bool> {
-        if self.flag_is_set(RETRY_PENDING_KEY)? {
+        if self.flag_is_set(NIGHTLY.pending_key)? {
             return Ok(true);
         }
 

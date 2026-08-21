@@ -93,7 +93,7 @@ impl CodexSupervisor {
             .unwrap_or(now_ms);
         let estimated_cache_warm_until_ms = existing
             .map(|p| p.estimated_cache_warm_until_ms)
-            .unwrap_or(now_ms + self.config.cache_ttl_ms());
+            .unwrap_or(now_ms + crate::codex::CACHE_TTL_MS);
 
         self.runtime_db.save_main_thread(&MainThreadState {
             thread_id: info.id.clone(),
@@ -190,7 +190,7 @@ impl CodexSupervisor {
             .map(|s| s.model_id)
             .unwrap_or_default();
 
-        match ThreadRouter::decide(&self.config, &self.runtime_db, &model_id)? {
+        match ThreadRouter::decide(&self.runtime_db, &model_id)? {
             ThreadDecision::Continue { thread_id } => {
                 if live_thread.as_deref() != Some(thread_id.as_str()) {
                     // Persisted but not loaded in this process yet. If the resume
@@ -212,7 +212,7 @@ impl CodexSupervisor {
                     turn_id: None,
                     started_at_ms: now_ms,
                     last_activity_at_ms: now_ms,
-                    estimated_cache_warm_until_ms: now_ms + self.config.cache_ttl_ms(),
+                    estimated_cache_warm_until_ms: now_ms + crate::codex::CACHE_TTL_MS,
                     model_id: info.model,
                 })?;
                 Ok(true)
@@ -225,7 +225,7 @@ impl CodexSupervisor {
         if let Ok(Some(mut state)) = self.runtime_db.get_main_thread() {
             let now_ms = Utc::now().timestamp_millis();
             state.last_activity_at_ms = now_ms;
-            state.estimated_cache_warm_until_ms = now_ms + self.config.cache_ttl_ms();
+            state.estimated_cache_warm_until_ms = now_ms + crate::codex::CACHE_TTL_MS;
             if let Err(e) = self.runtime_db.save_main_thread(&state) {
                 warn!("Could not update main thread activity: {e}");
             }

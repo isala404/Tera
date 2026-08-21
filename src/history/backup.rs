@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use tracing::info;
 
 /// Kept alongside history so a backup travels with the workspace.
-pub fn backup_dir(config: &Config) -> PathBuf {
+fn backup_dir(config: &Config) -> PathBuf {
     config.workspace_dir.join("history").join("backups")
 }
 
@@ -56,7 +56,6 @@ pub fn timestamp_now() -> String {
     Local::now().format("%Y%m%dT%H%M%S").to_string()
 }
 
-/// What an integrity check found.
 #[derive(Debug, Default)]
 pub struct IntegrityReport {
     pub sqlite_ok: bool,
@@ -75,7 +74,6 @@ impl IntegrityReport {
     }
 }
 
-/// Check canonical history against itself and against the projection.
 pub fn check_integrity(config: &Config, db: &crate::history::db::HistoryDb) -> Result<IntegrityReport> {
     let conn = Connection::open(config.history_db_path())?;
     let result: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;

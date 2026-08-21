@@ -1,4 +1,3 @@
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Used when neither `TERA_OWNER` nor the login name is available.
@@ -8,7 +7,7 @@ use std::path::PathBuf;
 /// leftover `{{OWNER}}` or an empty string is broken.
 const UNKNOWN_OWNER: &str = "the owner";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Config {
     pub workspace_dir: PathBuf,
     /// What to call the person this assistant works for, in every prompt and
@@ -20,7 +19,6 @@ pub struct Config {
     pub owner_name: String,
     pub whatsapp_owner_number: Option<String>,
     pub mock_transport: bool,
-    pub cache_ttl_minutes: u64,
     /// Absolute path to this binary, written into the Codex `config.toml` so
     /// Codex can spawn the MCP proxy. Overridable via `TERA_BIN`. Under
     /// `cargo test` the current executable is the test harness, not the daemon.
@@ -45,15 +43,8 @@ impl Config {
             owner_name: resolve_owner_name(),
             whatsapp_owner_number,
             mock_transport,
-            cache_ttl_minutes: 30,
             tera_bin,
         }
-    }
-
-    /// Prompt-cache lifetime, as milliseconds. An estimate, not a fact: the
-    /// app-server exposes no per-thread cache expiry (PLAN.md section 12.2).
-    pub fn cache_ttl_ms(&self) -> i64 {
-        (self.cache_ttl_minutes * 60 * 1000) as i64
     }
 
     pub fn runtime_dir(&self) -> PathBuf {

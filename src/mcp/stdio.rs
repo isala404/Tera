@@ -2,7 +2,7 @@ use crate::mcp::daemon_rpc::{DaemonRpcRequest, DaemonRpcResponse};
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Stdout};
 use tokio::net::UnixStream;
 
 /// Fallback only. Used when the client's `initialize` omits a version.
@@ -26,6 +26,15 @@ fn tool_definitions(owner: &str) -> Result<Value> {
     let rendered = crate::data::render(crate::data::MCP_TOOLS_JSON, &[("OWNER", owner)]);
     serde_json::from_str(&rendered)
         .context("embedded data/config/mcp-tools.json is not valid JSON")
+}
+
+/// Writes a JSON-RPC message as a line and flushes. The flush is required: a
+/// missing flush hangs the client waiting for a response it can't see yet.
+async fn respond(stdout: &mut Stdout, value: &Value) -> Result<()> {
+    let line = serde_json::to_string(value)? + "\n";
+    stdout.write_all(line.as_bytes()).await?;
+    stdout.flush().await?;
+    Ok(())
 }
 
 pub struct StdioMcpProxy {
@@ -84,18 +93,14 @@ impl StdioMcpProxy {
                         }
                     }
                 });
-                let resp_str = serde_json::to_string(&init_resp)? + "\n";
-                stdout.write_all(resp_str.as_bytes()).await?;
-                stdout.flush().await?;
+                respond(&mut stdout, &init_resp).await?;
             } else if method == "tools/list" {
                 let tools_resp = json!({
                     "jsonrpc": "2.0",
                     "id": id,
                     "result": { "tools": tool_definitions(&self.owner_name)? }
                 });
-                let resp_str = serde_json::to_string(&tools_resp)? + "\n";
-                stdout.write_all(resp_str.as_bytes()).await?;
-                stdout.flush().await?;
+                respond(&mut stdout, &tools_resp).await?;
             } else if method == "tools/call" {
                 let tool_name = req_val["params"]["name"].as_str().unwrap_or_default();
                 let tool_args = req_val["params"]["arguments"].clone();
@@ -114,9 +119,7 @@ impl StdioMcpProxy {
                                 ]
                             }
                         });
-                        let resp_str = serde_json::to_string(&tool_resp)? + "\n";
-                        stdout.write_all(resp_str.as_bytes()).await?;
-                        stdout.flush().await?;
+                        respond(&mut stdout, &tool_resp).await?;
                     }
                     Err(e) => {
                         let err_resp = json!({
@@ -127,9 +130,7 @@ impl StdioMcpProxy {
                                 "message": e.to_string()
                             }
                         });
-                        let resp_str = serde_json::to_string(&err_resp)? + "\n";
-                        stdout.write_all(resp_str.as_bytes()).await?;
-                        stdout.flush().await?;
+                        respond(&mut stdout, &err_resp).await?;
                     }
                 }
             } else if id.is_some() {
@@ -138,9 +139,7 @@ impl StdioMcpProxy {
                     "id": id,
                     "result": {}
                 });
-                let resp_str = serde_json::to_string(&ack_resp)? + "\n";
-                stdout.write_all(resp_str.as_bytes()).await?;
-                stdout.flush().await?;
+                respond(&mut stdout, &ack_resp).await?;
             }
         }
 

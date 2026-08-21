@@ -2,7 +2,7 @@ use tera::config::Config;
 use tera::history::db::{ConversationEvent, HistoryDb};
 use tera::history::projection::ProjectionEngine;
 use tera::memory::generations::GenerationManager;
-use tera::memory::optimizer::MemoryOptimizer;
+use tera::memory::NIGHTLY;
 use tera::runtime::RuntimeDb;
 use tera::codex::tier;
 use tera::scheduler::db::SchedulerDb;
@@ -258,7 +258,7 @@ async fn test_memory_generation_promotion_is_atomic() {
     let config = Config::new(temp_dir.path().to_path_buf(), true);
     WorkspaceInit::init(&config).unwrap();
 
-    let staging = MemoryOptimizer::prepare_staging(&config).unwrap();
+    let staging = NIGHTLY.prepare_staging(&config).unwrap();
     fs::write(staging.join("people.md"), "# Amaya\n\nMoving in December.\n").unwrap();
 
     let generation = GenerationManager::atomic_swap_generation(&config, &staging).unwrap();

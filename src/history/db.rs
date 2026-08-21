@@ -3,7 +3,7 @@ use crate::history::projection::ProjectionEngine;
 use crate::history::schema::INIT_HISTORY_SCHEMA_SQL;
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -50,7 +50,6 @@ pub struct ProviderRef {
     pub provider_msg_id: String,
     /// Chat the message lives in, without a device suffix.
     pub chat_jid: String,
-    /// Whether this account sent the message.
     pub from_me: bool,
 }
 
@@ -96,6 +95,44 @@ pub struct ConversationEvent {
     pub reaction_target_id: Option<String>,
     pub reaction_emoji: Option<String>,
     pub attachments: Vec<Attachment>,
+}
+
+/// `get_event`, `list_events_all` and `recent_messages` each select the same
+/// columns in the same order; sharing the mapper is what keeps them from
+/// drifting when a column is added.
+fn row_to_event(row: &Row) -> rusqlite::Result<ConversationEvent> {
+    Ok(ConversationEvent {
+        seq: Some(row.get(0)?),
+        id: row.get(1)?,
+        occurred_at_ms: row.get(2)?,
+        kind: row.get(3)?,
+        actor: row.get(4)?,
+        text: row.get(5)?,
+        reply_to_id: row.get(6)?,
+        turn_id: row.get(7)?,
+        reaction_target_id: row.get(8)?,
+        reaction_emoji: row.get(9)?,
+        attachments: vec![],
+    })
+}
+
+fn load_attachments(conn: &Connection, event_id: &str) -> Result<Vec<Attachment>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, event_id, position, media_type, relative_path, mime_type, original_name
+         FROM attachments WHERE event_id = ?1 ORDER BY position ASC",
+    )?;
+    let rows = stmt.query_map(params![event_id], |row| {
+        Ok(Attachment {
+            id: Some(row.get(0)?),
+            event_id: row.get(1)?,
+            position: row.get(2)?,
+            media_type: row.get(3)?,
+            relative_path: row.get(4)?,
+            mime_type: row.get(5)?,
+            original_name: row.get(6)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
 /// The canonical event store, and the owner of its JSONL projection.
@@ -228,7 +265,6 @@ impl HistoryDb {
         Ok(())
     }
 
-    /// Everything needed to address the provider's copy of an event.
     pub fn lookup_provider_ref_by_event_id(
         &self,
         event_id: &str,
@@ -269,41 +305,10 @@ impl HistoryDb {
             "SELECT seq, id, occurred_at_ms, kind, actor, text, reply_to_id, turn_id, reaction_target_id, reaction_emoji
              FROM conversation_events WHERE id = ?1"
         )?;
-        let event_opt = stmt.query_row(params![event_id], |row| {
-            Ok(ConversationEvent {
-                seq: Some(row.get(0)?),
-                id: row.get(1)?,
-                occurred_at_ms: row.get(2)?,
-                kind: row.get(3)?,
-                actor: row.get(4)?,
-                text: row.get(5)?,
-                reply_to_id: row.get(6)?,
-                turn_id: row.get(7)?,
-                reaction_target_id: row.get(8)?,
-                reaction_emoji: row.get(9)?,
-                attachments: vec![],
-            })
-        }).optional()?;
+        let event_opt = stmt.query_row(params![event_id], row_to_event).optional()?;
 
         if let Some(mut ev) = event_opt {
-            let mut att_stmt = conn.prepare(
-                "SELECT id, event_id, position, media_type, relative_path, mime_type, original_name
-                 FROM attachments WHERE event_id = ?1 ORDER BY position ASC"
-            )?;
-            let att_rows = att_stmt.query_map(params![event_id], |row| {
-                Ok(Attachment {
-                    id: Some(row.get(0)?),
-                    event_id: row.get(1)?,
-                    position: row.get(2)?,
-                    media_type: row.get(3)?,
-                    relative_path: row.get(4)?,
-                    mime_type: row.get(5)?,
-                    original_name: row.get(6)?,
-                })
-            })?;
-            for att in att_rows {
-                ev.attachments.push(att?);
-            }
+            ev.attachments = load_attachments(&conn, event_id)?;
             Ok(Some(ev))
         } else {
             Ok(None)
@@ -324,42 +329,11 @@ impl HistoryDb {
         )?;
 
         let mut events = Vec::new();
-        let rows = stmt.query_map([], |row| {
-            Ok(ConversationEvent {
-                seq: Some(row.get(0)?),
-                id: row.get(1)?,
-                occurred_at_ms: row.get(2)?,
-                kind: row.get(3)?,
-                actor: row.get(4)?,
-                text: row.get(5)?,
-                reply_to_id: row.get(6)?,
-                turn_id: row.get(7)?,
-                reaction_target_id: row.get(8)?,
-                reaction_emoji: row.get(9)?,
-                attachments: vec![],
-            })
-        })?;
+        let rows = stmt.query_map([], row_to_event)?;
 
         for ev in rows {
             let mut ev = ev?;
-            let mut att_stmt = conn.prepare(
-                "SELECT id, event_id, position, media_type, relative_path, mime_type, original_name
-                 FROM attachments WHERE event_id = ?1 ORDER BY position ASC"
-            )?;
-            let att_rows = att_stmt.query_map(params![ev.id], |row| {
-                Ok(Attachment {
-                    id: Some(row.get(0)?),
-                    event_id: row.get(1)?,
-                    position: row.get(2)?,
-                    media_type: row.get(3)?,
-                    relative_path: row.get(4)?,
-                    mime_type: row.get(5)?,
-                    original_name: row.get(6)?,
-                })
-            })?;
-            for att in att_rows {
-                ev.attachments.push(att?);
-            }
+            ev.attachments = load_attachments(&conn, &ev.id)?;
             events.push(ev);
         }
 
@@ -377,43 +351,12 @@ impl HistoryDb {
              WHERE kind = 'message'
              ORDER BY seq DESC LIMIT ?1",
         )?;
-        let rows = stmt.query_map(params![limit as i64], |row| {
-            Ok(ConversationEvent {
-                seq: Some(row.get(0)?),
-                id: row.get(1)?,
-                occurred_at_ms: row.get(2)?,
-                kind: row.get(3)?,
-                actor: row.get(4)?,
-                text: row.get(5)?,
-                reply_to_id: row.get(6)?,
-                turn_id: row.get(7)?,
-                reaction_target_id: row.get(8)?,
-                reaction_emoji: row.get(9)?,
-                attachments: vec![],
-            })
-        })?;
+        let rows = stmt.query_map(params![limit as i64], row_to_event)?;
 
         let mut events = Vec::new();
         for row in rows {
             let mut event = row?;
-            let mut att_stmt = conn.prepare(
-                "SELECT id, event_id, position, media_type, relative_path, mime_type, original_name
-                 FROM attachments WHERE event_id = ?1 ORDER BY position ASC",
-            )?;
-            let attachments = att_stmt.query_map(params![event.id], |row| {
-                Ok(Attachment {
-                    id: Some(row.get(0)?),
-                    event_id: row.get(1)?,
-                    position: row.get(2)?,
-                    media_type: row.get(3)?,
-                    relative_path: row.get(4)?,
-                    mime_type: row.get(5)?,
-                    original_name: row.get(6)?,
-                })
-            })?;
-            for attachment in attachments {
-                event.attachments.push(attachment?);
-            }
+            event.attachments = load_attachments(&conn, &event.id)?;
             events.push(event);
         }
 

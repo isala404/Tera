@@ -247,7 +247,6 @@ impl DaemonRpcServer {
                         .await?
                 };
 
-                // Save assistant event to history
                 let event = ConversationEvent {
                     seq: None,
                     id: format!("m_{}", Uuid::new_v4().simple()),
@@ -286,12 +285,8 @@ impl DaemonRpcServer {
 
             "react" => {
                 let recipient = self.recipient()?;
-                let msg_id = args["message_id"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("Missing message_id parameter"))?;
-                let emoji = args["emoji"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("Missing emoji parameter"))?;
+                let msg_id = require_str(args, "message_id")?;
+                let emoji = require_str(args, "emoji")?;
 
                 // Reacting needs the chat and sender-side of the target, not just
                 // its id; without them WhatsApp accepts the reaction and drops it.
@@ -335,12 +330,8 @@ impl DaemonRpcServer {
             }
 
             "schedule" => {
-                let sched_name = args["name"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("Missing schedule name"))?;
-                let prompt = args["prompt"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("Missing schedule prompt"))?;
+                let sched_name = require_str(args, "name")?;
+                let prompt = require_str(args, "prompt")?;
 
                 let timing = ScheduleTiming::parse(&args["timing"], Utc::now().timestamp_millis())?;
 
@@ -399,20 +390,14 @@ impl DaemonRpcServer {
             }
 
             "cancel_schedule" => {
-                let id = args["schedule_id"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("Missing schedule_id"))?;
+                let id = require_str(args, "schedule_id")?;
                 let success = SchedulerDb::cancel_schedule(&self.runtime_db, id)?;
                 Ok(json!({ "cancelled": success, "schedule_id": id }))
             }
 
             "request_secret" => {
-                let name = args["name"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("Missing secret name"))?;
-                let reason = args["reason"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("Missing reason"))?;
+                let name = require_str(args, "name")?;
+                let reason = require_str(args, "reason")?;
                 let recipient = self.recipient()?;
 
                 self.secrets
@@ -445,6 +430,13 @@ impl DaemonRpcServer {
             _ => Err(anyhow!("Unknown MCP tool name: '{}'", name)),
         }
     }
+}
+
+/// Reads a required string argument, erroring with a uniform message if it's
+/// absent. Only for arguments that hard-error on absence; genuinely optional
+/// ones stay as direct `.as_str()` reads.
+fn require_str<'a>(args: &'a Value, field: &str) -> Result<&'a str> {
+    args[field].as_str().ok_or_else(|| anyhow!("Missing {field}"))
 }
 
 fn attachment_argument(args: &Value) -> Result<Option<(&'static str, &str)>> {

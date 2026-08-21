@@ -32,9 +32,14 @@ pub const WORKING: &str = include_str!("../data/workspace/WORKING.md");
 pub const CODEX_HOME_AGENTS: &str = include_str!("../data/workspace/codex-home/AGENTS.md");
 pub const PROJECTS_AGENTS: &str = include_str!("../data/workspace/projects/AGENTS.md");
 pub const TASKS_AGENTS: &str = include_str!("../data/workspace/tasks/AGENTS.md");
+/// Bootstrap read by every run of a scheduled task.
 pub const SCHEDULE_AGENTS: &str = include_str!("../data/workspace/tasks/SCHEDULE_AGENTS.md");
 pub const HISTORY_SCHEMA: &str = include_str!("../data/workspace/history/SCHEMA.md");
 pub const LOGS_SCHEMA: &str = include_str!("../data/workspace/logs/SCHEMA.md");
+
+pub const MEMORY_INDEX_SEED: &str = include_str!("../data/workspace/memory/INDEX.md");
+pub const MEMORY_HORIZON_SEED: &str = include_str!("../data/workspace/memory/HORIZON.md");
+pub const MEMORY_USER_SEED: &str = include_str!("../data/workspace/memory/USER.md");
 
 /// A built-in skill package. Skill files are embedded so a released tera can
 /// initialize a workspace without depending on the source tree being present.
@@ -96,6 +101,9 @@ mod tests {
         ("workspace/projects/AGENTS.md", PROJECTS_AGENTS),
         ("workspace/tasks/AGENTS.md", TASKS_AGENTS),
         ("workspace/tasks/SCHEDULE_AGENTS.md", SCHEDULE_AGENTS),
+        ("workspace/memory/INDEX.md", MEMORY_INDEX_SEED),
+        ("workspace/memory/HORIZON.md", MEMORY_HORIZON_SEED),
+        ("workspace/memory/USER.md", MEMORY_USER_SEED),
         ("workspace/history/SCHEMA.md", HISTORY_SCHEMA),
         ("workspace/logs/SCHEMA.md", LOGS_SCHEMA),
         ("prompts/memory-optimizer.md", MEMORY_OPTIMIZER_PROMPT),

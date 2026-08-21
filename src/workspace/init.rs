@@ -1,6 +1,7 @@
 use crate::config::Config;
+use crate::data;
 use crate::memory::generations::GenerationManager;
-use crate::workspace::templates::*;
+use crate::workspace::templates::{self, GENERATED_MARKER_PREFIX};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -33,7 +34,6 @@ impl WorkspaceInit {
             config.workspace_dir, config.owner_name
         );
 
-        // 1. Create base directories
         let dirs_to_create = vec![
             config.workspace_dir.clone(),
             config.runtime_dir(),
@@ -58,75 +58,93 @@ impl WorkspaceInit {
                 .with_context(|| format!("Failed to create directory {:?}", dir))?;
         }
 
-        // 2. Initial memory generation 00000001
-        let gen1_dir = config.generations_dir().join("00000001");
-        let index_md = gen1_dir.join("INDEX.md");
-        if !index_md.exists() {
-            fs::write(
-                &index_md,
-                "# Active Memory Index\n\n- [USER.md](USER.md): Facts and preferences about the user.\n- [HORIZON.md](HORIZON.md): Current active focus and pending horizons.\n",
-            )?;
-        }
-        let horizon_md = gen1_dir.join("HORIZON.md");
-        if !horizon_md.exists() {
-            fs::write(
-                &horizon_md,
-                "# Horizon Context\n\nNo active long-term horizon goals registered.\n",
-            )?;
-        }
         // Seeded with the configured owner and nothing else. Anything more would
         // be this daemon inventing facts about someone it has not met; the agent
         // fills the rest in from conversation.
-        let user_md = gen1_dir.join("USER.md");
-        if !user_md.exists() {
-            fs::write(
-                &user_md,
-                format!(
-                    "# User profile\n\n- Name: {}\n\nEverything else here is learned from conversation. Do not invent it.\n",
-                    config.owner_name
-                ),
-            )?;
+        let gen1_dir = config.generations_dir().join("00000001");
+        let memory_seeds = [
+            ("INDEX.md", data::MEMORY_INDEX_SEED),
+            ("HORIZON.md", data::MEMORY_HORIZON_SEED),
+            ("USER.md", data::MEMORY_USER_SEED),
+        ];
+        for (filename, seed) in memory_seeds {
+            let path = gen1_dir.join(filename);
+            if !path.exists() {
+                fs::write(&path, templates::render(seed, config))?;
+            }
         }
 
-        // 3. Point `MEMORIES` at the newest generation. Not always at 00000001:
-        //    re-init on an existing workspace must not roll memory back to the
-        //    day it was created.
+        // Point `MEMORIES` at the newest generation. Not always at 00000001:
+        // re-init on an existing workspace must not roll memory back to the day
+        // it was created.
         Self::remove_legacy_memories_link(config);
         let active = GenerationManager::get_current_generation_num(config)?;
         GenerationManager::point_memories_at(config, active)?;
 
-        // 4. Instruction files.
-        //
-        //    Ours are refreshed every start so an improved template actually
-        //    reaches a live workspace; the user's persona file is written once and
-        //    then left alone. See templates.rs for why the split exists.
-        Self::write_generated(&config.root_agents_path(), &root_agents_template(config))?;
-        Self::write_generated(
-            &config.projects_dir().join("AGENTS.md"),
-            &projects_agents_template(config),
-        )?;
-        Self::write_generated(
-            &config.tasks_dir().join("AGENTS.md"),
-            &tasks_agents_template(config),
-        )?;
-        Self::write_generated(
-            &config.workspace_dir.join("history").join("SCHEMA.md"),
-            &history_schema_template(config),
-        )?;
-        Self::write_generated(
-            &config.logs_dir().join("SCHEMA.md"),
-            &logs_schema_template(config),
-        )?;
-        Self::write_generated(&config.workspace_dir.join("WORKING.md"), &working_template(config))?;
-        Self::write_generated(
-            &config.codex_home_dir().join("AGENTS.md"),
-            &codex_bootstrap_template(config),
-        )?;
-        Self::write_file_if_missing(&config.persona_path(), &persona_template(config))?;
-        // The agent's notes on the host. Seeded as a skeleton once, then never
-        // touched again, anything it learned about the machine is not recoverable
-        // from history and there is nowhere else it could have been written down.
-        Self::write_file_if_missing(&config.system_notes_path(), &system_notes_template(config))?;
+        // Instruction files. Ours are refreshed every start so an improved
+        // template actually reaches a live workspace; the user's persona file is
+        // written once and then left alone. See templates.rs for why the split
+        // exists.
+        enum Owned {
+            ByUs,
+            ByThem,
+        }
+
+        let instructions = [
+            (config.root_agents_path(), data::WORKSPACE_AGENTS, Owned::ByUs),
+            (
+                config.projects_dir().join("AGENTS.md"),
+                data::PROJECTS_AGENTS,
+                Owned::ByUs,
+            ),
+            (
+                config.tasks_dir().join("AGENTS.md"),
+                data::TASKS_AGENTS,
+                Owned::ByUs,
+            ),
+            // The reference the agent is pointed at from AGENTS.md. Generated,
+            // because it documents our own storage format. There is nothing here
+            // for a user to edit.
+            (
+                config.workspace_dir.join("history").join("SCHEMA.md"),
+                data::HISTORY_SCHEMA,
+                Owned::ByUs,
+            ),
+            // How to read the daemon's own log. Split out of AGENTS.md for the
+            // same reason as the history reference: it is needed when something
+            // looks broken, not on every turn, and AGENTS.md is read at the start
+            // of every session.
+            (
+                config.logs_dir().join("SCHEMA.md"),
+                data::LOGS_SCHEMA,
+                Owned::ByUs,
+            ),
+            // Craft, read before real work rather than every session.
+            (
+                config.workspace_dir.join("WORKING.md"),
+                data::WORKING,
+                Owned::ByUs,
+            ),
+            (
+                config.codex_home_dir().join("AGENTS.md"),
+                data::CODEX_HOME_AGENTS,
+                Owned::ByUs,
+            ),
+            (config.persona_path(), data::PERSONA, Owned::ByThem),
+            // The agent's notes on the host. Seeded as a skeleton once, then never
+            // touched again, anything it learned about the machine is not
+            // recoverable from history and there is nowhere else it could have
+            // been written down.
+            (config.system_notes_path(), data::SYSTEM_NOTES, Owned::ByThem),
+        ];
+
+        for (path, template, owned) in instructions {
+            let rendered = templates::render(template, config);
+            match owned {
+                Owned::ByUs => Self::write_generated(&path, &rendered)?,
+                Owned::ByThem => Self::write_file_if_missing(&path, &rendered)?,
+            }
+        }
 
         // Native skills are seeded once. Existing paths, edits, symlinks, and
         // deliberate deletions remain user-owned; untouched managed packages can
@@ -138,13 +156,11 @@ impl WorkspaceInit {
         // when the workspace or the binary moves.
         fs::write(
             config.codex_home_dir().join("config.toml"),
-            generate_codex_config(config),
+            templates::generate_codex_config(config),
         )?;
 
-        // 5. Share the operator's Codex credentials with the workspace home.
         Self::link_codex_credentials(config);
 
-        // 6. Check CLI tools
         Self::check_binary_dependencies();
 
         info!("Workspace initialization complete!");
@@ -417,16 +433,9 @@ impl WorkspaceInit {
     }
 
     fn write_builtin_skill_state(config: &Config, state: &BuiltinSkillState) -> Result<()> {
-        let path = config.builtin_skills_state_path();
-        let temporary = path.with_extension(format!("json.tmp-{}", std::process::id()));
-        let contents = serde_json::to_vec_pretty(state).context("failed to encode built-in skill state")?;
-        fs::write(&temporary, contents)
-            .with_context(|| format!("failed to write built-in skill state {temporary:?}"))?;
-        if let Err(error) = fs::rename(&temporary, &path) {
-            let _ = fs::remove_file(&temporary);
-            return Err(error).with_context(|| format!("failed to install built-in skill state {path:?}"));
-        }
-        Ok(())
+        let contents =
+            serde_json::to_vec_pretty(state).context("failed to encode built-in skill state")?;
+        crate::runtime::write_atomic(&config.builtin_skills_state_path(), &contents, 0o644)
     }
 
     fn create_skill_staging(skills_dir: &Path, skill_name: &str) -> Result<PathBuf> {

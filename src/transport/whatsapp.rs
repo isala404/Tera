@@ -1,10 +1,9 @@
 use crate::transport::owner::jid_user;
-use crate::transport::{InboundEvent, InboundMedia, InboundMessage, ReactionTarget, Transport};
+use crate::transport::{InboundMedia, InboundMessage, ReactionTarget, Transport};
 use anyhow::{anyhow, Context, Result};
 use qrcode::render::unicode;
 use qrcode::QrCode;
 use async_trait::async_trait;
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
@@ -257,7 +256,7 @@ impl WhatsAppWebTransport {
 
     pub async fn start_bot<F>(&self, inbound_callback: F) -> Result<()>
     where
-        F: Fn(InboundEvent) + Send + Sync + 'static,
+        F: Fn(InboundMessage) + Send + Sync + 'static,
     {
         let db_str = self.session_db_path.to_string_lossy().to_string();
         info!("Starting whatsapp-rust session at {}", db_str);
@@ -311,7 +310,7 @@ impl WhatsAppWebTransport {
                         is_group: ctx.info.source.is_group,
                     };
 
-                    cb(InboundEvent::Message(msg));
+                    cb(msg);
                 }
             })
             .build()
@@ -334,18 +333,11 @@ impl WhatsAppWebTransport {
 impl Transport for WhatsAppWebTransport {
     async fn send_text(&self, recipient: &str, text: &str, _reply_to_provider_id: Option<&str>) -> Result<String> {
         info!("whatsapp-rust send_text to {}: {}", recipient, text);
-        let client_opt = {
-            let lock = self.client_handle.lock().unwrap();
-            lock.clone()
-        };
 
         // Never invent a message id on failure: the caller records the returned
         // id in canonical history, so a fabricated one writes a message the user
-        // never received into the permanent record (PLAN.md section 55).
-        let client = client_opt.ok_or_else(|| anyhow!("WhatsApp client is not connected yet"))?;
-        let jid: Jid = recipient
-            .parse()
-            .map_err(|e| anyhow!("Invalid recipient JID '{}': {:?}", recipient, e))?;
+        // never received into the permanent record.
+        let (client, jid) = self.client_for(recipient)?;
 
         let send_res = client
             .send_text(jid, text)
@@ -377,69 +369,60 @@ impl Transport for WhatsAppWebTransport {
             file_path.display()
         );
 
-        let (wa_media_type, message) = match media_type {
+        // `reply_to_provider_id` is accepted but not yet attached to outbound
+        // media; the wire format needs a ContextInfo the SDK does not expose here.
+        let _ = reply_to_provider_id;
+
+        let message = match media_type {
             "image" => {
                 let upload = self.upload(&client, data, MediaType::Image).await?;
-                (
-                    MediaType::Image,
-                    media::image_message(
-                        upload,
-                        media::ImageOptions {
-                            caption: caption.map(str::to_string),
-                            mimetype: Some(mime),
-                            ..Default::default()
-                        },
-                    ),
+                media::image_message(
+                    upload,
+                    media::ImageOptions {
+                        caption: caption.map(str::to_string),
+                        mimetype: Some(mime),
+                        ..Default::default()
+                    },
                 )
             }
             "video" => {
                 let upload = self.upload(&client, data, MediaType::Video).await?;
-                (
-                    MediaType::Video,
-                    media::video_message(
-                        upload,
-                        media::VideoOptions {
-                            caption: caption.map(str::to_string),
-                            mimetype: Some(mime),
-                            ..Default::default()
-                        },
-                    ),
+                media::video_message(
+                    upload,
+                    media::VideoOptions {
+                        caption: caption.map(str::to_string),
+                        mimetype: Some(mime),
+                        ..Default::default()
+                    },
                 )
             }
             "audio" => {
                 let upload = self.upload(&client, data, MediaType::Audio).await?;
-                (
-                    MediaType::Audio,
-                    media::audio_message(
-                        upload,
-                        media::AudioOptions {
-                            mimetype: Some(mime),
-                            ..Default::default()
-                        },
-                    ),
+                media::audio_message(
+                    upload,
+                    media::AudioOptions {
+                        mimetype: Some(mime),
+                        ..Default::default()
+                    },
                 )
             }
             // Anything else rides as a document, which is what WhatsApp does for
             // arbitrary files anyway.
             _ => {
                 let upload = self.upload(&client, data, MediaType::Document).await?;
-                (
-                    MediaType::Document,
-                    media::document_message(
-                        upload,
-                        media::DocumentOptions {
-                            mimetype: Some(mime),
-                            file_name: file_path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string()),
-                            caption: caption.map(str::to_string),
-                            ..Default::default()
-                        },
-                    ),
+                media::document_message(
+                    upload,
+                    media::DocumentOptions {
+                        mimetype: Some(mime),
+                        file_name: file_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string()),
+                        caption: caption.map(str::to_string),
+                        ..Default::default()
+                    },
                 )
             }
         };
-        let _ = (wa_media_type, reply_to_provider_id);
 
         let send_res = client
             .send_message(jid, message)
@@ -511,16 +494,11 @@ pub struct MockTransport {
     pub sent_messages: Arc<Mutex<Vec<SentMessage>>>,
     pub sent_reactions: Arc<Mutex<Vec<(String, String, String)>>>,
     pub typing_states: Arc<Mutex<Vec<(String, bool)>>>,
-    pub inbound_queue: Arc<Mutex<VecDeque<InboundEvent>>>,
 }
 
 impl MockTransport {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn push_inbound(&self, event: InboundEvent) {
-        self.inbound_queue.lock().unwrap().push_back(event);
     }
 }
 

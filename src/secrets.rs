@@ -26,8 +26,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 /// How long a request from [`SecretStore::request`] keeps claiming the next
@@ -124,9 +123,9 @@ impl SecretStore {
         }
     }
 
-    /// Write via a temporary file so a crash mid-write cannot leave a truncated
-    /// store, and create it 0600 from the start rather than chmod-ing after: a
-    /// file that is briefly world-readable is world-readable.
+    /// 0600 from the start rather than chmod-ing after: a file that is briefly
+    /// world-readable is world-readable. The directory is locked down too, so
+    /// the store cannot be replaced out from under us by another user.
     fn save(&self, contents: &Contents) -> Result<()> {
         let parent = self
             .path
@@ -136,24 +135,9 @@ impl SecretStore {
             .with_context(|| format!("Cannot create {}", parent.display()))?;
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).ok();
 
-        let temporary = parent.join(format!(".secrets.json.tmp-{}", std::process::id()));
-        let serialized = serde_json::to_string_pretty(contents)?;
-
-        let mut handle = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&temporary)
-            .with_context(|| format!("Cannot write {}", temporary.display()))?;
-        handle.write_all(serialized.as_bytes())?;
-        handle.write_all(b"\n")?;
-        handle.sync_all()?;
-        drop(handle);
-
-        fs::rename(&temporary, &self.path)
-            .with_context(|| format!("Cannot replace {}", self.path.display()))?;
-        Ok(())
+        let mut serialized = serde_json::to_vec_pretty(contents)?;
+        serialized.push(b'\n');
+        crate::runtime::write_atomic(&self.path, &serialized, 0o600)
     }
 
     pub fn set(&self, name: &str, value: &str, now_ms: i64) -> Result<()> {

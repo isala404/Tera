@@ -64,7 +64,7 @@ pub struct JsonlReaction {
 pub struct ProjectionEngine;
 
 impl ProjectionEngine {
-    pub fn event_to_record(event: &ConversationEvent) -> JsonlRecord {
+    fn event_to_record(event: &ConversationEvent) -> JsonlRecord {
         let dt: DateTime<Utc> = Utc.timestamp_millis_opt(event.occurred_at_ms).unwrap();
         let t_str = dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
@@ -104,8 +104,7 @@ impl ProjectionEngine {
         }
     }
 
-    /// Which monthly file an event belongs in.
-    pub fn month_file(jsonl_dir: &Path, occurred_at_ms: i64) -> PathBuf {
+    fn month_file(jsonl_dir: &Path, occurred_at_ms: i64) -> PathBuf {
         let dt: DateTime<Utc> = Utc.timestamp_millis_opt(occurred_at_ms).unwrap();
         jsonl_dir.join(format!("{}.jsonl", dt.format("%Y-%m")))
     }
@@ -145,7 +144,6 @@ impl ProjectionEngine {
         jsonl_dir.join(DIRTY_MARKER).exists()
     }
 
-    /// Lines currently in the projection, across every month file.
     pub fn projected_line_count(jsonl_dir: &Path) -> Result<usize> {
         if !jsonl_dir.exists() {
             return Ok(0);
