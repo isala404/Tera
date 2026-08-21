@@ -24,6 +24,8 @@ Test for new code: would this need rewriting when the model gets better? If yes,
 - `anyhow::Result` everywhere, `.with_context()` on IO.
 - Unix-only by design; both release targets are unix. Do not add `#[cfg(unix)]` guards.
 - `write_atomic` in `runtime/fs.rs` is the one way to write a file that must not tear.
+- `sqlite::add_column_if_missing` is the one way to add a column to a table a live workspace already has. `CREATE TABLE IF NOT EXISTS` never revisits an existing table, so a new column in a schema constant reaches fresh databases only.
+- A module that keeps tables in the runtime database owns its own schema next to its queries. `RuntimeDb::open` calls into it, as it does for `scheduler::db::init_schema`.
 
 ## Gotchas
 
