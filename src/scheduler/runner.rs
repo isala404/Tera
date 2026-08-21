@@ -1,7 +1,8 @@
 use crate::codex::tier;
 use crate::codex::CodexSupervisor;
 use crate::config::Config;
-use crate::runtime::{ActivityTracker, RuntimeDb, ScheduleItem, ScheduleRun};
+use crate::runtime::{ActivityTracker, RuntimeDb};
+use crate::scheduler::db::{ScheduleItem, ScheduleRun};
 use crate::scheduler::db::SchedulerDb;
 use crate::scheduler::recurrence::RecurrenceEngine;
 use crate::workspace::templates;

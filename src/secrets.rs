@@ -56,8 +56,6 @@ pub struct Secret {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingRequest {
     pub name: String,
-    /// What the agent said it needed this for, echoed back to the owner.
-    pub reason: String,
     pub requested_at_ms: i64,
 }
 
@@ -185,12 +183,11 @@ impl SecretStore {
     }
 
     /// Claim the owner's next message as the value for `name`.
-    pub fn request(&self, name: &str, reason: &str, now_ms: i64) -> Result<()> {
+    pub fn request(&self, name: &str, now_ms: i64) -> Result<()> {
         let name = validate_name(name)?;
         let mut contents = self.load()?;
         contents.pending = Some(PendingRequest {
             name,
-            reason: reason.to_string(),
             requested_at_ms: now_ms,
         });
         self.save(&contents)
@@ -502,7 +499,7 @@ mod tests {
     #[test]
     fn test_pending_request_claims_the_next_message() {
         let (_dir, store) = store();
-        store.request("SPOTIFY_CLIENT_ID", "to control Spotify", 0).unwrap();
+        store.request("SPOTIFY_CLIENT_ID", 0).unwrap();
         let outcome = store.capture("  abc123  ", 1_000).unwrap();
         assert_eq!(outcome, Capture::Stored { name: "SPOTIFY_CLIENT_ID".to_string() });
         assert_eq!(store.get("SPOTIFY_CLIENT_ID").unwrap().as_deref(), Some("abc123"));
@@ -512,7 +509,7 @@ mod tests {
     #[test]
     fn test_request_is_consumed_by_the_message_it_claims() {
         let (_dir, store) = store();
-        store.request("TOKEN", "why", 0).unwrap();
+        store.request("TOKEN", 0).unwrap();
         store.capture("abc123", 0).unwrap();
         assert_eq!(store.capture("thanks!", 0).unwrap(), Capture::Passthrough);
     }
@@ -522,7 +519,7 @@ mod tests {
     #[test]
     fn test_stale_request_does_not_claim_a_message() {
         let (_dir, store) = store();
-        store.request("TOKEN", "why", 0).unwrap();
+        store.request("TOKEN", 0).unwrap();
         assert_eq!(
             store.capture("what's the weather", PENDING_LIFETIME_MS + 1).unwrap(),
             Capture::Passthrough
@@ -534,7 +531,7 @@ mod tests {
     #[test]
     fn test_explicit_command_clears_a_pending_request() {
         let (_dir, store) = store();
-        store.request("TOKEN", "why", 0).unwrap();
+        store.request("TOKEN", 0).unwrap();
         store.capture("/secret OTHER_TOKEN abc123", 0).unwrap();
         assert_eq!(store.capture("thanks!", 0).unwrap(), Capture::Passthrough);
     }

@@ -5,10 +5,6 @@ use std::collections::HashMap;
 pub struct InputRenderer;
 
 impl InputRenderer {
-    pub fn render_burst(events: &[ConversationEvent]) -> String {
-        Self::render_events(events, None, &HashMap::new())
-    }
-
     /// Render a live turn with the messages that WhatsApp says it is replying
     /// to. The quoted text is delimited as data so it gives the agent context
     /// without becoming a second set of instructions.
@@ -129,7 +125,7 @@ mod tests {
             attachments: vec![],
         };
 
-        let rendered = InputRenderer::render_burst(&[ev]);
+        let rendered = InputRenderer::render_burst_with_replies(&[ev], &HashMap::new());
         assert!(rendered.contains("User m_test:"), "{rendered}");
         assert!(rendered.contains("Test query"));
     }

@@ -38,8 +38,6 @@ pub struct JsonRpcResponse {
 pub struct JsonRpcError {
     pub code: i64,
     pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<Value>,
 }
 
 // Notifications are deliberately not modelled as a struct: they are read as raw

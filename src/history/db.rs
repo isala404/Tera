@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::history::projection::ProjectionEngine;
 use crate::history::schema::INIT_HISTORY_SCHEMA_SQL;
+use crate::sqlite::add_column_if_missing;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -19,22 +20,6 @@ use uuid::Uuid;
 fn migrate(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "provider_refs", "chat_jid", "TEXT")?;
     add_column_if_missing(conn, "provider_refs", "from_me", "INTEGER NOT NULL DEFAULT 0")?;
-    Ok(())
-}
-
-fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
-    let existing: Vec<String> = conn
-        .prepare(&format!("PRAGMA table_info({table})"))?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<std::result::Result<_, _>>()?;
-
-    if existing.iter().any(|c| c == column) {
-        return Ok(());
-    }
-
-    info!("Migrating {table}: adding column {column}");
-    conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl};"))
-        .with_context(|| format!("Failed to add {table}.{column}"))?;
     Ok(())
 }
 

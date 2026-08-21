@@ -1,10 +1,84 @@
 use crate::codex::tier::{self, ModelTier};
-use crate::runtime::{RuntimeDb, ScheduleItem, ScheduleRun};
+use crate::runtime::RuntimeDb;
 use crate::scheduler::recurrence::ScheduleTiming;
+use crate::sqlite::add_column_if_missing;
 use anyhow::Result;
 use chrono::{Local, Utc};
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// The scheduler's two tables, applied by [`RuntimeDb::open`] alongside the
+/// daemon's own. They live here so the shape of a row is next to the queries
+/// that read it.
+const INIT_SCHEDULER_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS schedules (
+    id                 TEXT PRIMARY KEY,
+    name               TEXT NOT NULL,
+    prompt             TEXT NOT NULL,
+    schedule_type      TEXT NOT NULL,
+    one_shot_at_ms     INTEGER,
+    dtstart_local      TEXT,
+    rrule              TEXT,
+    timezone           TEXT NOT NULL,
+    task_path          TEXT NOT NULL,
+    status             TEXT NOT NULL,
+    next_run_at_ms     INTEGER,
+    created_at_ms      INTEGER NOT NULL,
+    cancelled_at_ms    INTEGER,
+    tier               TEXT
+);
+
+CREATE TABLE IF NOT EXISTS schedule_runs (
+    id                 TEXT PRIMARY KEY,
+    schedule_id        TEXT NOT NULL,
+    scheduled_for_ms   INTEGER NOT NULL,
+    started_at_ms      INTEGER,
+    finished_at_ms     INTEGER,
+    state              TEXT NOT NULL,
+    codex_thread_id    TEXT,
+    error              TEXT
+);
+"#;
+
+pub fn init_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(INIT_SCHEDULER_SCHEMA_SQL)?;
+    add_column_if_missing(conn, "schedules", "tier", "TEXT")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleItem {
+    pub id: String,
+    pub name: String,
+    pub prompt: String,
+    pub schedule_type: String, // "once" | "recurring"
+    pub one_shot_at_ms: Option<i64>,
+    pub dtstart_local: Option<String>,
+    pub rrule: Option<String>,
+    pub timezone: String,
+    pub task_path: String,
+    pub status: String, // "active" | "cancelled" | "completed"
+    pub next_run_at_ms: Option<i64>,
+    pub created_at_ms: i64,
+    pub cancelled_at_ms: Option<i64>,
+    /// Which model tier runs it: see [`crate::codex::tier`]. Nullable because
+    /// schedules created before tiers existed have none; those read back as the
+    /// routine tier.
+    pub tier: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleRun {
+    pub id: String,
+    pub schedule_id: String,
+    pub scheduled_for_ms: i64,
+    pub started_at_ms: Option<i64>,
+    pub finished_at_ms: Option<i64>,
+    pub state: String, // "pending" | "running" | "completed" | "failed"
+    pub codex_thread_id: Option<String>,
+    pub error: Option<String>,
+}
+
 
 /// Both schedule queries select the same columns in the same order; sharing the
 /// mapper is what keeps them from drifting when a column is added.

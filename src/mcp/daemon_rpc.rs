@@ -401,7 +401,7 @@ impl DaemonRpcServer {
                 let recipient = self.recipient()?;
 
                 self.secrets
-                    .request(name, reason, Utc::now().timestamp_millis())?;
+                    .request(name, Utc::now().timestamp_millis())?;
 
                 // The tool asks rather than returning instructions for the agent
                 // to relay. The wording has to be exact, the owner's reply must be
