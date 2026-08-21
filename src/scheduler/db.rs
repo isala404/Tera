@@ -80,8 +80,21 @@ pub struct ScheduleRun {
 }
 
 
-/// Both schedule queries select the same columns in the same order; sharing the
+/// Every query here selects its columns in the same order, and sharing the
 /// mapper is what keeps them from drifting when a column is added.
+fn run_from_row(row: &Row) -> rusqlite::Result<ScheduleRun> {
+    Ok(ScheduleRun {
+        id: row.get(0)?,
+        schedule_id: row.get(1)?,
+        scheduled_for_ms: row.get(2)?,
+        started_at_ms: row.get(3)?,
+        finished_at_ms: row.get(4)?,
+        state: row.get(5)?,
+        codex_thread_id: row.get(6)?,
+        error: row.get(7)?,
+    })
+}
+
 fn schedule_from_row(row: &Row) -> rusqlite::Result<ScheduleItem> {
     Ok(ScheduleItem {
         id: row.get(0)?,
@@ -279,24 +292,9 @@ impl SchedulerDb {
             "SELECT id, schedule_id, scheduled_for_ms, started_at_ms, finished_at_ms, state, codex_thread_id, error
              FROM schedule_runs ORDER BY started_at_ms DESC LIMIT ?1",
         )?;
-        let rows = stmt.query_map(params![limit as i64], |row: &Row| {
-            Ok(ScheduleRun {
-                id: row.get(0)?,
-                schedule_id: row.get(1)?,
-                scheduled_for_ms: row.get(2)?,
-                started_at_ms: row.get(3)?,
-                finished_at_ms: row.get(4)?,
-                state: row.get(5)?,
-                codex_thread_id: row.get(6)?,
-                error: row.get(7)?,
-            })
-        })?;
-
-        let mut runs = Vec::new();
-        for r in rows {
-            runs.push(r?);
-        }
-        Ok(runs)
+        let rows = stmt.query_map(params![limit as i64], run_from_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     pub fn running_runs(runtime_db: &RuntimeDb) -> Result<Vec<ScheduleRun>> {
@@ -305,20 +303,9 @@ impl SchedulerDb {
             "SELECT id, schedule_id, scheduled_for_ms, started_at_ms, finished_at_ms, state, codex_thread_id, error
              FROM schedule_runs WHERE state = 'running' ORDER BY started_at_ms ASC",
         )?;
-        let rows = stmt.query_map([], |row: &Row| {
-            Ok(ScheduleRun {
-                id: row.get(0)?,
-                schedule_id: row.get(1)?,
-                scheduled_for_ms: row.get(2)?,
-                started_at_ms: row.get(3)?,
-                finished_at_ms: row.get(4)?,
-                state: row.get(5)?,
-                codex_thread_id: row.get(6)?,
-                error: row.get(7)?,
-            })
-        })?;
-
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+        let rows = stmt.query_map([], run_from_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     pub fn update_next_run(

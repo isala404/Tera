@@ -3,6 +3,7 @@
 /// to tune it against, so it is a constant rather than configuration.
 pub const CACHE_TTL_MS: i64 = 30 * 60 * 1000;
 
+pub mod log;
 pub mod models;
 pub mod process;
 pub mod rpc;
