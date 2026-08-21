@@ -96,6 +96,62 @@ fn media_filename(msg_id: &str, mime: &str, default_ext: &str) -> String {
     format!("{msg_id}.{ext}")
 }
 
+/// Read the provider id of a WhatsApp message this message quotes.
+///
+/// WhatsApp stores reply metadata as `ContextInfo` on the message body, not in
+/// `MessageInfo`. The body can also be wrapped in an ephemeral or view-once
+/// envelope, so inspect the base message after the SDK unwraps those envelopes.
+fn quoted_message_provider_id(message: &wa::Message) -> Option<String> {
+    let message = message.get_base_message();
+
+    macro_rules! find_stanza_id {
+        ($($field:ident),+ $(,)?) => {
+            $(
+                if let Some(body) = message.$field.as_option() {
+                    if let Some(context) = body.context_info.as_option() {
+                        if context.stanza_id.is_some() {
+                            return context.stanza_id.clone();
+                        }
+                    }
+                }
+            )+
+        };
+    }
+
+    find_stanza_id!(
+        extended_text_message,
+        image_message,
+        video_message,
+        ptv_message,
+        audio_message,
+        document_message,
+        sticker_message,
+        location_message,
+        live_location_message,
+        contact_message,
+        contacts_array_message,
+        buttons_message,
+        buttons_response_message,
+        list_message,
+        list_response_message,
+        template_message,
+        template_button_reply_message,
+        interactive_message,
+        interactive_response_message,
+        poll_creation_message,
+        poll_creation_message_v2,
+        poll_creation_message_v3,
+        product_message,
+        order_message,
+        group_invite_message,
+        event_message,
+        sticker_pack_message,
+        newsletter_admin_invite_message,
+    );
+
+    None
+}
+
 pub struct WhatsAppWebTransport {
     session_db_path: PathBuf,
     client_handle: Arc<Mutex<Option<Arc<Client>>>>,
@@ -248,7 +304,7 @@ impl WhatsAppWebTransport {
                         sender,
                         text,
                         timestamp_ms,
-                        reply_to_provider_msg_id: None,
+                        reply_to_provider_msg_id: quoted_message_provider_id(&ctx.message),
                         media_attachment,
                         chat_jid: ctx.info.source.chat.to_non_ad_string(),
                         from_own_account: Self::is_own_account(&ctx),
@@ -620,5 +676,25 @@ mod tests {
 
         let widest = art.lines().map(|l| l.chars().count()).max().unwrap();
         assert!(widest <= 80, "a {}-byte payload renders {widest} columns wide", payload.len());
+    }
+
+    #[test]
+    fn test_reads_a_quoted_message_id_from_text_context() {
+        let message = wa::Message {
+            extended_text_message: MessageField::some(wa::message::ExtendedTextMessage {
+                text: Some("Why?".to_string()),
+                context_info: MessageField::some(wa::ContextInfo {
+                    stanza_id: Some("wamid.quoted".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            quoted_message_provider_id(&message).as_deref(),
+            Some("wamid.quoted")
+        );
     }
 }

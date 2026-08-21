@@ -394,7 +394,28 @@ impl TurnEngine {
     /// Render events into the turn input Codex receives: the text, then any media
     /// it can read natively.
     fn turn_inputs(&self, events: &[ConversationEvent]) -> Vec<TurnInput> {
-        let mut inputs = vec![TurnInput::Text(InputRenderer::render_burst(events))];
+        let mut reply_targets = HashMap::new();
+        for event in events {
+            let Some(reply_to) = event.reply_to_id.as_deref() else {
+                continue;
+            };
+            match self.history_db.get_event(reply_to) {
+                Ok(Some(target)) => {
+                    reply_targets.insert(target.id.clone(), target);
+                }
+                Ok(None) => {
+                    info!("Reply target {reply_to} is not available for prompt injection");
+                }
+                Err(e) => {
+                    warn!("Could not load reply target {reply_to} for prompt injection: {e:?}");
+                }
+            }
+        }
+
+        let mut inputs = vec![TurnInput::Text(InputRenderer::render_burst_with_replies(
+            events,
+            &reply_targets,
+        ))];
         inputs.extend(self.media_inputs(events));
         inputs
     }
