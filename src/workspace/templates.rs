@@ -27,59 +27,10 @@ use crate::data;
 
 pub use crate::data::GENERATED_MARKER_PREFIX;
 
-fn render(template: &str, config: &Config) -> String {
+pub fn render(template: &str, config: &Config) -> String {
     let vars = config.template_vars();
     let refs: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
     data::render(template, &refs)
-}
-
-pub fn root_agents_template(config: &Config) -> String {
-    render(data::WORKSPACE_AGENTS, config)
-}
-
-pub fn codex_bootstrap_template(config: &Config) -> String {
-    render(data::CODEX_HOME_AGENTS, config)
-}
-
-pub fn projects_agents_template(config: &Config) -> String {
-    render(data::PROJECTS_AGENTS, config)
-}
-
-pub fn tasks_agents_template(config: &Config) -> String {
-    render(data::TASKS_AGENTS, config)
-}
-
-/// The user's own overrides. Written once; theirs from then on.
-pub fn persona_template(config: &Config) -> String {
-    render(data::PERSONA, config)
-}
-
-/// Craft, read before real work rather than every session.
-pub fn working_template(config: &Config) -> String {
-    render(data::WORKING, config)
-}
-
-/// The agent's notebook about the host. Seeded once; the agent's from then on.
-pub fn system_notes_template(config: &Config) -> String {
-    render(data::SYSTEM_NOTES, config)
-}
-
-/// The reference the agent is pointed at from `AGENTS.md`. Generated, because it
-/// documents our own storage format. There is nothing here for a user to edit.
-pub fn history_schema_template(config: &Config) -> String {
-    render(data::HISTORY_SCHEMA, config)
-}
-
-/// How to read the daemon's own log. Split out of `AGENTS.md` for the same reason
-/// as the history reference: it is needed when something looks broken, not on every
-/// turn, and `AGENTS.md` is read at the start of every session.
-pub fn logs_schema_template(config: &Config) -> String {
-    render(data::LOGS_SCHEMA, config)
-}
-
-/// Bootstrap read by every run of a scheduled task (PLAN.md section 62).
-pub fn schedule_agents_template(config: &Config) -> String {
-    render(data::SCHEDULE_AGENTS, config)
 }
 
 /// `command` must be an absolute path: Codex spawns MCP servers itself and will
@@ -115,22 +66,22 @@ mod tests {
 
     fn all_generated(config: &Config) -> Vec<String> {
         vec![
-            root_agents_template(config),
-            codex_bootstrap_template(config),
-            projects_agents_template(config),
-            tasks_agents_template(config),
-            history_schema_template(config),
-            logs_schema_template(config),
-            schedule_agents_template(config),
-            working_template(config),
+            render(data::WORKSPACE_AGENTS, config),
+            render(data::CODEX_HOME_AGENTS, config),
+            render(data::PROJECTS_AGENTS, config),
+            render(data::TASKS_AGENTS, config),
+            render(data::HISTORY_SCHEMA, config),
+            render(data::LOGS_SCHEMA, config),
+            render(data::SCHEDULE_AGENTS, config),
+            render(data::WORKING, config),
         ]
     }
 
     #[test]
     fn test_templates_use_the_real_workspace_path() {
         let config = config("/tmp/my_workspace");
-        let root = root_agents_template(&config);
-        let bootstrap = codex_bootstrap_template(&config);
+        let root = render(data::WORKSPACE_AGENTS, &config);
+        let bootstrap = render(data::CODEX_HOME_AGENTS, &config);
 
         assert!(root.contains("/tmp/my_workspace/history/history.sqlite3"));
         assert!(root.contains("/tmp/my_workspace/WORKING.md"));
@@ -148,10 +99,10 @@ mod tests {
         let config = config("/ws");
         let mut named = 0;
 
-        for rendered in all_generated(&config)
-            .into_iter()
-            .chain([persona_template(&config), system_notes_template(&config)])
-        {
+        for rendered in all_generated(&config).into_iter().chain([
+            render(data::PERSONA, &config),
+            render(data::SYSTEM_NOTES, &config),
+        ]) {
             assert!(!rendered.contains("{{OWNER}}"), "unrendered owner name");
             if rendered.contains("Ada Lovelace") {
                 named += 1;
@@ -161,8 +112,8 @@ mod tests {
         // The two schema references legitimately never mention the user; the files
         // that speak about them must.
         assert!(named >= 4, "only {named} rendered files addressed the owner");
-        assert!(root_agents_template(&config).contains("Ada Lovelace"));
-        assert!(persona_template(&config).contains("Ada Lovelace"));
+        assert!(render(data::WORKSPACE_AGENTS, &config).contains("Ada Lovelace"));
+        assert!(render(data::PERSONA, &config).contains("Ada Lovelace"));
     }
 
     #[test]
@@ -182,8 +133,8 @@ mod tests {
         let cfg = generate_codex_config(&config);
 
         assert!(cfg.contains(&format!("[mcp_servers.{name}]")));
-        assert!(root_agents_template(&config).contains(&format!("`{name}` MCP server")));
-        assert!(tasks_agents_template(&config).contains(&format!("`{name}` MCP server")));
+        assert!(render(data::WORKSPACE_AGENTS, &config).contains(&format!("`{name}` MCP server")));
+        assert!(render(data::TASKS_AGENTS, &config).contains(&format!("`{name}` MCP server")));
     }
 
     /// The pinned model must be the one the daemon asks for per turn. If they
@@ -216,7 +167,7 @@ mod tests {
     #[test]
     fn test_root_instructions_teach_the_shell_path_to_history() {
         let config = config("/ws");
-        let root = root_agents_template(&config);
+        let root = render(data::WORKSPACE_AGENTS, &config);
 
         assert!(root.contains("/ws/history/jsonl/"));
         assert!(root.contains("jq"));
@@ -225,7 +176,7 @@ mod tests {
         // The log reference lives in its own file now; AGENTS.md must point at it
         // rather than silently dropping the only way the agent diagnoses itself.
         assert!(root.contains("/ws/logs/SCHEMA.md"));
-        assert!(logs_schema_template(&config).contains("tera::scheduler"));
+        assert!(render(data::LOGS_SCHEMA, &config).contains("tera::scheduler"));
         // There is no history tool any more; nothing may imply otherwise.
         assert!(!root.contains("history_search"));
     }
@@ -234,7 +185,7 @@ mod tests {
     /// keep it current. A skeleton with no prompts in it gets ignored.
     #[test]
     fn test_system_notes_are_a_fillable_skeleton_owned_by_the_agent() {
-        let notes = system_notes_template(&config("/ws"));
+        let notes = render(data::SYSTEM_NOTES, &config("/ws"));
         assert!(!notes.starts_with(GENERATED_MARKER_PREFIX));
         assert!(notes.contains("Maintenance log"));
     }
@@ -246,8 +197,8 @@ mod tests {
             assert!(generated.starts_with(GENERATED_MARKER_PREFIX), "{generated:.60}");
         }
         // Neither of these is ours to rewrite, so neither may look like it is.
-        assert!(!persona_template(&config).starts_with(GENERATED_MARKER_PREFIX));
-        assert!(!system_notes_template(&config).starts_with(GENERATED_MARKER_PREFIX));
+        assert!(!render(data::PERSONA, &config).starts_with(GENERATED_MARKER_PREFIX));
+        assert!(!render(data::SYSTEM_NOTES, &config).starts_with(GENERATED_MARKER_PREFIX));
     }
 
     /// Nothing may reach a workspace file with a placeholder still in it.
@@ -255,8 +206,8 @@ mod tests {
     fn test_rendered_instructions_have_no_leftover_placeholders() {
         let config = config("/ws");
         for rendered in all_generated(&config).into_iter().chain([
-            persona_template(&config),
-            system_notes_template(&config),
+            render(data::PERSONA, &config),
+            render(data::SYSTEM_NOTES, &config),
             generate_codex_config(&config),
         ]) {
             assert!(!rendered.contains("{{"), "{rendered:.200}");

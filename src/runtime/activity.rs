@@ -2,7 +2,7 @@
 //!
 //! Memory maintenance has the lowest priority in the system: it may only run
 //! when nothing else is, and must get out of the way the moment real work
-//! arrives (PLAN.md section 41). That needs one shared answer to "is anything
+//! arrives. That needs one shared answer to "is anything
 //! active", which conversation turns and scheduled runs both contribute to.
 
 use std::sync::atomic::{AtomicUsize, Ordering};

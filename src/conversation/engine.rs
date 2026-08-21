@@ -7,10 +7,10 @@ use crate::conversation::session::ConversationSession;
 use crate::conversation::typing::TypingGuard;
 use crate::history::assets::AssetStorage;
 use crate::conversation::record_assistant_message;
-use crate::history::db::{Attachment, ConversationEvent, HistoryDb, ProviderRef};
+use crate::history::db::{Attachment, ConversationEvent, EventKind, HistoryDb, ProviderRef};
 use crate::runtime::{ActivityTracker, RuntimeDb};
 use crate::secrets::{Capture, SecretStore};
-use crate::transport::{InboundMessage, OwnerPolicy, Transport, Verdict};
+use crate::transport::{InboundMessage, MessageRef, OwnerPolicy, Transport, Verdict};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,12 +20,12 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 /// How long to wait for the user to stop typing before starting a turn, so a
-/// three-message burst becomes one turn rather than three (PLAN.md section 13).
+/// three-message burst becomes one turn rather than three.
 const BURST_QUIET_PERIOD: Duration = Duration::from_millis(2500);
 
 /// Ceiling on the total wait from the first message of a burst. The quiet period
 /// restarts on each new message, so without this someone typing steadily is never
-/// answered at all (PLAN.md section 13.1).
+/// answered at all.
 const MAX_BURST_WAIT: Duration = Duration::from_secs(8);
 
 /// Bursts waiting out their quiet period, and the logical turn currently being
@@ -43,7 +43,7 @@ struct ConversationState {
 /// What to do with a message that just arrived.
 enum Route {
     /// A turn is already running: hand the message to it as it arrives, with no
-    /// debounce (PLAN.md section 13.2).
+    /// debounce.
     Steer,
     /// A burst is already collecting for this sender; its timer will fire.
     JoinBurst,
@@ -123,14 +123,14 @@ impl TurnEngine {
         // 2. Decide where this message goes before recording it, because the
         //    answer determines the logical turn id it is stamped with. Without
         //    that, user messages had no `turn` in history at all and a past
-        //    exchange could not be reconstructed (PLAN.md section 13.3).
+        //    exchange could not be reconstructed.
         let (route, logical_turn) = self.route(&sender).await;
 
         let conv_ev = ConversationEvent {
             seq: None,
             id: event_id.clone(),
             occurred_at_ms: msg.timestamp_ms,
-            kind: "message".to_string(),
+            kind: EventKind::Message,
             actor: "user".to_string(),
             text: msg.text.clone(),
             reply_to_id: self.resolve_reply_target(msg.reply_to_provider_msg_id.as_deref()),
@@ -364,7 +364,7 @@ impl TurnEngine {
     }
 
     /// Write inbound media into the asset store and describe it as an
-    /// attachment row. Originals are kept byte-for-byte (PLAN.md section 19).
+    /// attachment row. Originals are kept byte-for-byte.
     fn persist_media(&self, msg: &InboundMessage, event_id: &str) -> Result<Vec<Attachment>> {
         let Some(media) = &msg.media_attachment else {
             return Ok(vec![]);
@@ -394,7 +394,28 @@ impl TurnEngine {
     /// Render events into the turn input Codex receives: the text, then any media
     /// it can read natively.
     fn turn_inputs(&self, events: &[ConversationEvent]) -> Vec<TurnInput> {
-        let mut inputs = vec![TurnInput::Text(InputRenderer::render_burst(events))];
+        let mut reply_targets = HashMap::new();
+        for event in events {
+            let Some(reply_to) = event.reply_to_id.as_deref() else {
+                continue;
+            };
+            match self.history_db.get_event(reply_to) {
+                Ok(Some(target)) => {
+                    reply_targets.insert(target.id.clone(), target);
+                }
+                Ok(None) => {
+                    info!("Reply target {reply_to} is not available for prompt injection");
+                }
+                Err(e) => {
+                    warn!("Could not load reply target {reply_to} for prompt injection: {e:?}");
+                }
+            }
+        }
+
+        let mut inputs = vec![TurnInput::Text(InputRenderer::render_burst_with_replies(
+            events,
+            &reply_targets,
+        ))];
         inputs.extend(self.media_inputs(events));
         inputs
     }
@@ -490,7 +511,7 @@ impl TurnEngine {
             // The agent is instructed to reply through the send_message MCP tool, and
             // usually does. Sending the final agent text unconditionally would then
             // deliver every answer twice. Only fall back when the turn produced no
-            // user-visible message of its own (PLAN.md section 54.1).
+            // user-visible message of its own.
             if self.session.sends_since(sends_before) > 0 {
                 info!("Turn replied via send_message; skipping final-text fallback");
                 return Ok(());
@@ -506,9 +527,18 @@ impl TurnEngine {
                 reply_text
             };
 
+            // The fallback answers the burst, so it quotes the message that
+            // closed it, which is the one the owner is still looking at.
+            let reply_target = burst.events.last().map(|last| MessageRef {
+                provider_msg_id: last_provider_msg_id.to_string(),
+                chat_jid: chat_jid.clone(),
+                from_me: false,
+                text: last.text.clone(),
+            });
+
             let outbound_msg_id = self
                 .transport
-                .send_text(sender, &reply_text, Some(last_provider_msg_id))
+                .send_text(sender, &reply_text, reply_target.as_ref())
                 .await?;
 
             record_assistant_message(

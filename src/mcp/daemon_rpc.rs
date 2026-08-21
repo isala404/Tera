@@ -1,12 +1,12 @@
 use crate::codex::tier;
 use crate::config::Config;
 use crate::conversation::ConversationSession;
-use crate::history::db::{ConversationEvent, HistoryDb, ProviderRef};
+use crate::history::db::{ConversationEvent, EventKind, HistoryDb, ProviderRef};
 use crate::runtime::RuntimeDb;
 use crate::scheduler::db::SchedulerDb;
 use crate::scheduler::recurrence::{self as recurrence, ScheduleTiming};
 use crate::secrets::SecretStore;
-use crate::transport::{ReactionTarget, Transport};
+use crate::transport::{MessageRef, Transport};
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -189,6 +189,32 @@ impl DaemonRpcServer {
         })
     }
 
+    /// Point at a message the agent named by its own event id.
+    ///
+    /// The agent knows events; the wire knows provider ids, chats and sender
+    /// sides. Both replying and reacting need that translation, and WhatsApp
+    /// drops a message addressed with the wrong chat or sender side instead of
+    /// reporting it, so neither may guess.
+    fn message_ref(&self, event_id: &str, recipient: &str) -> Result<Option<MessageRef>> {
+        let Some(stored) = self
+            .history_db
+            .lookup_provider_ref_by_event_id(event_id, "whatsapp")?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(MessageRef {
+            provider_msg_id: stored.provider_msg_id,
+            chat_jid: if stored.chat_jid.is_empty() {
+                recipient.to_string()
+            } else {
+                stored.chat_jid
+            },
+            from_me: stored.from_me,
+            text: self.history_db.get_event(event_id)?.and_then(|e| e.text),
+        }))
+    }
+
     async fn execute_tool(&self, name: &str, args: &Value) -> Result<Value> {
         match name {
             "send_message" => {
@@ -210,21 +236,14 @@ impl DaemonRpcServer {
                     return Err(anyhow!("send_message requires at least one of text, image_path, video_path, audio_path, or file_path"));
                 }
 
-                // Replying needs the provider's own id for the target, which is
-                // what the provider ref table exists to translate back to.
                 let reply_to = args["reply_to"].as_str();
-                let reply_to_provider_id = match reply_to {
-                    Some(event_id) => Some(
-                        self.history_db
-                            .lookup_provider_ref_by_event_id(event_id, "whatsapp")?
-                            .ok_or_else(|| {
-                                anyhow!("no WhatsApp message is recorded for event {event_id}; cannot reply to it")
-                            })?
-                            .provider_msg_id,
-                    ),
+                let reply_target = match reply_to {
+                    Some(event_id) => Some(self.message_ref(event_id, &recipient)?.ok_or_else(|| {
+                        anyhow!("no WhatsApp message is recorded for event {event_id}; cannot reply to it")
+                    })?),
                     None => None,
                 };
-                let reply_to_provider_id = reply_to_provider_id.as_deref();
+                let reply_target = reply_target.as_ref();
 
                 let provider_msg_id = if let Some((media_type, media_path_str)) = attachment {
                     let path = resolve_media_path(&self.config.workspace_dir, media_path_str)?;
@@ -234,7 +253,7 @@ impl DaemonRpcServer {
                             media_type,
                             &path,
                             outgoing.as_deref(),
-                            reply_to_provider_id,
+                            reply_target,
                         )
                         .await?
                 } else {
@@ -242,17 +261,16 @@ impl DaemonRpcServer {
                         .send_text(
                             &recipient,
                             outgoing.as_deref().unwrap_or_default(),
-                            reply_to_provider_id,
+                            reply_target,
                         )
                         .await?
                 };
 
-                // Save assistant event to history
                 let event = ConversationEvent {
                     seq: None,
                     id: format!("m_{}", Uuid::new_v4().simple()),
                     occurred_at_ms: Utc::now().timestamp_millis(),
-                    kind: "message".to_string(),
+                    kind: EventKind::Message,
                     actor: "assistant".to_string(),
                     text: authored,
                     reply_to_id: reply_to.map(|id| id.to_string()),
@@ -286,31 +304,12 @@ impl DaemonRpcServer {
 
             "react" => {
                 let recipient = self.recipient()?;
-                let msg_id = args["message_id"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("Missing message_id parameter"))?;
-                let emoji = args["emoji"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("Missing emoji parameter"))?;
+                let msg_id = require_str(args, "message_id")?;
+                let emoji = require_str(args, "emoji")?;
 
-                // Reacting needs the chat and sender-side of the target, not just
-                // its id; without them WhatsApp accepts the reaction and drops it.
-                let stored = self
-                    .history_db
-                    .lookup_provider_ref_by_event_id(msg_id, "whatsapp")?
-                    .ok_or_else(|| {
-                        anyhow!("no WhatsApp message is recorded for event {msg_id}; cannot react to it")
-                    })?;
-
-                let target = ReactionTarget {
-                    provider_msg_id: stored.provider_msg_id.clone(),
-                    chat_jid: if stored.chat_jid.is_empty() {
-                        recipient.clone()
-                    } else {
-                        stored.chat_jid.clone()
-                    },
-                    from_me: stored.from_me,
-                };
+                let target = self.message_ref(msg_id, &recipient)?.ok_or_else(|| {
+                    anyhow!("no WhatsApp message is recorded for event {msg_id}; cannot react to it")
+                })?;
 
                 self.transport
                     .send_reaction(&recipient, &target, emoji)
@@ -320,7 +319,7 @@ impl DaemonRpcServer {
                     seq: None,
                     id: format!("r_{}", Uuid::new_v4().simple()),
                     occurred_at_ms: Utc::now().timestamp_millis(),
-                    kind: "reaction".to_string(),
+                    kind: EventKind::Reaction,
                     actor: "assistant".to_string(),
                     text: None,
                     reply_to_id: None,
@@ -335,12 +334,8 @@ impl DaemonRpcServer {
             }
 
             "schedule" => {
-                let sched_name = args["name"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("Missing schedule name"))?;
-                let prompt = args["prompt"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("Missing schedule prompt"))?;
+                let sched_name = require_str(args, "name")?;
+                let prompt = require_str(args, "prompt")?;
 
                 let timing = ScheduleTiming::parse(&args["timing"], Utc::now().timestamp_millis())?;
 
@@ -399,24 +394,18 @@ impl DaemonRpcServer {
             }
 
             "cancel_schedule" => {
-                let id = args["schedule_id"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("Missing schedule_id"))?;
+                let id = require_str(args, "schedule_id")?;
                 let success = SchedulerDb::cancel_schedule(&self.runtime_db, id)?;
                 Ok(json!({ "cancelled": success, "schedule_id": id }))
             }
 
             "request_secret" => {
-                let name = args["name"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("Missing secret name"))?;
-                let reason = args["reason"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("Missing reason"))?;
+                let name = require_str(args, "name")?;
+                let reason = require_str(args, "reason")?;
                 let recipient = self.recipient()?;
 
                 self.secrets
-                    .request(name, reason, Utc::now().timestamp_millis())?;
+                    .request(name, Utc::now().timestamp_millis())?;
 
                 // The tool asks rather than returning instructions for the agent
                 // to relay. The wording has to be exact, the owner's reply must be
@@ -440,11 +429,18 @@ impl DaemonRpcServer {
 
             // Reading history is deliberately NOT a tool. The agent has a shell,
             // jq, sqlite3 and Python, and the projection is designed for them
-            // (PLAN.md section 18). A tool here would only be a worse query
+            //. A tool here would only be a worse query
             // language than the ones it already knows.
             _ => Err(anyhow!("Unknown MCP tool name: '{}'", name)),
         }
     }
+}
+
+/// Reads a required string argument, erroring with a uniform message if it's
+/// absent. Only for arguments that hard-error on absence; genuinely optional
+/// ones stay as direct `.as_str()` reads.
+fn require_str<'a>(args: &'a Value, field: &str) -> Result<&'a str> {
+    args[field].as_str().ok_or_else(|| anyhow!("Missing {field}"))
 }
 
 fn attachment_argument(args: &Value) -> Result<Option<(&'static str, &str)>> {
@@ -594,7 +590,7 @@ mod tests {
                 seq: None,
                 id: String::new(),
                 occurred_at_ms: 0,
-                kind: "message".to_string(),
+                kind: EventKind::Message,
                 actor: "user".to_string(),
                 text: Some("which one?".to_string()),
                 reply_to_id: None,

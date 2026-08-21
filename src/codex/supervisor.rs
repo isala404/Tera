@@ -8,8 +8,7 @@
 //! * the main conversation lives on one long-lived thread, persisted and resumed
 //!   across restarts;
 //! * each scheduled run gets a fresh thread rooted in its own task directory, so
-//!   background work never pollutes the conversation the user is having
-//!   (PLAN.md sections 27 and 29).
+//!   background work never pollutes the conversation the user is having.
 
 use crate::codex::process::{ThreadOptions, ThreadOrigin, TurnInput};
 use crate::codex::thread_router::{ThreadDecision, ThreadRouter};
@@ -65,7 +64,7 @@ impl CodexSupervisor {
     /// `memories/`, `history/`, `projects/` and `tasks/` resolve.
     ///
     /// A manager whose process has exited is discarded and replaced rather than
-    /// handed out again, the conversation outlives the process (PLAN.md 53).
+    /// handed out again, the conversation outlives the process.
     pub async fn ensure(&self) -> Result<Arc<CodexProcessManager>> {
         let mut lock = self.mgr.lock().await;
 
@@ -93,7 +92,7 @@ impl CodexSupervisor {
             .unwrap_or(now_ms);
         let estimated_cache_warm_until_ms = existing
             .map(|p| p.estimated_cache_warm_until_ms)
-            .unwrap_or(now_ms + self.config.cache_ttl_ms());
+            .unwrap_or(now_ms + crate::codex::CACHE_TTL_MS);
 
         self.runtime_db.save_main_thread(&MainThreadState {
             thread_id: info.id.clone(),
@@ -127,7 +126,7 @@ impl CodexSupervisor {
     ///
     /// `Ok(false)` means there was nothing to steer, the turn finished in the
     /// gap between the check and the call, and the caller should start a new
-    /// turn instead. No input may be lost either way (PLAN.md 13.2).
+    /// turn instead. No input may be lost either way.
     pub async fn steer_main_turn(&self, inputs: &[TurnInput]) -> Result<bool> {
         let mgr = {
             let lock = self.mgr.lock().await;
@@ -154,14 +153,14 @@ impl CodexSupervisor {
     ///
     /// Before starting, decide whether the existing thread is still the right
     /// place: a thread whose prompt cache has gone cold, or one started under a
-    /// different model, is rotated out for a fresh one (PLAN.md 12.3).
+    /// different model, is rotated out for a fresh one.
     pub async fn run_main_turn(&self, inputs: &[TurnInput]) -> Result<String> {
         let mgr = self.ensure().await?;
         let started_fresh = self.rotate_main_thread_if_stale(&mgr).await?;
 
         // A thread that starts empty does not know who it is talking to. It is
         // pointed at the workspace files rather than handed a summary of them
-        // (PLAN.md 12.4), then given the last few messages verbatim so the
+        //, then given the last few messages verbatim so the
         // rotation does not read as amnesia to the person on the other end.
         if started_fresh {
             let mut with_bootstrap =
@@ -190,7 +189,7 @@ impl CodexSupervisor {
             .map(|s| s.model_id)
             .unwrap_or_default();
 
-        match ThreadRouter::decide(&self.config, &self.runtime_db, &model_id)? {
+        match ThreadRouter::decide(&self.runtime_db, &model_id)? {
             ThreadDecision::Continue { thread_id } => {
                 if live_thread.as_deref() != Some(thread_id.as_str()) {
                     // Persisted but not loaded in this process yet. If the resume
@@ -212,7 +211,7 @@ impl CodexSupervisor {
                     turn_id: None,
                     started_at_ms: now_ms,
                     last_activity_at_ms: now_ms,
-                    estimated_cache_warm_until_ms: now_ms + self.config.cache_ttl_ms(),
+                    estimated_cache_warm_until_ms: now_ms + crate::codex::CACHE_TTL_MS,
                     model_id: info.model,
                 })?;
                 Ok(true)
@@ -225,7 +224,7 @@ impl CodexSupervisor {
         if let Ok(Some(mut state)) = self.runtime_db.get_main_thread() {
             let now_ms = Utc::now().timestamp_millis();
             state.last_activity_at_ms = now_ms;
-            state.estimated_cache_warm_until_ms = now_ms + self.config.cache_ttl_ms();
+            state.estimated_cache_warm_until_ms = now_ms + crate::codex::CACHE_TTL_MS;
             if let Err(e) = self.runtime_db.save_main_thread(&state) {
                 warn!("Could not update main thread activity: {e}");
             }
@@ -270,7 +269,7 @@ impl CodexSupervisor {
         self.run_turn_on_thread(&thread_id, prompt, tier).await
     }
 
-    /// Ask the app-server which models it offers (PLAN.md section 11).
+    /// Ask the app-server which models it offers.
     pub async fn list_models(&self) -> Result<serde_json::Value> {
         self.ensure().await?.list_models().await
     }

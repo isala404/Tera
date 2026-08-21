@@ -21,9 +21,10 @@ use crate::conversation::record_assistant_message;
 use crate::conversation::renderer::InputRenderer;
 use crate::data;
 use crate::history::db::HistoryDb;
-use crate::runtime::phoenix::CrashMark;
+use crate::runtime::crash_mark::CrashMark;
 use crate::runtime::{ActivityTracker, ConversationTurn, RuntimeDb};
-use crate::transport::Transport;
+use crate::transport::{MessageRef, Transport};
+use crate::update::UpdateNotice;
 use anyhow::Result;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -74,9 +75,13 @@ impl Phoenix {
     /// Nothing is written until the owner has actually been told, so a failure
     /// to reach them — the transport is usually still connecting at this point —
     /// leaves the whole job untouched and safe to retry.
-    pub async fn run(&self, crashed: Option<CrashMark>) -> Result<()> {
+    pub async fn run(
+        &self,
+        crashed: Option<CrashMark>,
+        update: Option<UpdateNotice>,
+    ) -> Result<()> {
         let pending = self.runtime_db.unfinished_turns()?;
-        if crashed.is_none() && pending.is_empty() {
+        if crashed.is_none() && pending.is_empty() && update.is_none() {
             return Ok(());
         }
 
@@ -92,7 +97,13 @@ impl Phoenix {
             .into_iter()
             .partition(|turn| !over_budget && turn.attempts < MAX_TURN_ATTEMPTS);
 
-        self.report(&chat_jid, crashed.as_ref(), &recoverable, &abandoned)
+        self.report(
+            &chat_jid,
+            crashed.as_ref(),
+            update.as_ref(),
+            &recoverable,
+            &abandoned,
+        )
             .await?;
 
         for turn in recoverable.iter().chain(&abandoned) {
@@ -105,6 +116,10 @@ impl Phoenix {
 
         if over_budget {
             warn!("Phoenix is over its crash budget; reporting only, no repair attempted");
+            return Ok(());
+        }
+
+        if crashed.is_none() && recoverable.is_empty() {
             return Ok(());
         }
 
@@ -126,13 +141,19 @@ impl Phoenix {
         &self,
         chat_jid: &str,
         crashed: Option<&CrashMark>,
+        update: Option<&UpdateNotice>,
         recoverable: &[ConversationTurn],
         abandoned: &[ConversationTurn],
     ) -> Result<()> {
-        let mut lines = vec![match crashed {
-            Some(mark) => format!("I {}. Restarted now.", mark.describe()),
-            None => "I restarted while I was still working on something.".to_string(),
-        }];
+        let mut lines = Vec::new();
+        if let Some(mark) = crashed {
+            lines.push(format!("I {}. Restarted now.", mark.describe()));
+        } else if !recoverable.is_empty() || !abandoned.is_empty() {
+            lines.push("I restarted while I was still working on something.".to_string());
+        }
+        if let Some(update) = update {
+            lines.push(update.message());
+        }
 
         if !recoverable.is_empty() {
             lines.push("You were waiting on me. Picking that back up.".to_string());
@@ -142,19 +163,26 @@ impl Phoenix {
                 "One thing I can't retry: it has already crashed me twice, so I'm leaving it. Ask again if you still want it.".to_string(),
             );
         }
-        if recoverable.is_empty() && abandoned.is_empty() {
+        if crashed.is_some() && recoverable.is_empty() && abandoned.is_empty() {
             lines.push("Nothing of yours was in flight. Checking myself over.".to_string());
         }
 
         let text = lines.join(" ");
+        // Quote what the owner was waiting on, so the report lands against the
+        // request it is about rather than at the bottom of a cold thread.
         let reply_to = recoverable
             .first()
             .or(abandoned.first())
-            .map(|t| t.last_provider_msg_id.clone());
+            .map(|t| MessageRef {
+                provider_msg_id: t.last_provider_msg_id.clone(),
+                chat_jid: chat_jid.to_string(),
+                from_me: false,
+                text: self.quoted_text(&t.last_provider_msg_id),
+            });
 
         let provider_msg_id = self
             .transport
-            .send_text(chat_jid, &text, reply_to.as_deref())
+            .send_text(chat_jid, &text, reply_to.as_ref())
             .await?;
         record_assistant_message(
             &self.history_db,
@@ -166,6 +194,17 @@ impl Phoenix {
         )?;
         info!("Phoenix reported to {chat_jid}: {text}");
         Ok(())
+    }
+
+    /// The text of a message we only know by its wire id. Best effort: a quote
+    /// that renders empty is better than a report that never goes out.
+    fn quoted_text(&self, provider_msg_id: &str) -> Option<String> {
+        self.history_db
+            .event_id_for_provider_ref("whatsapp", provider_msg_id)
+            .ok()
+            .flatten()
+            .and_then(|event_id| self.history_db.get_event(&event_id).ok().flatten())
+            .and_then(|event| event.text)
     }
 
     /// One isolated thread, rooted in the workspace, that finishes what was

@@ -9,5 +9,8 @@ pub mod observability;
 pub mod runtime;
 pub mod scheduler;
 pub mod secrets;
+pub mod sqlite;
 pub mod transport;
+pub mod update;
+pub mod version;
 pub mod workspace;

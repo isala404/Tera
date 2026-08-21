@@ -3,7 +3,7 @@
 //! SQLite is the only authoritative copy of the conversation, and memory is
 //! derived from it, losing it loses everything the assistant knows. Backups go
 //! through SQLite rather than copying the file, because a plain copy of a live
-//! WAL database can be torn (PLAN.md section 73).
+//! WAL database can be torn.
 
 use crate::config::Config;
 use anyhow::{anyhow, Context, Result};
@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use tracing::info;
 
 /// Kept alongside history so a backup travels with the workspace.
-pub fn backup_dir(config: &Config) -> PathBuf {
+fn backup_dir(config: &Config) -> PathBuf {
     config.workspace_dir.join("history").join("backups")
 }
 
@@ -56,7 +56,6 @@ pub fn timestamp_now() -> String {
     Local::now().format("%Y%m%dT%H%M%S").to_string()
 }
 
-/// What an integrity check found.
 #[derive(Debug, Default)]
 pub struct IntegrityReport {
     pub sqlite_ok: bool,
@@ -75,7 +74,6 @@ impl IntegrityReport {
     }
 }
 
-/// Check canonical history against itself and against the projection.
 pub fn check_integrity(config: &Config, db: &crate::history::db::HistoryDb) -> Result<IntegrityReport> {
     let conn = Connection::open(config.history_db_path())?;
     let result: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
@@ -109,7 +107,7 @@ pub fn check_integrity(config: &Config, db: &crate::history::db::HistoryDb) -> R
 /// Remove staging directories left behind by an interrupted run.
 ///
 /// Staging is always rebuilt from scratch before use, so anything found here at
-/// boot is debris from a crash, and it is debris that takes disk (PLAN.md 96.3).
+/// boot is debris from a crash, and it is debris that takes disk.
 pub fn clear_stale_staging(config: &Config) -> Result<Vec<PathBuf>> {
     let mut removed = Vec::new();
     for root in [config.staging_dir(), config.runtime_dir().join("tmp")] {
@@ -155,7 +153,7 @@ pub fn verify_memories_link(config: &Config) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::db::{Attachment, ConversationEvent, HistoryDb};
+    use crate::history::db::{Attachment, ConversationEvent, EventKind, HistoryDb};
     use crate::workspace::init::WorkspaceInit;
 
     fn workspace() -> (tempfile::TempDir, Config) {
@@ -173,7 +171,7 @@ mod tests {
             seq: None,
             id: "m_1".to_string(),
             occurred_at_ms: 1_786_962_664_000,
-            kind: "message".to_string(),
+            kind: EventKind::Message,
             actor: "user".to_string(),
             text: Some("remember this".to_string()),
             reply_to_id: None,
@@ -202,7 +200,7 @@ mod tests {
             seq: None,
             id: "m_2".to_string(),
             occurred_at_ms: 1_786_962_664_000,
-            kind: "message".to_string(),
+            kind: EventKind::Message,
             actor: "user".to_string(),
             text: None,
             reply_to_id: None,
@@ -236,7 +234,7 @@ mod tests {
             seq: None,
             id: "m_3".to_string(),
             occurred_at_ms: 1_786_962_664_000,
-            kind: "message".to_string(),
+            kind: EventKind::Message,
             actor: "assistant".to_string(),
             text: Some("fine".to_string()),
             reply_to_id: None,

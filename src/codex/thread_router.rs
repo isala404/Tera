@@ -1,4 +1,4 @@
-//! Thread-selection policy for the main conversation (PLAN.md section 12.3).
+//! Thread-selection policy for the main conversation.
 //!
 //! This decides *whether* to keep talking on the current thread. It deliberately
 //! does not mint thread ids: only the app-server can, and an earlier version that
@@ -23,11 +23,7 @@ pub enum ThreadDecision {
 pub struct ThreadRouter;
 
 impl ThreadRouter {
-    pub fn decide(
-        config: &Config,
-        runtime_db: &RuntimeDb,
-        current_model_id: &str,
-    ) -> Result<ThreadDecision> {
+    pub fn decide(runtime_db: &RuntimeDb, current_model_id: &str) -> Result<ThreadDecision> {
         Ok(Self::decide_at(
             runtime_db.get_main_thread()?.as_ref().map(|s| PersistedThread {
                 thread_id: s.thread_id.clone(),
@@ -36,7 +32,6 @@ impl ThreadRouter {
             }),
             current_model_id,
             Utc::now().timestamp_millis(),
-            config.cache_ttl_ms(),
         ))
     }
 
@@ -45,7 +40,6 @@ impl ThreadRouter {
         persisted: Option<PersistedThread>,
         current_model_id: &str,
         now_ms: i64,
-        _ttl_ms: i64,
     ) -> ThreadDecision {
         let Some(state) = persisted else {
             return ThreadDecision::Rotate {
@@ -79,8 +73,8 @@ impl ThreadRouter {
     /// Pointers handed to a thread that starts with nothing. The caller adds
     /// the recent conversation itself.
     ///
-    /// Kept deliberately small. PLAN.md section 12.4 is explicit that a fresh
-    /// thread should not receive a synthesized context blob. `AGENTS.md` tells
+    /// Kept deliberately small. A fresh thread gets pointers, never a
+    /// synthesized context blob. `AGENTS.md` tells
     /// the agent to read `HORIZON.md` and `INDEX.md` itself, and it reads them
     /// better than we can summarize them.
     pub fn build_bootstrap_context(config: &Config) -> String {
@@ -124,7 +118,7 @@ struct PersistedThread {
 mod tests {
     use super::*;
 
-    const TTL: i64 = 30 * 60 * 1000;
+    use crate::codex::CACHE_TTL_MS as TTL;
     const NOW: i64 = 1_786_962_664_000;
 
     fn persisted(warm_until_ms: i64, model: &str) -> Option<PersistedThread> {
@@ -138,7 +132,7 @@ mod tests {
     #[test]
     fn test_first_ever_turn_starts_a_thread() {
         assert!(matches!(
-            ThreadRouter::decide_at(None, "gpt-5.6-sol", NOW, TTL),
+            ThreadRouter::decide_at(None, "gpt-5.6-sol", NOW),
             ThreadDecision::Rotate { .. }
         ));
     }
@@ -146,7 +140,7 @@ mod tests {
     #[test]
     fn test_warm_persisted_thread_is_continued() {
         let decision =
-            ThreadRouter::decide_at(persisted(NOW + TTL, "gpt-5.6-sol"), "gpt-5.6-sol", NOW, TTL);
+            ThreadRouter::decide_at(persisted(NOW + TTL, "gpt-5.6-sol"), "gpt-5.6-sol", NOW);
         assert_eq!(
             decision,
             ThreadDecision::Continue {
@@ -161,14 +155,14 @@ mod tests {
     #[test]
     fn test_cold_thread_is_rotated() {
         let decision =
-            ThreadRouter::decide_at(persisted(NOW - 1, "gpt-5.6-sol"), "gpt-5.6-sol", NOW, TTL);
+            ThreadRouter::decide_at(persisted(NOW - 1, "gpt-5.6-sol"), "gpt-5.6-sol", NOW);
         assert!(matches!(decision, ThreadDecision::Rotate { .. }));
     }
 
     #[test]
     fn test_model_change_rotates_even_when_warm() {
         let decision =
-            ThreadRouter::decide_at(persisted(NOW + TTL, "gpt-5.6-sol"), "gpt-6", NOW, TTL);
+            ThreadRouter::decide_at(persisted(NOW + TTL, "gpt-5.6-sol"), "gpt-6", NOW);
         match decision {
             ThreadDecision::Rotate { reason } => assert!(reason.contains("gpt-6"), "{reason}"),
             other => panic!("expected rotation, got {other:?}"),
@@ -179,7 +173,7 @@ mod tests {
     #[test]
     fn test_unknown_model_does_not_force_rotation() {
         let decision =
-            ThreadRouter::decide_at(persisted(NOW + TTL, "gpt-5.6-sol"), "", NOW, TTL);
+            ThreadRouter::decide_at(persisted(NOW + TTL, "gpt-5.6-sol"), "", NOW);
         assert!(matches!(decision, ThreadDecision::Continue { .. }));
     }
 }

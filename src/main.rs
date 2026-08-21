@@ -8,14 +8,13 @@ use tera::scheduler::db::SchedulerDb;
 use tera::scheduler::recurrence;
 use tera::secrets::SecretStore;
 use tera::mcp::{DaemonRpcServer, StdioMcpProxy};
-use tera::memory::optimizer::OptimizerOutcome;
-use tera::memory::{MaintenanceRunner, MemoryOptimizer, MemoryRebuilder};
+use tera::memory::{self, MaintenanceRunner, Outcome};
 use tera::runtime::{self, ActivityTracker, DaemonLock, RuntimeDb};
 use tera::scheduler::SchedulerRunner;
-use tera::transport::{InboundEvent, MockTransport, Transport, WhatsAppWebTransport};
+use tera::transport::{MockTransport, Transport, WhatsAppWebTransport};
 use tera::workspace::WorkspaceInit;
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -26,26 +25,51 @@ const PHOENIX_REPORT_ATTEMPTS: u32 = 10;
 use tracing::{error, info, warn};
 
 #[derive(Parser)]
-#[command(name = "tera")]
+#[command(
+    name = "tera",
+    version = env!("CARGO_PKG_VERSION"),
+    long_version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("TERA_GIT_SHA"), ", built ", env!("TERA_BUILD_TIME"), ")")
+)]
 #[command(about = "Persistent Personal Helper Daemon", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
 }
 
+#[derive(clap::Args, Debug, Clone)]
+struct WorkspaceArg {
+    #[arg(long, default_value = "/workspace")]
+    workspace: PathBuf,
+}
+
 #[derive(Subcommand)]
 enum Commands {
+    /// Print Tera and Codex version details
+    Version {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Update Tera and Codex, then restart the daemon safely
+    Update {
+        #[command(flatten)]
+        workspace: WorkspaceArg,
+        #[arg(long, value_enum, default_value_t = UpdateComponent::All)]
+        component: UpdateComponent,
+        /// Reinstall the current Tera release
+        #[arg(long)]
+        force: bool,
+    },
     /// Start the long-running assistant daemon
     Daemon {
-        #[arg(long, default_value = "/workspace")]
-        workspace: PathBuf,
+        #[command(flatten)]
+        workspace: WorkspaceArg,
         #[arg(long)]
         mock_transport: bool,
     },
     /// Idempotent workspace initialization
     Init {
-        #[arg(long, default_value = "/workspace")]
-        workspace: PathBuf,
+        #[command(flatten)]
+        workspace: WorkspaceArg,
     },
     /// Stdio MCP server proxy for Codex App Server
     Mcp {
@@ -54,8 +78,8 @@ enum Commands {
     },
     /// Print system health and state status
     Status {
-        #[arg(long, default_value = "/workspace")]
-        workspace: PathBuf,
+        #[command(flatten)]
+        workspace: WorkspaceArg,
     },
     /// History tools
     History {
@@ -72,24 +96,48 @@ enum Commands {
         #[command(subcommand)]
         sub: SecretSubcommands,
     },
+    #[command(name = "__signal-update", hide = true)]
+    InternalSignalUpdate {
+        #[arg(long)]
+        lock: PathBuf,
+        #[arg(long)]
+        pid: u32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum UpdateComponent {
+    All,
+    Tera,
+    Codex,
+}
+
+impl From<UpdateComponent> for tera::update::Component {
+    fn from(value: UpdateComponent) -> Self {
+        match value {
+            UpdateComponent::All => Self::All,
+            UpdateComponent::Tera => Self::Tera,
+            UpdateComponent::Codex => Self::Codex,
+        }
+    }
 }
 
 #[derive(Subcommand)]
 enum HistorySubcommands {
     /// Rebuild JSONL projection from canonical SQLite history
     RebuildJsonl {
-        #[arg(long, default_value = "/workspace")]
-        workspace: PathBuf,
+        #[command(flatten)]
+        workspace: WorkspaceArg,
     },
     /// Snapshot canonical history into history/backups/
     Backup {
-        #[arg(long, default_value = "/workspace")]
-        workspace: PathBuf,
+        #[command(flatten)]
+        workspace: WorkspaceArg,
     },
     /// Check canonical history, its projection, and its assets
     Check {
-        #[arg(long, default_value = "/workspace")]
-        workspace: PathBuf,
+        #[command(flatten)]
+        workspace: WorkspaceArg,
     },
 }
 
@@ -97,23 +145,23 @@ enum HistorySubcommands {
 enum MemorySubcommands {
     /// Trigger full memory regeneration from SQLite history
     Rebuild {
-        #[arg(long, default_value = "/workspace")]
-        workspace: PathBuf,
+        #[command(flatten)]
+        workspace: WorkspaceArg,
     },
     /// Trigger nightly memory optimization pass
     Optimize {
-        #[arg(long, default_value = "/workspace")]
-        workspace: PathBuf,
+        #[command(flatten)]
+        workspace: WorkspaceArg,
     },
     /// List memory generations and which one is active
     Status {
-        #[arg(long, default_value = "/workspace")]
-        workspace: PathBuf,
+        #[command(flatten)]
+        workspace: WorkspaceArg,
     },
     /// Point active memory back at an earlier generation
     Rollback {
-        #[arg(long, default_value = "/workspace")]
-        workspace: PathBuf,
+        #[command(flatten)]
+        workspace: WorkspaceArg,
         generation: u64,
     },
 }
@@ -122,22 +170,22 @@ enum MemorySubcommands {
 enum SecretSubcommands {
     /// List stored names and when each was set. Never prints a value.
     List {
-        #[arg(long, default_value = "/workspace")]
-        workspace: PathBuf,
+        #[command(flatten)]
+        workspace: WorkspaceArg,
     },
     /// Store a credential, read from stdin.
     ///
     /// Stdin rather than an argument, so the value does not end up in shell
     /// history or in the process list of every other account on the machine.
     Set {
-        #[arg(long, default_value = "/workspace")]
-        workspace: PathBuf,
+        #[command(flatten)]
+        workspace: WorkspaceArg,
         name: String,
     },
     /// Forget a credential.
     Rm {
-        #[arg(long, default_value = "/workspace")]
-        workspace: PathBuf,
+        #[command(flatten)]
+        workspace: WorkspaceArg,
         name: String,
     },
 }
@@ -147,7 +195,7 @@ impl SecretSubcommands {
         match self {
             SecretSubcommands::List { workspace }
             | SecretSubcommands::Set { workspace, .. }
-            | SecretSubcommands::Rm { workspace, .. } => workspace,
+            | SecretSubcommands::Rm { workspace, .. } => &workspace.workspace,
         }
     }
 }
@@ -160,11 +208,14 @@ impl Commands {
         match self {
             Commands::Daemon { workspace, .. }
             | Commands::Init { workspace }
-            | Commands::Status { workspace } => Some(workspace),
+            | Commands::Status { workspace }
+            | Commands::Update { workspace, .. } => Some(&workspace.workspace),
             Commands::History { sub } => Some(sub.workspace()),
             Commands::Memory { sub } => Some(sub.workspace()),
             Commands::Secret { sub } => Some(sub.workspace()),
-            Commands::Mcp { .. } => None,
+            Commands::Mcp { .. }
+            | Commands::Version { .. }
+            | Commands::InternalSignalUpdate { .. } => None,
         }
     }
 }
@@ -174,7 +225,7 @@ impl HistorySubcommands {
         match self {
             HistorySubcommands::RebuildJsonl { workspace }
             | HistorySubcommands::Backup { workspace }
-            | HistorySubcommands::Check { workspace } => workspace,
+            | HistorySubcommands::Check { workspace } => &workspace.workspace,
         }
     }
 }
@@ -185,8 +236,18 @@ impl MemorySubcommands {
             MemorySubcommands::Rebuild { workspace }
             | MemorySubcommands::Optimize { workspace }
             | MemorySubcommands::Status { workspace }
-            | MemorySubcommands::Rollback { workspace, .. } => workspace,
+            | MemorySubcommands::Rollback { workspace, .. } => &workspace.workspace,
         }
+    }
+}
+
+/// Print what a one-shot `memory` command did. Both passes end the same three
+/// ways, so both report the same three ways.
+fn report(outcome: Outcome) {
+    match outcome {
+        Outcome::Promoted(generation) => println!("Generation {generation} is active"),
+        Outcome::Interrupted => println!("The pass was interrupted; memory is unchanged"),
+        Outcome::Rejected(reason) => println!("Rejected, memory is unchanged: {reason}"),
     }
 }
 
@@ -202,7 +263,35 @@ async fn main() -> Result<()> {
     tera::observability::init_tracing(log_dir.as_deref());
 
     match cli.command {
-        Commands::Init { workspace } => {
+        Commands::Version { json } => {
+            tera::version::VersionReport::current().print(json)?;
+        }
+
+        Commands::Update {
+            workspace: WorkspaceArg { workspace },
+            component,
+            force,
+        } => {
+            let config = Config::new(workspace, false);
+            let outcome = tera::update::run(&config, component.into(), force)?;
+            println!(
+                "Tera: {} ({})",
+                outcome.tera.version,
+                outcome.tera.short_sha()
+            );
+            if let Some(codex) = outcome.codex {
+                println!("Codex: {codex}");
+            }
+            if outcome.restart_scheduled {
+                println!("The daemon will restart in a few seconds. Phoenix will report the result.");
+            }
+        }
+
+        Commands::InternalSignalUpdate { lock, pid } => {
+            tera::update::signal_update(&lock, pid)?;
+        }
+
+        Commands::Init { workspace: WorkspaceArg { workspace } } => {
             let config = Config::new(workspace, false);
             WorkspaceInit::init(&config)?;
             let _ = HistoryDb::open_for(&config)?;
@@ -211,9 +300,8 @@ async fn main() -> Result<()> {
         }
 
         // Reports what is degraded, not just what is configured: a status command
-        // that only echoes paths back cannot tell you why the assistant is quiet
-        // (PLAN.md section 95).
-        Commands::Status { workspace } => {
+        // that only echoes paths back cannot tell you why the assistant is quiet.
+        Commands::Status { workspace: WorkspaceArg { workspace } } => {
             let config = Config::new(workspace, false);
             println!("=== tera status ===");
             println!("Workspace:   {}", config.workspace_dir.display());
@@ -332,8 +420,8 @@ async fn main() -> Result<()> {
                 }
 
                 for (label, key) in [
-                    ("Rebuild pending", tera::memory::rebuild::REBUILD_PENDING_KEY),
-                    ("Optimizer retry", tera::memory::optimizer::RETRY_PENDING_KEY),
+                    ("Rebuild pending", memory::REBUILD.pending_key),
+                    ("Optimizer retry", memory::NIGHTLY.pending_key),
                 ] {
                     if rdb.get_state_value(key)?.as_deref() == Some("true") {
                         println!("{label}: yes");
@@ -352,7 +440,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::History { sub } => match sub {
-            HistorySubcommands::RebuildJsonl { workspace } => {
+            HistorySubcommands::RebuildJsonl { workspace: WorkspaceArg { workspace } } => {
                 let config = Config::new(workspace, false);
                 let history_db = HistoryDb::open_for(&config)?;
                 ProjectionEngine::rebuild_all(
@@ -362,13 +450,13 @@ async fn main() -> Result<()> {
                 )?;
             }
 
-            HistorySubcommands::Backup { workspace } => {
+            HistorySubcommands::Backup { workspace: WorkspaceArg { workspace } } => {
                 let config = Config::new(workspace, false);
                 let path = backup::backup_history(&config, &backup::timestamp_now())?;
                 println!("Backed up history to {}", path.display());
             }
 
-            HistorySubcommands::Check { workspace } => {
+            HistorySubcommands::Check { workspace: WorkspaceArg { workspace } } => {
                 let config = Config::new(workspace, false);
                 let history_db = HistoryDb::open_for(&config)?;
                 let report = backup::check_integrity(&config, &history_db)?;
@@ -392,39 +480,35 @@ async fn main() -> Result<()> {
         // Both of these drive a real Codex turn, so they need a workspace that is
         // set up and a live app-server, the same path the daemon uses.
         Commands::Memory { sub } => match sub {
-            MemorySubcommands::Rebuild { workspace } => {
+            MemorySubcommands::Rebuild { workspace: WorkspaceArg { workspace } } => {
                 let config = Config::new(workspace, false);
                 WorkspaceInit::init(&config)?;
                 let history_db = HistoryDb::open_for(&config)?;
                 let runtime_db = RuntimeDb::open(&config.runtime_db_path())?;
                 let codex =
                     CodexSupervisor::new(config.clone(), runtime_db.clone(), history_db.clone());
-                let generation =
-                    MemoryRebuilder::run(&config, &history_db, &runtime_db, &codex).await?;
-                println!("Memory rebuilt; generation {generation} is active");
+                report(
+                    memory::REBUILD
+                        .run(&config, &history_db, &runtime_db, &codex, None)
+                        .await?,
+                );
             }
 
-            MemorySubcommands::Optimize { workspace } => {
+            MemorySubcommands::Optimize { workspace: WorkspaceArg { workspace } } => {
                 let config = Config::new(workspace, false);
                 WorkspaceInit::init(&config)?;
                 let runtime_db = RuntimeDb::open(&config.runtime_db_path())?;
                 let history_db = HistoryDb::open_for(&config)?;
-                let codex = CodexSupervisor::new(config.clone(), runtime_db.clone(), history_db);
-                // No other work can be in flight in a one-shot command, so an
-                // empty tracker is the honest answer to "is anything active".
-                let activity = ActivityTracker::new();
-                match MemoryOptimizer::run(&config, &runtime_db, &codex, &activity).await? {
-                    OptimizerOutcome::Promoted(generation) => {
-                        println!("Memory optimized; generation {generation} is active")
-                    }
-                    OptimizerOutcome::Interrupted => println!("Optimization was interrupted"),
-                    OptimizerOutcome::Rejected(reason) => {
-                        println!("Optimization rejected, memory unchanged: {reason}")
-                    }
-                }
+                let codex =
+                    CodexSupervisor::new(config.clone(), runtime_db.clone(), history_db.clone());
+                report(
+                    memory::NIGHTLY
+                        .run(&config, &history_db, &runtime_db, &codex, None)
+                        .await?,
+                );
             }
 
-            MemorySubcommands::Status { workspace } => {
+            MemorySubcommands::Status { workspace: WorkspaceArg { workspace } } => {
                 let config = Config::new(workspace, false);
                 let active = GenerationManager::active_generation(&config);
                 let latest = GenerationManager::get_current_generation_num(&config)?;
@@ -449,7 +533,7 @@ async fn main() -> Result<()> {
             }
 
             MemorySubcommands::Rollback {
-                workspace,
+                workspace: WorkspaceArg { workspace },
                 generation,
             } => {
                 let config = Config::new(workspace, false);
@@ -496,29 +580,36 @@ async fn main() -> Result<()> {
         }
 
         Commands::Daemon {
-            workspace,
+            workspace: WorkspaceArg { workspace },
             mock_transport,
         } => {
             let config = Config::new(workspace, mock_transport);
             info!("Starting tera daemon...");
 
-            // 1. Acquire singleton daemon lock
             let _lock = DaemonLock::acquire(&config.lock_file_path())?;
 
             // Armed before anything else can fail, and removed only by a clean
             // exit further down. Whatever this returns is the previous life.
-            let crashed = runtime::phoenix::arm(&config.runtime_dir())?;
+            let crashed = runtime::crash_mark::arm(&config.runtime_dir())?;
             if let Some(mark) = &crashed {
                 warn!("Previous tera {} (started {})", mark.describe(), mark.started_at_ms);
             }
+            let update_notice = match tera::update::startup_action(&config, crashed.is_some())? {
+                tera::update::StartupAction::Continue(notice) => notice.map(|notice| *notice),
+                tera::update::StartupAction::RestartAfterRollback => {
+                    runtime::crash_mark::disarm(&config.runtime_dir());
+                    return Err(anyhow::anyhow!(
+                        "the failed update was rolled back; restarting the restored binary"
+                    ));
+                }
+            };
 
-            // 2. Initialize workspace & databases
             WorkspaceInit::init(&config)?;
             let history_db = HistoryDb::open_for(&config)?;
             let runtime_db = RuntimeDb::open(&config.runtime_db_path())?;
 
             // 2a. Repair what a crash or an older build may have left behind,
-            //     before anything is served (PLAN.md section 96.3).
+            //     before anything is served.
             match backup::clear_stale_staging(&config) {
                 Ok(removed) if !removed.is_empty() => {
                     info!("Cleared {} stale staging director(ies)", removed.len())
@@ -563,9 +654,14 @@ async fn main() -> Result<()> {
             // One app-server process, shared by the conversation and the scheduler.
             let codex =
                 CodexSupervisor::new(config.clone(), runtime_db.clone(), history_db.clone());
-            codex.warm_in_background();
+            if update_notice.is_some() {
+                // An update is not healthy until the exact app-server protocol
+                // this daemon depends on has completed its handshake.
+                codex.ensure().await?;
+            } else {
+                codex.warm_in_background();
+            }
 
-            // 3. Initialize transport & spawn bot loop
             let transport: Arc<dyn Transport> = if config.mock_transport {
                 warn!("Starting daemon with MockTransport for testing");
                 Arc::new(MockTransport::new())
@@ -597,7 +693,7 @@ async fn main() -> Result<()> {
                 );
                 tokio::spawn(async move {
                     for attempt in 1..=PHOENIX_REPORT_ATTEMPTS {
-                        match phoenix.run(crashed.clone()).await {
+                        match phoenix.run(crashed.clone(), update_notice.clone()).await {
                             Ok(()) => return,
                             Err(e) => {
                                 warn!("Phoenix could not run (attempt {attempt}): {e:?}");
@@ -616,18 +712,11 @@ async fn main() -> Result<()> {
                     loop {
                         let engine_for_run = turn_engine.clone();
                         let result = wa_clone
-                            .start_bot(move |event| {
+                            .start_bot(move |message| {
                                 let engine = engine_for_run.clone();
                                 tokio::spawn(async move {
-                                    match event {
-                                        InboundEvent::Message(msg) => {
-                                            if let Err(err) =
-                                                engine.handle_inbound_message(msg).await
-                                            {
-                                                tracing::error!("TurnEngine error: {:?}", err);
-                                            }
-                                        }
-                                        InboundEvent::Reaction(_) => {}
+                                    if let Err(err) = engine.handle_inbound_message(message).await {
+                                        tracing::error!("TurnEngine error: {:?}", err);
                                     }
                                 });
                             })
@@ -648,7 +737,6 @@ async fn main() -> Result<()> {
                 wa_transport
             };
 
-            // 4. Start MCP RPC server on Unix socket
             let rpc_server = Arc::new(DaemonRpcServer::new(
                 config.clone(),
                 history_db.clone(),
@@ -662,7 +750,6 @@ async fn main() -> Result<()> {
                 }
             });
 
-            // 5. Start background scheduler runner
             let scheduler_runner = Arc::new(SchedulerRunner::new(
                 config.clone(),
                 runtime_db.clone(),
@@ -671,9 +758,9 @@ async fn main() -> Result<()> {
             ));
             scheduler_runner.start_loop();
 
-            // 6. Memory maintenance: nightly optimization, and rebuilds after a
-            //    model change. Lowest priority in the system; it only runs in an
-            //    idle window and abandons its work when anything else starts.
+            // Nightly optimization, and rebuilds after a model change. Lowest
+            // priority in the system; it only runs in an idle window and
+            // abandons its work when anything else starts.
             let maintenance = Arc::new(MaintenanceRunner::new(
                 config.clone(),
                 history_db.clone(),
@@ -683,11 +770,26 @@ async fn main() -> Result<()> {
             ));
             maintenance.start_loop();
 
-            info!("Daemon is fully initialized and operational. Press Ctrl+C to stop.");
-            tokio::signal::ctrl_c().await?;
+            // Everything required to serve a turn is now running, including a
+            // post-update Codex handshake. The rollback copy is no longer needed.
+            tera::update::mark_healthy(&config);
 
-            // Graceful shutdown (PLAN.md section 52). Systemd may restart us, so
-            // what matters is leaving no state that a fresh start would misread:
+            info!("Daemon is fully initialized and operational. Press Ctrl+C to stop.");
+            // Both signals mean the same thing: stop cleanly and let the
+            // supervisor start whatever binary is on disk now. SIGUSR1 is what
+            // `tera update` sends once the replacement is installed; ctrl-c is a
+            // person. Nothing here restarts the daemon itself, because a process
+            // that supervises itself is a worse supervisor than the one the OS
+            // already runs.
+            let mut update_signal =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
+            tokio::select! {
+                result = tokio::signal::ctrl_c() => result?,
+                _ = update_signal.recv() => {}
+            }
+
+            // Graceful shutdown. Systemd may restart us, so what matters is
+            // leaving no state that a fresh start would misread:
             // no phantom typing indicator, no stale socket.
             info!("Shutting down: clearing typing state and releasing the socket");
             if let Some(chat) = session.chat() {
@@ -702,7 +804,7 @@ async fn main() -> Result<()> {
             }
 
             // Last thing, so anything that stops us before here reads as a crash.
-            runtime::phoenix::disarm(&config.runtime_dir());
+            runtime::crash_mark::disarm(&config.runtime_dir());
             info!("tera stopped.");
         }
     }

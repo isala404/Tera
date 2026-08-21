@@ -1,13 +1,100 @@
 use crate::codex::tier::{self, ModelTier};
-use crate::runtime::{RuntimeDb, ScheduleItem, ScheduleRun};
+use crate::runtime::RuntimeDb;
 use crate::scheduler::recurrence::ScheduleTiming;
+use crate::sqlite::add_column_if_missing;
 use anyhow::Result;
 use chrono::{Local, Utc};
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Both schedule queries select the same columns in the same order; sharing the
+/// The scheduler's two tables, applied by [`RuntimeDb::open`] alongside the
+/// daemon's own. They live here so the shape of a row is next to the queries
+/// that read it.
+const INIT_SCHEDULER_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS schedules (
+    id                 TEXT PRIMARY KEY,
+    name               TEXT NOT NULL,
+    prompt             TEXT NOT NULL,
+    schedule_type      TEXT NOT NULL,
+    one_shot_at_ms     INTEGER,
+    dtstart_local      TEXT,
+    rrule              TEXT,
+    timezone           TEXT NOT NULL,
+    task_path          TEXT NOT NULL,
+    status             TEXT NOT NULL,
+    next_run_at_ms     INTEGER,
+    created_at_ms      INTEGER NOT NULL,
+    cancelled_at_ms    INTEGER,
+    tier               TEXT
+);
+
+CREATE TABLE IF NOT EXISTS schedule_runs (
+    id                 TEXT PRIMARY KEY,
+    schedule_id        TEXT NOT NULL,
+    scheduled_for_ms   INTEGER NOT NULL,
+    started_at_ms      INTEGER,
+    finished_at_ms     INTEGER,
+    state              TEXT NOT NULL,
+    codex_thread_id    TEXT,
+    error              TEXT
+);
+"#;
+
+pub fn init_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(INIT_SCHEDULER_SCHEMA_SQL)?;
+    add_column_if_missing(conn, "schedules", "tier", "TEXT")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleItem {
+    pub id: String,
+    pub name: String,
+    pub prompt: String,
+    pub schedule_type: String, // "once" | "recurring"
+    pub one_shot_at_ms: Option<i64>,
+    pub dtstart_local: Option<String>,
+    pub rrule: Option<String>,
+    pub timezone: String,
+    pub task_path: String,
+    pub status: String, // "active" | "cancelled" | "completed"
+    pub next_run_at_ms: Option<i64>,
+    pub created_at_ms: i64,
+    pub cancelled_at_ms: Option<i64>,
+    /// Which model tier runs it: see [`crate::codex::tier`]. Nullable because
+    /// schedules created before tiers existed have none; those read back as the
+    /// routine tier.
+    pub tier: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleRun {
+    pub id: String,
+    pub schedule_id: String,
+    pub scheduled_for_ms: i64,
+    pub started_at_ms: Option<i64>,
+    pub finished_at_ms: Option<i64>,
+    pub state: String, // "pending" | "running" | "completed" | "failed"
+    pub codex_thread_id: Option<String>,
+    pub error: Option<String>,
+}
+
+
+/// Every query here selects its columns in the same order, and sharing the
 /// mapper is what keeps them from drifting when a column is added.
+fn run_from_row(row: &Row) -> rusqlite::Result<ScheduleRun> {
+    Ok(ScheduleRun {
+        id: row.get(0)?,
+        schedule_id: row.get(1)?,
+        scheduled_for_ms: row.get(2)?,
+        started_at_ms: row.get(3)?,
+        finished_at_ms: row.get(4)?,
+        state: row.get(5)?,
+        codex_thread_id: row.get(6)?,
+        error: row.get(7)?,
+    })
+}
+
 fn schedule_from_row(row: &Row) -> rusqlite::Result<ScheduleItem> {
     Ok(ScheduleItem {
         id: row.get(0)?,
@@ -205,24 +292,9 @@ impl SchedulerDb {
             "SELECT id, schedule_id, scheduled_for_ms, started_at_ms, finished_at_ms, state, codex_thread_id, error
              FROM schedule_runs ORDER BY started_at_ms DESC LIMIT ?1",
         )?;
-        let rows = stmt.query_map(params![limit as i64], |row: &Row| {
-            Ok(ScheduleRun {
-                id: row.get(0)?,
-                schedule_id: row.get(1)?,
-                scheduled_for_ms: row.get(2)?,
-                started_at_ms: row.get(3)?,
-                finished_at_ms: row.get(4)?,
-                state: row.get(5)?,
-                codex_thread_id: row.get(6)?,
-                error: row.get(7)?,
-            })
-        })?;
-
-        let mut runs = Vec::new();
-        for r in rows {
-            runs.push(r?);
-        }
-        Ok(runs)
+        let rows = stmt.query_map(params![limit as i64], run_from_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     pub fn running_runs(runtime_db: &RuntimeDb) -> Result<Vec<ScheduleRun>> {
@@ -231,20 +303,9 @@ impl SchedulerDb {
             "SELECT id, schedule_id, scheduled_for_ms, started_at_ms, finished_at_ms, state, codex_thread_id, error
              FROM schedule_runs WHERE state = 'running' ORDER BY started_at_ms ASC",
         )?;
-        let rows = stmt.query_map([], |row: &Row| {
-            Ok(ScheduleRun {
-                id: row.get(0)?,
-                schedule_id: row.get(1)?,
-                scheduled_for_ms: row.get(2)?,
-                started_at_ms: row.get(3)?,
-                finished_at_ms: row.get(4)?,
-                state: row.get(5)?,
-                codex_thread_id: row.get(6)?,
-                error: row.get(7)?,
-            })
-        })?;
-
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+        let rows = stmt.query_map([], run_from_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     pub fn update_next_run(

@@ -1,8 +1,8 @@
 use tera::config::Config;
-use tera::history::db::{ConversationEvent, HistoryDb};
+use tera::history::db::{ConversationEvent, EventKind, HistoryDb};
 use tera::history::projection::ProjectionEngine;
 use tera::memory::generations::GenerationManager;
-use tera::memory::optimizer::MemoryOptimizer;
+use tera::memory::NIGHTLY;
 use tera::runtime::RuntimeDb;
 use tera::codex::tier;
 use tera::scheduler::db::SchedulerDb;
@@ -55,7 +55,7 @@ async fn test_fts_index_is_queryable_the_way_the_agent_queries_it() {
             seq: None,
             id: "m_test1".to_string(),
             occurred_at_ms: Utc::now().timestamp_millis(),
-            kind: "message".to_string(),
+            kind: EventKind::Message,
             actor: "user".to_string(),
             text: Some("OpenChoreo deployment setup in progress".to_string()),
             reply_to_id: None,
@@ -99,7 +99,7 @@ async fn test_jsonl_projection_and_rebuild() {
                 seq: None,
                 id: id.to_string(),
                 occurred_at_ms: Utc::now().timestamp_millis(),
-                kind: "message".to_string(),
+                kind: EventKind::Message,
                 actor: actor.to_string(),
                 text: Some(text.to_string()),
                 reply_to_id: None,
@@ -139,7 +139,7 @@ async fn test_start_repairs_a_projection_that_drifted() {
             seq: None,
             id: "m_kept".to_string(),
             occurred_at_ms: Utc::now().timestamp_millis(),
-            kind: "message".to_string(),
+            kind: EventKind::Message,
             actor: "assistant".to_string(),
             text: Some("I replied through the tool".to_string()),
             reply_to_id: None,
@@ -258,7 +258,7 @@ async fn test_memory_generation_promotion_is_atomic() {
     let config = Config::new(temp_dir.path().to_path_buf(), true);
     WorkspaceInit::init(&config).unwrap();
 
-    let staging = MemoryOptimizer::prepare_staging(&config).unwrap();
+    let staging = NIGHTLY.prepare_staging(&config).unwrap();
     fs::write(staging.join("people.md"), "# Amaya\n\nMoving in December.\n").unwrap();
 
     let generation = GenerationManager::atomic_swap_generation(&config, &staging).unwrap();

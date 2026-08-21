@@ -9,7 +9,7 @@ pub use engine::TurnEngine;
 pub use phoenix::Phoenix;
 pub use session::ConversationSession;
 
-use crate::history::db::{ConversationEvent, HistoryDb, ProviderRef};
+use crate::history::db::{ConversationEvent, EventKind, HistoryDb, ProviderRef};
 use anyhow::Result;
 use uuid::Uuid;
 
@@ -30,7 +30,7 @@ pub fn record_assistant_message(
         seq: None,
         id: format!("msg_{}", Uuid::new_v4().simple()),
         occurred_at_ms: chrono::Utc::now().timestamp_millis(),
-        kind: "message".to_string(),
+        kind: EventKind::Message,
         actor: "assistant".to_string(),
         text: Some(text.to_string()),
         reply_to_id,

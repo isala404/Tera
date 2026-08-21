@@ -17,30 +17,34 @@ const MAX_MEMORY_FILE_BYTES: u64 = 4 * 1024 * 1024;
 /// so it has no business being the same order of size as history.
 const MAX_GENERATION_BYTES: u64 = 64 * 1024 * 1024;
 
-/// How many generations to keep for rollback (PLAN.md section 43).
+/// How many generations to keep for rollback.
 const GENERATIONS_TO_KEEP: usize = 14;
+
+/// Every generation directory, numbered, oldest first. A name that is not a
+/// number is not one of ours, so it is neither counted nor pruned.
+fn numbered_generations(config: &Config) -> Result<Vec<(u64, PathBuf)>> {
+    let dir = config.generations_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut found: Vec<(u64, PathBuf)> = fs::read_dir(&dir)?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let num = entry.file_name().to_str()?.parse::<u64>().ok()?;
+            Some((num, entry.path()))
+        })
+        .collect();
+    found.sort_by_key(|(num, _)| *num);
+    Ok(found)
+}
 
 pub struct GenerationManager;
 
 impl GenerationManager {
     pub fn get_current_generation_num(config: &Config) -> Result<u64> {
-        let generations_dir = config.generations_dir();
-        if !generations_dir.exists() {
-            return Ok(1);
-        }
-
-        let mut max_gen = 1u64;
-        for entry in fs::read_dir(&generations_dir)? {
-            let entry = entry?;
-            if let Some(name) = entry.file_name().to_str() {
-                if let Ok(num) = name.parse::<u64>() {
-                    if num > max_gen {
-                        max_gen = num;
-                    }
-                }
-            }
-        }
-        Ok(max_gen)
+        Ok(numbered_generations(config)?
+            .last()
+            .map_or(1, |(num, _)| *num))
     }
 
     /// The generation actually in use, read from the symlink.
@@ -64,7 +68,7 @@ impl GenerationManager {
         Ok((next_num, next_dir))
     }
 
-    /// Deterministic checks before a generation may become active (PLAN.md 64).
+    /// Deterministic checks before a generation may become active.
     ///
     /// These are all shape, never truth: whether the memory is *correct* is a
     /// model and history problem, not something Rust can judge. What Rust can do
@@ -178,8 +182,7 @@ impl GenerationManager {
     /// Removing the old symlink and then creating the new one leaves a window in
     /// which `memories/` does not exist, and a turn reading `memories/INDEX.md`
     /// in that window sees an assistant with no memory at all. Creating the link
-    /// under a temporary name and renaming it over the old one is atomic
-    /// (PLAN.md section 42).
+    /// under a temporary name and renaming it over the old one is atomic.
     pub fn point_memories_at(config: &Config, generation: u64) -> Result<()> {
         let memories_link = config.memories_link();
         let staging_link = config.workspace_dir.join("memories.new");
@@ -198,31 +201,12 @@ impl GenerationManager {
     }
 
     pub fn prune_old_generations(config: &Config, keep_count: usize) -> Result<()> {
-        let generations_dir = config.generations_dir();
-        if !generations_dir.exists() {
-            return Ok(());
+        let generations = numbered_generations(config)?;
+        let excess = generations.len().saturating_sub(keep_count);
+        for (num, path) in generations.iter().take(excess) {
+            info!("Pruning old memory generation {num:08}");
+            let _ = fs::remove_dir_all(path);
         }
-
-        let mut nums = Vec::new();
-        for entry in fs::read_dir(&generations_dir)? {
-            let entry = entry?;
-            if let Some(name) = entry.file_name().to_str() {
-                if let Ok(num) = name.parse::<u64>() {
-                    nums.push((num, entry.path()));
-                }
-            }
-        }
-
-        nums.sort_by_key(|k| k.0);
-
-        if nums.len() > keep_count {
-            let remove_count = nums.len() - keep_count;
-            for (num, path) in nums.iter().take(remove_count) {
-                info!("Pruning old memory generation {:08}", num);
-                let _ = fs::remove_dir_all(path);
-            }
-        }
-
         Ok(())
     }
 }

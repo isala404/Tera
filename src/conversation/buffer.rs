@@ -29,7 +29,7 @@ impl MessageBurst {
     ///
     /// The quiet period restarts on every message, so a user who keeps typing
     /// would otherwise never get an answer. `max_wait` caps the total from the
-    /// first message (PLAN.md section 13.1).
+    /// first message.
     pub fn remaining_wait(&self, quiet: Duration, max_wait: Duration) -> Duration {
         let since_last = self.last_updated_at.elapsed();
         let quiet_left = quiet.saturating_sub(since_last);
@@ -41,6 +41,7 @@ impl MessageBurst {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::db::EventKind;
 
     #[test]
     fn test_message_burst_buffering() {
@@ -48,7 +49,7 @@ mod tests {
             seq: None,
             id: "m_1".to_string(),
             occurred_at_ms: 1000,
-            kind: "message".to_string(),
+            kind: EventKind::Message,
             actor: "user".to_string(),
             text: Some("Hello".to_string()),
             reply_to_id: None,
@@ -65,7 +66,7 @@ mod tests {
             seq: None,
             id: "m_2".to_string(),
             occurred_at_ms: 1005,
-            kind: "message".to_string(),
+            kind: EventKind::Message,
             actor: "user".to_string(),
             text: Some("World".to_string()),
             reply_to_id: None,
@@ -104,7 +105,7 @@ mod tests {
             seq: None,
             id: id.to_string(),
             occurred_at_ms: 1000,
-            kind: "message".to_string(),
+            kind: EventKind::Message,
             actor: "user".to_string(),
             text: Some("hi".to_string()),
             reply_to_id: None,

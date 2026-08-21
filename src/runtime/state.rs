@@ -44,63 +44,7 @@ CREATE TABLE IF NOT EXISTS model_observations (
     is_default      INTEGER NOT NULL,
     observed_at_ms  INTEGER NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS schedules (
-    id                 TEXT PRIMARY KEY,
-    name               TEXT NOT NULL,
-    prompt             TEXT NOT NULL,
-    schedule_type      TEXT NOT NULL,
-    one_shot_at_ms     INTEGER,
-    dtstart_local      TEXT,
-    rrule              TEXT,
-    timezone           TEXT NOT NULL,
-    task_path          TEXT NOT NULL,
-    status             TEXT NOT NULL,
-    next_run_at_ms     INTEGER,
-    created_at_ms      INTEGER NOT NULL,
-    cancelled_at_ms    INTEGER,
-    tier               TEXT
-);
-
-CREATE TABLE IF NOT EXISTS schedule_runs (
-    id                 TEXT PRIMARY KEY,
-    schedule_id        TEXT NOT NULL,
-    scheduled_for_ms   INTEGER NOT NULL,
-    started_at_ms      INTEGER,
-    finished_at_ms     INTEGER,
-    state              TEXT NOT NULL,
-    codex_thread_id    TEXT,
-    error              TEXT
-);
-
-CREATE TABLE IF NOT EXISTS maintenance_runs (
-    id                 TEXT PRIMARY KEY,
-    kind               TEXT NOT NULL,
-    started_at_ms      INTEGER NOT NULL,
-    finished_at_ms     INTEGER,
-    state              TEXT NOT NULL,
-    new_generation     TEXT,
-    error              TEXT
-);
 "#;
-
-/// Add a column to a table that already exists in a live workspace.
-///
-/// `CREATE TABLE IF NOT EXISTS` never revisits a table it did not create, so a
-/// new column in the schema above reaches a fresh database and no other. SQLite
-/// has no `ADD COLUMN IF NOT EXISTS`, so the check is a lookup in `pragma_table_info`.
-fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
-    let exists: bool = conn.query_row(
-        "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name = ?2",
-        params![table, column],
-        |row| row.get(0),
-    )?;
-    if !exists {
-        info!("Adding column {table}.{column} to the runtime database");
-        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
-    }
-    Ok(())
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MainThreadState {
@@ -137,39 +81,6 @@ pub struct ModelObservation {
     pub observed_at_ms: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScheduleItem {
-    pub id: String,
-    pub name: String,
-    pub prompt: String,
-    pub schedule_type: String, // "once" | "recurring"
-    pub one_shot_at_ms: Option<i64>,
-    pub dtstart_local: Option<String>,
-    pub rrule: Option<String>,
-    pub timezone: String,
-    pub task_path: String,
-    pub status: String, // "active" | "cancelled" | "completed"
-    pub next_run_at_ms: Option<i64>,
-    pub created_at_ms: i64,
-    pub cancelled_at_ms: Option<i64>,
-    /// Which model tier runs it: see [`crate::codex::tier`]. Nullable because
-    /// schedules created before tiers existed have none; those read back as the
-    /// routine tier.
-    pub tier: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScheduleRun {
-    pub id: String,
-    pub schedule_id: String,
-    pub scheduled_for_ms: i64,
-    pub started_at_ms: Option<i64>,
-    pub finished_at_ms: Option<i64>,
-    pub state: String, // "pending" | "running" | "completed" | "failed"
-    pub codex_thread_id: Option<String>,
-    pub error: Option<String>,
-}
-
 #[derive(Clone)]
 pub struct RuntimeDb {
     pub conn: Arc<Mutex<Connection>>,
@@ -183,7 +94,7 @@ impl RuntimeDb {
         let conn = Connection::open(db_path)
             .with_context(|| format!("Failed to open runtime state DB at {:?}", db_path))?;
         conn.execute_batch(INIT_RUNTIME_SCHEMA_SQL)?;
-        add_column_if_missing(&conn, "schedules", "tier", "TEXT")?;
+        crate::scheduler::db::init_schema(&conn)?;
         info!("Opened runtime state database at {:?}", db_path);
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),

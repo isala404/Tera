@@ -1,8 +1,6 @@
 pub mod generations;
 pub mod maintenance;
-pub mod optimizer;
-pub mod rebuild;
+pub mod pass;
 
 pub use maintenance::MaintenanceRunner;
-pub use optimizer::MemoryOptimizer;
-pub use rebuild::MemoryRebuilder;
+pub use pass::{Outcome, Pass, NIGHTLY, REBUILD};

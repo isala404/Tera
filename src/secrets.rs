@@ -26,8 +26,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 /// How long a request from [`SecretStore::request`] keeps claiming the next
@@ -57,8 +56,6 @@ pub struct Secret {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingRequest {
     pub name: String,
-    /// What the agent said it needed this for, echoed back to the owner.
-    pub reason: String,
     pub requested_at_ms: i64,
 }
 
@@ -124,9 +121,9 @@ impl SecretStore {
         }
     }
 
-    /// Write via a temporary file so a crash mid-write cannot leave a truncated
-    /// store, and create it 0600 from the start rather than chmod-ing after: a
-    /// file that is briefly world-readable is world-readable.
+    /// 0600 from the start rather than chmod-ing after: a file that is briefly
+    /// world-readable is world-readable. The directory is locked down too, so
+    /// the store cannot be replaced out from under us by another user.
     fn save(&self, contents: &Contents) -> Result<()> {
         let parent = self
             .path
@@ -136,24 +133,9 @@ impl SecretStore {
             .with_context(|| format!("Cannot create {}", parent.display()))?;
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).ok();
 
-        let temporary = parent.join(format!(".secrets.json.tmp-{}", std::process::id()));
-        let serialized = serde_json::to_string_pretty(contents)?;
-
-        let mut handle = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&temporary)
-            .with_context(|| format!("Cannot write {}", temporary.display()))?;
-        handle.write_all(serialized.as_bytes())?;
-        handle.write_all(b"\n")?;
-        handle.sync_all()?;
-        drop(handle);
-
-        fs::rename(&temporary, &self.path)
-            .with_context(|| format!("Cannot replace {}", self.path.display()))?;
-        Ok(())
+        let mut serialized = serde_json::to_vec_pretty(contents)?;
+        serialized.push(b'\n');
+        crate::runtime::write_atomic(&self.path, &serialized, 0o600)
     }
 
     pub fn set(&self, name: &str, value: &str, now_ms: i64) -> Result<()> {
@@ -201,12 +183,11 @@ impl SecretStore {
     }
 
     /// Claim the owner's next message as the value for `name`.
-    pub fn request(&self, name: &str, reason: &str, now_ms: i64) -> Result<()> {
+    pub fn request(&self, name: &str, now_ms: i64) -> Result<()> {
         let name = validate_name(name)?;
         let mut contents = self.load()?;
         contents.pending = Some(PendingRequest {
             name,
-            reason: reason.to_string(),
             requested_at_ms: now_ms,
         });
         self.save(&contents)
@@ -228,6 +209,17 @@ impl SecretStore {
         Ok(())
     }
 
+    /// The one place a validation failure becomes a message for the owner, so
+    /// the two ways in cannot report the same rejection differently.
+    fn store(&self, name: String, value: &str, now_ms: i64) -> Capture {
+        match self.set(&name, value, now_ms) {
+            Ok(()) => Capture::Stored { name },
+            Err(error) => Capture::Rejected {
+                reason: error.to_string(),
+            },
+        }
+    }
+
     /// Decide what an inbound message is, and store the value if it is a secret.
     ///
     /// Two ways in, one path out. `/secret NAME value` is unambiguous and always
@@ -237,12 +229,7 @@ impl SecretStore {
     pub fn capture(&self, text: &str, now_ms: i64) -> Result<Capture> {
         if let Some(rest) = command_argument(text) {
             let outcome = match parse_command(rest) {
-                Ok((name, value)) => match self.set(&name, &value, now_ms) {
-                    Ok(()) => Capture::Stored { name },
-                    Err(error) => Capture::Rejected {
-                        reason: error.to_string(),
-                    },
-                },
+                Ok((name, value)) => self.store(name, &value, now_ms),
                 Err(reason) => Capture::Rejected { reason },
             };
             // Whatever happened, an explicit /secret ends any guided request:
@@ -261,14 +248,7 @@ impl SecretStore {
                 reason: format!("The message held no value for {}", request.name),
             }
         } else {
-            match self.set(&request.name, value, now_ms) {
-                Ok(()) => Capture::Stored {
-                    name: request.name.clone(),
-                },
-                Err(error) => Capture::Rejected {
-                    reason: error.to_string(),
-                },
-            }
+            self.store(request.name, value, now_ms)
         };
         self.clear_pending()?;
         Ok(outcome)
@@ -518,7 +498,7 @@ mod tests {
     #[test]
     fn test_pending_request_claims_the_next_message() {
         let (_dir, store) = store();
-        store.request("SPOTIFY_CLIENT_ID", "to control Spotify", 0).unwrap();
+        store.request("SPOTIFY_CLIENT_ID", 0).unwrap();
         let outcome = store.capture("  abc123  ", 1_000).unwrap();
         assert_eq!(outcome, Capture::Stored { name: "SPOTIFY_CLIENT_ID".to_string() });
         assert_eq!(store.get("SPOTIFY_CLIENT_ID").unwrap().as_deref(), Some("abc123"));
@@ -528,7 +508,7 @@ mod tests {
     #[test]
     fn test_request_is_consumed_by_the_message_it_claims() {
         let (_dir, store) = store();
-        store.request("TOKEN", "why", 0).unwrap();
+        store.request("TOKEN", 0).unwrap();
         store.capture("abc123", 0).unwrap();
         assert_eq!(store.capture("thanks!", 0).unwrap(), Capture::Passthrough);
     }
@@ -538,7 +518,7 @@ mod tests {
     #[test]
     fn test_stale_request_does_not_claim_a_message() {
         let (_dir, store) = store();
-        store.request("TOKEN", "why", 0).unwrap();
+        store.request("TOKEN", 0).unwrap();
         assert_eq!(
             store.capture("what's the weather", PENDING_LIFETIME_MS + 1).unwrap(),
             Capture::Passthrough
@@ -550,7 +530,7 @@ mod tests {
     #[test]
     fn test_explicit_command_clears_a_pending_request() {
         let (_dir, store) = store();
-        store.request("TOKEN", "why", 0).unwrap();
+        store.request("TOKEN", 0).unwrap();
         store.capture("/secret OTHER_TOKEN abc123", 0).unwrap();
         assert_eq!(store.capture("thanks!", 0).unwrap(), Capture::Passthrough);
     }

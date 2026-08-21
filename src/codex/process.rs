@@ -1,3 +1,4 @@
+use crate::codex::log::{is_stderr_problem, log_notification, strip_ansi, truncate};
 use crate::codex::rpc::{JsonRpcRequest, JsonRpcResponse};
 use crate::codex::tier::{self, ModelTier};
 use anyhow::{anyhow, Context, Result};
@@ -11,57 +12,6 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
-
-/// Remove ANSI colour sequences so Codex's coloured output does not arrive as
-/// literal `\x1b[2m` noise in our log.
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
-            out.push(c);
-            continue;
-        }
-        // CSI sequence: ESC [ ... <final byte in @..~>
-        if chars.next() == Some('[') {
-            for c in chars.by_ref() {
-                if ('\u{40}'..='\u{7e}').contains(&c) {
-                    break;
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Whether a Codex stderr line is something the operator should see.
-///
-/// Codex logs its own INFO telemetry to stderr; only genuine failures deserve a
-/// warning in the daemon's log.
-fn is_stderr_problem(line: &str) -> bool {
-    let lowered = line.to_lowercase();
-    ["error", "panic", "fatal", " warn"]
-        .iter()
-        .any(|needle| lowered.contains(needle))
-}
-
-/// Keep a log line readable: agent output and command dumps can be megabytes.
-fn truncate(s: &str, max: usize) -> String {
-    let s = s.trim();
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let head: String = s.chars().take(max).collect();
-    format!("{head}… (+{} more chars)", s.chars().count() - max)
-}
-
-fn text_of(v: &Value, key: &str) -> Option<String> {
-    v.get(key).and_then(|x| x.as_str()).map(str::to_string)
-}
-
-fn num_of(v: &Value, key: &str) -> i64 {
-    v.get(key).and_then(|x| x.as_i64()).unwrap_or_default()
-}
 
 /// Streaming events tera cares about, routed per Codex thread.
 #[derive(Debug, Clone)]
@@ -131,7 +81,7 @@ impl TurnInput {
 ///
 /// The difference matters beyond logging: a resumed thread already knows the
 /// user, while a fresh one needs bootstrap context before it can behave like the
-/// same assistant (PLAN.md section 12.4).
+/// same assistant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadOrigin {
     /// Rejoined a thread from a previous daemon run; history intact.
@@ -313,7 +263,7 @@ impl CodexProcessManager {
                         }
                     }
                     (Some(_), None) => {
-                        Self::log_notification(&v);
+                        log_notification(&v);
                         Self::track_active_turn(&turns_clone, &v).await;
                         if let Some((thread_id, event)) = Self::classify_notification(&v) {
                             Self::dispatch(&listeners_clone, &thread_id, event).await;
@@ -352,7 +302,7 @@ impl CodexProcessManager {
                 Some(json!({
                     "clientInfo": {
                         "name": "tera",
-                        "version": "0.1.0"
+                        "version": env!("CARGO_PKG_VERSION")
                     }
                 })),
             )
@@ -364,8 +314,7 @@ impl CodexProcessManager {
     }
 
     /// Thread creation settings. The assistant runs unattended over WhatsApp, so
-    /// it cannot answer approval prompts. Hence `never` / full access, per
-    /// PLAN.md section 10.
+    /// it cannot answer approval prompts. Hence `never` and full access.
     fn thread_params(&self, opts: &ThreadOptions) -> Value {
         json!({
             "cwd": opts.cwd.to_string_lossy(),
@@ -505,7 +454,7 @@ impl CodexProcessManager {
     }
 
     /// Ask the app-server which models it offers and which is default, so memory
-    /// regeneration can be triggered when the default changes (PLAN.md 11).
+    /// regeneration can be triggered when the default changes.
     pub async fn list_models(&self) -> Result<Value> {
         self.send_request("model/list", Some(json!({}))).await
     }
@@ -513,136 +462,6 @@ impl CodexProcessManager {
     /// Narrate what the agent is doing, so a turn is traceable from the daemon
     /// log without attaching to Codex.
     ///
-    /// `info` carries the things worth seeing on every turn. Shell commands,
-    /// MCP tool calls, file edits, web searches, token usage. `debug` carries the
-    /// streaming firehose (output deltas, reasoning text) that is only useful
-    /// when chasing a specific problem; enable with
-    /// `RUST_LOG=tera::codex=debug`.
-    fn log_notification(v: &Value) {
-        let Some(method) = v.get("method").and_then(|m| m.as_str()) else {
-            return;
-        };
-        let params = v.get("params").unwrap_or(&Value::Null);
-
-        match method {
-            "item/started" | "item/completed" => Self::log_item(method, params),
-
-            "item/commandExecution/outputDelta" | "process/outputDelta" => {
-                debug!(target: "codex::stream", "command output: {}", truncate(&text_of(params, "chunk").or_else(|| text_of(params, "delta")).unwrap_or_default(), 400));
-            }
-            "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
-                debug!(target: "codex::stream", "reasoning: {}", truncate(&text_of(params, "delta").unwrap_or_default(), 400));
-            }
-            "item/agentMessage/delta" => {
-                debug!(target: "codex::stream", "answer: {}", truncate(&text_of(params, "delta").unwrap_or_default(), 200));
-            }
-            "item/mcpToolCall/progress" => {
-                debug!(target: "codex::mcp", "MCP tool progress: {}", truncate(&params.to_string(), 300));
-            }
-
-            "turn/started" => info!(target: "codex::turn", "turn started"),
-            "turn/completed" => info!(target: "codex::turn", "turn completed"),
-            "turn/failed" => warn!(target: "codex::turn", "turn failed: {}", truncate(&params.to_string(), 500)),
-
-            "thread/tokenUsage/updated" => {
-                if let Some(last) = params.get("tokenUsage").and_then(|u| u.get("last")) {
-                    info!(
-                        target: "codex::usage",
-                        "tokens: in={} cached={} out={} (context window {})",
-                        num_of(last, "inputTokens"),
-                        num_of(last, "cachedInputTokens"),
-                        num_of(last, "outputTokens"),
-                        params.get("tokenUsage").and_then(|u| u.get("modelContextWindow")).and_then(|c| c.as_i64()).unwrap_or(0),
-                    );
-                }
-            }
-
-            "mcpServer/startupStatus/updated" => {
-                let name = text_of(params, "name").unwrap_or_default();
-                let status = text_of(params, "status").unwrap_or_default();
-                match params.get("error").and_then(|e| e.as_str()) {
-                    Some(err) => warn!(target: "codex::mcp", "MCP server '{name}' {status}: {err}"),
-                    None => info!(target: "codex::mcp", "MCP server '{name}' {status}"),
-                }
-            }
-
-            "error" | "guardianWarning" | "configWarning" | "deprecationNotice" => {
-                warn!(target: "codex", "{method}: {}", truncate(&params.to_string(), 500));
-            }
-            "model/rerouted" => info!(target: "codex", "model rerouted: {}", truncate(&params.to_string(), 200)),
-
-            _ => debug!(target: "codex::raw", "{method}: {}", truncate(&params.to_string(), 300)),
-        }
-    }
-
-    /// One line per thread item, with the detail that makes it identifiable:
-    /// which command ran, which MCP tool was called, which files changed.
-    fn log_item(method: &str, params: &Value) {
-        let Some(item) = params.get("item") else { return };
-        let Some(kind) = item.get("type").and_then(|t| t.as_str()) else { return };
-        let finished = method == "item/completed";
-
-        match kind {
-            "commandExecution" => {
-                let cmd = truncate(&text_of(item, "command").unwrap_or_default(), 300);
-                if finished {
-                    let exit = num_of(item, "exitCode");
-                    let ms = num_of(item, "durationMs");
-                    let out = truncate(&text_of(item, "aggregatedOutput").unwrap_or_default(), 500);
-                    if exit == 0 {
-                        info!(target: "codex::exec", "$ {cmd} -> exit {exit} in {ms}ms\n{out}");
-                    } else {
-                        warn!(target: "codex::exec", "$ {cmd} -> exit {exit} in {ms}ms\n{out}");
-                    }
-                } else {
-                    info!(target: "codex::exec", "$ {cmd}");
-                }
-            }
-
-            "mcpToolCall" => {
-                let server = text_of(item, "server").unwrap_or_default();
-                let tool = text_of(item, "tool").unwrap_or_default();
-                if finished {
-                    let ms = num_of(item, "durationMs");
-                    match item.get("error").and_then(|e| if e.is_null() { None } else { Some(e) }) {
-                        Some(err) => warn!(target: "codex::mcp", "{server}.{tool} failed in {ms}ms: {}", truncate(&err.to_string(), 400)),
-                        None => info!(target: "codex::mcp", "{server}.{tool} ok in {ms}ms -> {}", truncate(&item.get("result").map(|r| r.to_string()).unwrap_or_default(), 400)),
-                    }
-                } else {
-                    info!(target: "codex::mcp", "{server}.{tool} calling with {}", truncate(&item.get("arguments").map(|a| a.to_string()).unwrap_or_default(), 400));
-                }
-            }
-
-            "fileChange" if finished => {
-                let files: Vec<String> = item
-                    .get("changes")
-                    .and_then(|c| c.as_array())
-                    .map(|arr| arr.iter().filter_map(|c| c.get("path").and_then(|p| p.as_str()).map(str::to_string)).collect())
-                    .unwrap_or_default();
-                info!(target: "codex::files", "edited {} file(s): {}", files.len(), files.join(", "));
-            }
-
-            "webSearch" if finished => {
-                info!(target: "codex::web", "searched: {}", truncate(&text_of(item, "query").unwrap_or_default(), 200));
-            }
-
-            "agentMessage" if finished => {
-                info!(target: "codex::answer", "{}", truncate(&text_of(item, "text").unwrap_or_default(), 500));
-            }
-
-            "reasoning" if finished => {
-                debug!(target: "codex::reasoning", "{}", truncate(&item.to_string(), 600));
-            }
-
-            "plan" if finished => {
-                info!(target: "codex::plan", "{}", truncate(&text_of(item, "text").unwrap_or_default(), 400));
-            }
-
-            other if finished => debug!(target: "codex::item", "{other} completed"),
-            _ => {}
-        }
-    }
-
     /// Map an app-server notification to the thread it belongs to and the event
     /// tera cares about. Returns `None` for notifications we ignore
     /// (MCP startup status, token usage, rate limits, presence, ...).
@@ -723,7 +542,7 @@ impl CodexProcessManager {
     ///
     /// This is what makes "actually, make it Japanese" work while the agent is
     /// mid-search, instead of starting a second concurrent turn on the same
-    /// thread (PLAN.md section 13.2).
+    /// thread.
     pub async fn steer(&self, thread_id: &str, inputs: &[TurnInput]) -> Result<()> {
         let turn_id = self
             .active_turn_of(thread_id)
@@ -745,7 +564,7 @@ impl CodexProcessManager {
     }
 
     /// Stop the turn running on a thread. Used to get out of the way of real work
-    /// when maintenance is holding the app-server (PLAN.md section 65).
+    /// when maintenance is holding the app-server.
     pub async fn interrupt(&self, thread_id: &str) -> Result<()> {
         let Some(turn_id) = self.active_turn_of(thread_id).await else {
             return Ok(());
@@ -1170,34 +989,3 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod stderr_tests {
-    use super::*;
-
-    #[test]
-    fn test_strip_ansi_removes_colour_sequences() {
-        // Verbatim shape of a codex app-server stderr line.
-        let raw = "\u{1b}[2m2026-08-17T14:47:49Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m \u{1b}[2mcodex_otel\u{1b}[0m: ready";
-        let clean = strip_ansi(raw);
-        assert_eq!(clean, "2026-08-17T14:47:49Z  INFO codex_otel: ready");
-        assert!(!clean.contains('\u{1b}'));
-    }
-
-    #[test]
-    fn test_startup_telemetry_is_not_a_problem() {
-        let line = "2026-08-17T14:47:49Z  INFO codex_otel.trace_safe: \
-                    event.name=\"codex.startup_phase\" startup.status=\"ready\" duration_ms=3421";
-        assert!(!is_stderr_problem(&strip_ansi(line)));
-    }
-
-    #[test]
-    fn test_real_failures_are_still_surfaced() {
-        for line in [
-            "2026-08-17T14:47:49Z ERROR codex: failed to reach model provider",
-            "thread 'main' panicked at src/lib.rs:1:1",
-            "2026-08-17T14:47:49Z  WARN codex: retrying request",
-        ] {
-            assert!(is_stderr_problem(line), "should have been surfaced: {line}");
-        }
-    }
-}

@@ -1,10 +1,9 @@
 use crate::transport::owner::jid_user;
-use crate::transport::{InboundEvent, InboundMedia, InboundMessage, ReactionTarget, Transport};
+use crate::transport::{InboundMedia, InboundMessage, MessageRef, Transport};
 use anyhow::{anyhow, Context, Result};
 use qrcode::render::unicode;
 use qrcode::QrCode;
 use async_trait::async_trait;
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
@@ -12,6 +11,7 @@ use uuid::Uuid;
 use whatsapp_rust::bot::MessageContext;
 use whatsapp_rust::media;
 use whatsapp_rust::wacore::download::MediaType;
+use whatsapp_rust::wacore::proto_helpers::build_quote_context;
 use whatsapp_rust::upload::{UploadOptions, UploadResponse};
 use whatsapp_rust::prelude::*;
 use whatsapp_rust_sqlite_storage::SqliteStore;
@@ -94,6 +94,84 @@ fn media_filename(msg_id: &str, mime: &str, default_ext: &str) -> String {
         .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric()))
         .unwrap_or(default_ext);
     format!("{msg_id}.{ext}")
+}
+
+/// The `ContextInfo` that turns an outbound message into a quoted reply.
+///
+/// WhatsApp renders the quote from a copy of the original carried in the reply,
+/// not from its id: a context with only a stanza id arrives as an empty bubble.
+/// History keeps the text of everything we have seen, so the copy is rebuilt as
+/// plain text. An attachment quotes as an empty body, its media keys being long
+/// gone by the time anyone replies to it.
+fn quote_context(target: &MessageRef, own_jid: Option<Jid>) -> wa::ContextInfo {
+    // Whoever wrote the quoted message, named the way WhatsApp names them: our
+    // own account for something we sent, otherwise the other end of the chat.
+    let sender = match (target.from_me, own_jid) {
+        (true, Some(own)) => own.to_non_ad_string(),
+        _ => target.chat_jid.clone(),
+    };
+
+    build_quote_context(
+        target.provider_msg_id.clone(),
+        sender,
+        &wa::Message::text(target.text.clone().unwrap_or_default()),
+    )
+}
+
+/// Read the provider id of a WhatsApp message this message quotes.
+///
+/// WhatsApp stores reply metadata as `ContextInfo` on the message body, not in
+/// `MessageInfo`. The body can also be wrapped in an ephemeral or view-once
+/// envelope, so inspect the base message after the SDK unwraps those envelopes.
+fn quoted_message_provider_id(message: &wa::Message) -> Option<String> {
+    let message = message.get_base_message();
+
+    macro_rules! find_stanza_id {
+        ($($field:ident),+ $(,)?) => {
+            $(
+                if let Some(body) = message.$field.as_option() {
+                    if let Some(context) = body.context_info.as_option() {
+                        if context.stanza_id.is_some() {
+                            return context.stanza_id.clone();
+                        }
+                    }
+                }
+            )+
+        };
+    }
+
+    find_stanza_id!(
+        extended_text_message,
+        image_message,
+        video_message,
+        ptv_message,
+        audio_message,
+        document_message,
+        sticker_message,
+        location_message,
+        live_location_message,
+        contact_message,
+        contacts_array_message,
+        buttons_message,
+        buttons_response_message,
+        list_message,
+        list_response_message,
+        template_message,
+        template_button_reply_message,
+        interactive_message,
+        interactive_response_message,
+        poll_creation_message,
+        poll_creation_message_v2,
+        poll_creation_message_v3,
+        product_message,
+        order_message,
+        group_invite_message,
+        event_message,
+        sticker_pack_message,
+        newsletter_admin_invite_message,
+    );
+
+    None
 }
 
 pub struct WhatsAppWebTransport {
@@ -201,7 +279,7 @@ impl WhatsAppWebTransport {
 
     pub async fn start_bot<F>(&self, inbound_callback: F) -> Result<()>
     where
-        F: Fn(InboundEvent) + Send + Sync + 'static,
+        F: Fn(InboundMessage) + Send + Sync + 'static,
     {
         let db_str = self.session_db_path.to_string_lossy().to_string();
         info!("Starting whatsapp-rust session at {}", db_str);
@@ -248,14 +326,14 @@ impl WhatsAppWebTransport {
                         sender,
                         text,
                         timestamp_ms,
-                        reply_to_provider_msg_id: None,
+                        reply_to_provider_msg_id: quoted_message_provider_id(&ctx.message),
                         media_attachment,
                         chat_jid: ctx.info.source.chat.to_non_ad_string(),
                         from_own_account: Self::is_own_account(&ctx),
                         is_group: ctx.info.source.is_group,
                     };
 
-                    cb(InboundEvent::Message(msg));
+                    cb(msg);
                 }
             })
             .build()
@@ -276,23 +354,23 @@ impl WhatsAppWebTransport {
 
 #[async_trait]
 impl Transport for WhatsAppWebTransport {
-    async fn send_text(&self, recipient: &str, text: &str, _reply_to_provider_id: Option<&str>) -> Result<String> {
+    async fn send_text(&self, recipient: &str, text: &str, reply_to: Option<&MessageRef>) -> Result<String> {
         info!("whatsapp-rust send_text to {}: {}", recipient, text);
-        let client_opt = {
-            let lock = self.client_handle.lock().unwrap();
-            lock.clone()
-        };
 
         // Never invent a message id on failure: the caller records the returned
         // id in canonical history, so a fabricated one writes a message the user
-        // never received into the permanent record (PLAN.md section 55).
-        let client = client_opt.ok_or_else(|| anyhow!("WhatsApp client is not connected yet"))?;
-        let jid: Jid = recipient
-            .parse()
-            .map_err(|e| anyhow!("Invalid recipient JID '{}': {:?}", recipient, e))?;
+        // never received into the permanent record.
+        let (client, jid) = self.client_for(recipient)?;
+
+        let message = match reply_to {
+            Some(target) => {
+                wa::Message::text_with_context(text, quote_context(target, client.pn()))
+            }
+            None => wa::Message::text(text),
+        };
 
         let send_res = client
-            .send_text(jid, text)
+            .send_message(jid, message)
             .await
             .map_err(|e| anyhow!("WhatsApp send_text to {} failed: {:?}", recipient, e))?;
 
@@ -306,7 +384,7 @@ impl Transport for WhatsAppWebTransport {
         media_type: &str,
         file_path: &Path,
         caption: Option<&str>,
-        reply_to_provider_id: Option<&str>,
+        reply_to: Option<&MessageRef>,
     ) -> Result<String> {
         let (client, jid) = self.client_for(recipient)?;
 
@@ -321,69 +399,62 @@ impl Transport for WhatsAppWebTransport {
             file_path.display()
         );
 
-        let (wa_media_type, message) = match media_type {
+        let context_info = reply_to.map(|target| Box::new(quote_context(target, client.pn())));
+
+        let message = match media_type {
             "image" => {
                 let upload = self.upload(&client, data, MediaType::Image).await?;
-                (
-                    MediaType::Image,
-                    media::image_message(
-                        upload,
-                        media::ImageOptions {
-                            caption: caption.map(str::to_string),
-                            mimetype: Some(mime),
-                            ..Default::default()
-                        },
-                    ),
+                media::image_message(
+                    upload,
+                    media::ImageOptions {
+                        caption: caption.map(str::to_string),
+                        mimetype: Some(mime),
+                        context_info,
+                        ..Default::default()
+                    },
                 )
             }
             "video" => {
                 let upload = self.upload(&client, data, MediaType::Video).await?;
-                (
-                    MediaType::Video,
-                    media::video_message(
-                        upload,
-                        media::VideoOptions {
-                            caption: caption.map(str::to_string),
-                            mimetype: Some(mime),
-                            ..Default::default()
-                        },
-                    ),
+                media::video_message(
+                    upload,
+                    media::VideoOptions {
+                        caption: caption.map(str::to_string),
+                        mimetype: Some(mime),
+                        context_info,
+                        ..Default::default()
+                    },
                 )
             }
             "audio" => {
                 let upload = self.upload(&client, data, MediaType::Audio).await?;
-                (
-                    MediaType::Audio,
-                    media::audio_message(
-                        upload,
-                        media::AudioOptions {
-                            mimetype: Some(mime),
-                            ..Default::default()
-                        },
-                    ),
+                media::audio_message(
+                    upload,
+                    media::AudioOptions {
+                        mimetype: Some(mime),
+                        context_info,
+                        ..Default::default()
+                    },
                 )
             }
             // Anything else rides as a document, which is what WhatsApp does for
             // arbitrary files anyway.
             _ => {
                 let upload = self.upload(&client, data, MediaType::Document).await?;
-                (
-                    MediaType::Document,
-                    media::document_message(
-                        upload,
-                        media::DocumentOptions {
-                            mimetype: Some(mime),
-                            file_name: file_path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string()),
-                            caption: caption.map(str::to_string),
-                            ..Default::default()
-                        },
-                    ),
+                media::document_message(
+                    upload,
+                    media::DocumentOptions {
+                        mimetype: Some(mime),
+                        file_name: file_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string()),
+                        caption: caption.map(str::to_string),
+                        context_info,
+                        ..Default::default()
+                    },
                 )
             }
         };
-        let _ = (wa_media_type, reply_to_provider_id);
 
         let send_res = client
             .send_message(jid, message)
@@ -400,7 +471,7 @@ impl Transport for WhatsAppWebTransport {
     async fn send_reaction(
         &self,
         recipient: &str,
-        target: &ReactionTarget,
+        target: &MessageRef,
         emoji: &str,
     ) -> Result<()> {
         let (client, jid) = self.client_for(recipient)?;
@@ -455,27 +526,22 @@ pub struct MockTransport {
     pub sent_messages: Arc<Mutex<Vec<SentMessage>>>,
     pub sent_reactions: Arc<Mutex<Vec<(String, String, String)>>>,
     pub typing_states: Arc<Mutex<Vec<(String, bool)>>>,
-    pub inbound_queue: Arc<Mutex<VecDeque<InboundEvent>>>,
 }
 
 impl MockTransport {
     pub fn new() -> Self {
         Self::default()
     }
-
-    pub fn push_inbound(&self, event: InboundEvent) {
-        self.inbound_queue.lock().unwrap().push_back(event);
-    }
 }
 
 #[async_trait]
 impl Transport for MockTransport {
-    async fn send_text(&self, recipient: &str, text: &str, reply_to_provider_id: Option<&str>) -> Result<String> {
+    async fn send_text(&self, recipient: &str, text: &str, reply_to: Option<&MessageRef>) -> Result<String> {
         let msg_id = format!("wamid.mock_{}", Uuid::new_v4().simple());
         self.sent_messages.lock().unwrap().push((
             recipient.to_string(),
             text.to_string(),
-            reply_to_provider_id.map(|s| s.to_string()),
+            reply_to.map(|t| t.provider_msg_id.clone()),
         ));
         Ok(msg_id)
     }
@@ -486,7 +552,7 @@ impl Transport for MockTransport {
         media_type: &str,
         file_path: &Path,
         caption: Option<&str>,
-        reply_to_provider_id: Option<&str>,
+        reply_to: Option<&MessageRef>,
     ) -> Result<String> {
         let msg_id = format!("wamid.mock_media_{}", Uuid::new_v4().simple());
         let cap_str = caption.unwrap_or("");
@@ -494,12 +560,12 @@ impl Transport for MockTransport {
         self.sent_messages.lock().unwrap().push((
             recipient.to_string(),
             text,
-            reply_to_provider_id.map(|s| s.to_string()),
+            reply_to.map(|t| t.provider_msg_id.clone()),
         ));
         Ok(msg_id)
     }
 
-    async fn send_reaction(&self, recipient: &str, target: &ReactionTarget, emoji: &str) -> Result<()> {
+    async fn send_reaction(&self, recipient: &str, target: &MessageRef, emoji: &str) -> Result<()> {
         self.sent_reactions.lock().unwrap().push((
             recipient.to_string(),
             target.provider_msg_id.clone(),
@@ -513,6 +579,56 @@ impl Transport for MockTransport {
         Ok(())
     }
 
+}
+
+#[cfg(test)]
+mod quote_tests {
+    use super::*;
+
+    fn target(from_me: bool, text: Option<&str>) -> MessageRef {
+        MessageRef {
+            provider_msg_id: "3EB0ABCDEF".to_string(),
+            chat_jid: "15550001111@s.whatsapp.net".to_string(),
+            from_me,
+            text: text.map(str::to_string),
+        }
+    }
+
+    fn own() -> Option<Jid> {
+        // As `Client::pn()` hands it over: our number with the device we paired.
+        Some("15559998888:7@s.whatsapp.net".parse().unwrap())
+    }
+
+    /// The three fields WhatsApp needs to draw a reply bubble. Dropping any of
+    /// them is accepted by the server and then shows up as a plain message.
+    #[test]
+    fn test_quoting_the_owner_names_the_owner_as_the_author() {
+        let ctx = quote_context(&target(false, Some("What is the price?")), own());
+
+        assert_eq!(ctx.stanza_id.as_deref(), Some("3EB0ABCDEF"));
+        assert_eq!(ctx.participant.as_deref(), Some("15550001111@s.whatsapp.net"));
+        assert_eq!(
+            ctx.quoted_message.as_option().and_then(|m| m.text_content()),
+            Some("What is the price?")
+        );
+    }
+
+    /// Quoting ourselves is the same shape with a different author. Reusing the
+    /// chat JID here would credit our own words to the owner.
+    #[test]
+    fn test_quoting_ourselves_names_this_account_without_its_device() {
+        let ctx = quote_context(&target(true, Some("It is 42.")), own());
+
+        assert_eq!(ctx.participant.as_deref(), Some("15559998888@s.whatsapp.net"));
+    }
+
+    #[test]
+    fn test_quoting_an_attachment_still_addresses_the_message() {
+        let ctx = quote_context(&target(false, None), own());
+
+        assert_eq!(ctx.stanza_id.as_deref(), Some("3EB0ABCDEF"));
+        assert_eq!(ctx.participant.as_deref(), Some("15550001111@s.whatsapp.net"));
+    }
 }
 
 #[cfg(test)]
@@ -620,5 +736,25 @@ mod tests {
 
         let widest = art.lines().map(|l| l.chars().count()).max().unwrap();
         assert!(widest <= 80, "a {}-byte payload renders {widest} columns wide", payload.len());
+    }
+
+    #[test]
+    fn test_reads_a_quoted_message_id_from_text_context() {
+        let message = wa::Message {
+            extended_text_message: MessageField::some(wa::message::ExtendedTextMessage {
+                text: Some("Why?".to_string()),
+                context_info: MessageField::some(wa::ContextInfo {
+                    stanza_id: Some("wamid.quoted".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            quoted_message_provider_id(&message).as_deref(),
+            Some("wamid.quoted")
+        );
     }
 }

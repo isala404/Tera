@@ -9,7 +9,7 @@
 //! never appended, which silently dropped every assistant message and reaction
 //! from the projection.
 
-use crate::history::db::{ConversationEvent, HistoryDb};
+use crate::history::db::{ConversationEvent, EventKind, HistoryDb};
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 /// Marker left behind when an append fails, so the next daemon start knows the
-/// projection has drifted from SQLite and rebuilds it (PLAN.md section 17.4).
+/// projection has drifted from SQLite and rebuilds it.
 const DIRTY_MARKER: &str = ".projection-dirty";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,11 +64,11 @@ pub struct JsonlReaction {
 pub struct ProjectionEngine;
 
 impl ProjectionEngine {
-    pub fn event_to_record(event: &ConversationEvent) -> JsonlRecord {
+    fn event_to_record(event: &ConversationEvent) -> JsonlRecord {
         let dt: DateTime<Utc> = Utc.timestamp_millis_opt(event.occurred_at_ms).unwrap();
         let t_str = dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
-        if event.kind == "reaction" {
+        if event.kind == EventKind::Reaction {
             JsonlRecord::Reaction(JsonlReaction {
                 id: event.id.clone(),
                 t: t_str,
@@ -104,8 +104,7 @@ impl ProjectionEngine {
         }
     }
 
-    /// Which monthly file an event belongs in.
-    pub fn month_file(jsonl_dir: &Path, occurred_at_ms: i64) -> PathBuf {
+    fn month_file(jsonl_dir: &Path, occurred_at_ms: i64) -> PathBuf {
         let dt: DateTime<Utc> = Utc.timestamp_millis_opt(occurred_at_ms).unwrap();
         jsonl_dir.join(format!("{}.jsonl", dt.format("%Y-%m")))
     }
@@ -145,7 +144,6 @@ impl ProjectionEngine {
         jsonl_dir.join(DIRTY_MARKER).exists()
     }
 
-    /// Lines currently in the projection, across every month file.
     pub fn projected_line_count(jsonl_dir: &Path) -> Result<usize> {
         if !jsonl_dir.exists() {
             return Ok(0);
@@ -273,7 +271,7 @@ mod tests {
             seq: None,
             id: id.to_string(),
             occurred_at_ms: at_ms,
-            kind: "message".to_string(),
+            kind: EventKind::Message,
             actor: actor.to_string(),
             text: Some(text.to_string()),
             reply_to_id: None,
@@ -287,7 +285,7 @@ mod tests {
     #[test]
     fn test_absent_fields_are_omitted() {
         // The agent reads these lines with jq; a `"reply_to": null` on every
-        // record is noise it has to filter (PLAN.md section 17.3).
+        // record is noise it has to filter.
         let line = serde_json::to_string(&ProjectionEngine::event_to_record(&message(
             "m_1", "user", 1_786_962_664_000, "hi",
         )))
@@ -300,7 +298,7 @@ mod tests {
     #[test]
     fn test_reaction_renders_as_a_reaction_record() {
         let mut ev = message("r_1", "user", 1_786_962_664_000, "");
-        ev.kind = "reaction".to_string();
+        ev.kind = EventKind::Reaction;
         ev.text = None;
         ev.reaction_emoji = Some("❤️".to_string());
         ev.reaction_target_id = Some("m_1".to_string());
