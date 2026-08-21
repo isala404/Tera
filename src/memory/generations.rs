@@ -17,7 +17,7 @@ const MAX_MEMORY_FILE_BYTES: u64 = 4 * 1024 * 1024;
 /// so it has no business being the same order of size as history.
 const MAX_GENERATION_BYTES: u64 = 64 * 1024 * 1024;
 
-/// How many generations to keep for rollback (PLAN.md section 43).
+/// How many generations to keep for rollback.
 const GENERATIONS_TO_KEEP: usize = 14;
 
 pub struct GenerationManager;
@@ -64,7 +64,7 @@ impl GenerationManager {
         Ok((next_num, next_dir))
     }
 
-    /// Deterministic checks before a generation may become active (PLAN.md 64).
+    /// Deterministic checks before a generation may become active.
     ///
     /// These are all shape, never truth: whether the memory is *correct* is a
     /// model and history problem, not something Rust can judge. What Rust can do
@@ -178,8 +178,7 @@ impl GenerationManager {
     /// Removing the old symlink and then creating the new one leaves a window in
     /// which `memories/` does not exist, and a turn reading `memories/INDEX.md`
     /// in that window sees an assistant with no memory at all. Creating the link
-    /// under a temporary name and renaming it over the old one is atomic
-    /// (PLAN.md section 42).
+    /// under a temporary name and renaming it over the old one is atomic.
     pub fn point_memories_at(config: &Config, generation: u64) -> Result<()> {
         let memories_link = config.memories_link();
         let staging_link = config.workspace_dir.join("memories.new");

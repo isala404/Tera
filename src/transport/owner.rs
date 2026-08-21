@@ -5,7 +5,7 @@
 //! therefore run arbitrary work as the owner, so the check belongs in one place
 //! with one answer, not spread across the transport as ad-hoc `if`s.
 //!
-//! PLAN.md section 81: single owner in V1, reject unknown senders.
+//! One owner, and every other sender is rejected.
 
 use crate::transport::InboundMessage;
 use serde::{Deserialize, Serialize};

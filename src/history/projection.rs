@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 /// Marker left behind when an append fails, so the next daemon start knows the
-/// projection has drifted from SQLite and rebuilds it (PLAN.md section 17.4).
+/// projection has drifted from SQLite and rebuilds it.
 const DIRTY_MARKER: &str = ".projection-dirty";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -285,7 +285,7 @@ mod tests {
     #[test]
     fn test_absent_fields_are_omitted() {
         // The agent reads these lines with jq; a `"reply_to": null` on every
-        // record is noise it has to filter (PLAN.md section 17.3).
+        // record is noise it has to filter.
         let line = serde_json::to_string(&ProjectionEngine::event_to_record(&message(
             "m_1", "user", 1_786_962_664_000, "hi",
         )))

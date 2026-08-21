@@ -227,7 +227,7 @@ impl HistoryDb {
     ///
     /// Reply targets arrive as WhatsApp ids. They have to be translated before
     /// they are stored, because history is addressed by event id and the JSONL
-    /// projection must not contain provider ids at all (PLAN.md section 17.3) , 
+    /// projection must not contain provider ids at all , 
     /// storing the raw provider id made `reply_to` unjoinable against anything.
     pub fn event_id_for_provider_ref(&self, provider: &str, provider_msg_id: &str) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();

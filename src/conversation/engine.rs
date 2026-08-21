@@ -20,12 +20,12 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 /// How long to wait for the user to stop typing before starting a turn, so a
-/// three-message burst becomes one turn rather than three (PLAN.md section 13).
+/// three-message burst becomes one turn rather than three.
 const BURST_QUIET_PERIOD: Duration = Duration::from_millis(2500);
 
 /// Ceiling on the total wait from the first message of a burst. The quiet period
 /// restarts on each new message, so without this someone typing steadily is never
-/// answered at all (PLAN.md section 13.1).
+/// answered at all.
 const MAX_BURST_WAIT: Duration = Duration::from_secs(8);
 
 /// Bursts waiting out their quiet period, and the logical turn currently being
@@ -43,7 +43,7 @@ struct ConversationState {
 /// What to do with a message that just arrived.
 enum Route {
     /// A turn is already running: hand the message to it as it arrives, with no
-    /// debounce (PLAN.md section 13.2).
+    /// debounce.
     Steer,
     /// A burst is already collecting for this sender; its timer will fire.
     JoinBurst,
@@ -123,7 +123,7 @@ impl TurnEngine {
         // 2. Decide where this message goes before recording it, because the
         //    answer determines the logical turn id it is stamped with. Without
         //    that, user messages had no `turn` in history at all and a past
-        //    exchange could not be reconstructed (PLAN.md section 13.3).
+        //    exchange could not be reconstructed.
         let (route, logical_turn) = self.route(&sender).await;
 
         let conv_ev = ConversationEvent {
@@ -364,7 +364,7 @@ impl TurnEngine {
     }
 
     /// Write inbound media into the asset store and describe it as an
-    /// attachment row. Originals are kept byte-for-byte (PLAN.md section 19).
+    /// attachment row. Originals are kept byte-for-byte.
     fn persist_media(&self, msg: &InboundMessage, event_id: &str) -> Result<Vec<Attachment>> {
         let Some(media) = &msg.media_attachment else {
             return Ok(vec![]);
@@ -511,7 +511,7 @@ impl TurnEngine {
             // The agent is instructed to reply through the send_message MCP tool, and
             // usually does. Sending the final agent text unconditionally would then
             // deliver every answer twice. Only fall back when the turn produced no
-            // user-visible message of its own (PLAN.md section 54.1).
+            // user-visible message of its own.
             if self.session.sends_since(sends_before) > 0 {
                 info!("Turn replied via send_message; skipping final-text fallback");
                 return Ok(());

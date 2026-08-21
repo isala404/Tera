@@ -40,7 +40,7 @@ pub struct SchedulerRunner {
     codex: CodexSupervisor,
     activity: ActivityTracker,
     /// Schedules with a run in flight. A slow task must not be started again on
-    /// the next tick five seconds later (PLAN.md section 28.1).
+    /// the next tick five seconds later.
     running: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -192,7 +192,7 @@ impl SchedulerRunner {
         )?;
 
         // Codex reads AGENTS.md from the thread's cwd, so the bootstrap has to
-        // live in the task directory itself (PLAN.md section 62).
+        // live in the task directory itself.
         fs::write(
             task_dir.join("AGENTS.md"),
             templates::render(crate::data::SCHEDULE_AGENTS, &self.config),
@@ -205,8 +205,7 @@ impl SchedulerRunner {
         //
         //    Computing the next run from *now* rather than from the missed slot is
         //    also what coalesces a backlog: after an outage a daily job fires once
-        //    and resumes its normal cadence, instead of replaying 40 occurrences
-        //    (PLAN.md section 28.2).
+        //    and resumes its normal cadence, instead of replaying 40 occurrences.
         let next_run = RecurrenceEngine::compute_next_run(
             &item.schedule_type,
             item.one_shot_at_ms,
@@ -372,7 +371,7 @@ impl SchedulerRunner {
         }
     }
 
-    /// Append one line per run to the task's own `RUNS.jsonl` (PLAN.md 25).
+    /// Append one line per run to the task's own `RUNS.jsonl`.
     fn append_run_log(&self, task_dir: &Path, item: &ScheduleItem, state: &str, detail: &str) {
         let entry = serde_json::json!({
             "at": Local::now().to_rfc3339(),

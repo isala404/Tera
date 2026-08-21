@@ -17,7 +17,7 @@ pub struct ModelDiscovery;
 
 impl ModelDiscovery {
     /// Record which model this daemon runs on, and flag a memory rebuild when it
-    /// changes (PLAN.md section 11.2).
+    /// changes.
     ///
     /// The tracked model is *ours*, [`tier::CONVERSATION`], not the app-server's
     /// advertised default. The rebuild exists because memory is one model's

@@ -3,7 +3,7 @@
 //! SQLite is the only authoritative copy of the conversation, and memory is
 //! derived from it, losing it loses everything the assistant knows. Backups go
 //! through SQLite rather than copying the file, because a plain copy of a live
-//! WAL database can be torn (PLAN.md section 73).
+//! WAL database can be torn.
 
 use crate::config::Config;
 use anyhow::{anyhow, Context, Result};
@@ -107,7 +107,7 @@ pub fn check_integrity(config: &Config, db: &crate::history::db::HistoryDb) -> R
 /// Remove staging directories left behind by an interrupted run.
 ///
 /// Staging is always rebuilt from scratch before use, so anything found here at
-/// boot is debris from a crash, and it is debris that takes disk (PLAN.md 96.3).
+/// boot is debris from a crash, and it is debris that takes disk.
 pub fn clear_stale_staging(config: &Config) -> Result<Vec<PathBuf>> {
     let mut removed = Vec::new();
     for root in [config.staging_dir(), config.runtime_dir().join("tmp")] {

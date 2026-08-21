@@ -29,7 +29,7 @@ impl MessageBurst {
     ///
     /// The quiet period restarts on every message, so a user who keeps typing
     /// would otherwise never get an answer. `max_wait` caps the total from the
-    /// first message (PLAN.md section 13.1).
+    /// first message.
     pub fn remaining_wait(&self, quiet: Duration, max_wait: Duration) -> Duration {
         let since_last = self.last_updated_at.elapsed();
         let quiet_left = quiet.saturating_sub(since_last);

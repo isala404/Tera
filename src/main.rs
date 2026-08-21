@@ -300,8 +300,7 @@ async fn main() -> Result<()> {
         }
 
         // Reports what is degraded, not just what is configured: a status command
-        // that only echoes paths back cannot tell you why the assistant is quiet
-        // (PLAN.md section 95).
+        // that only echoes paths back cannot tell you why the assistant is quiet.
         Commands::Status { workspace: WorkspaceArg { workspace } } => {
             let config = Config::new(workspace, false);
             println!("=== tera status ===");
@@ -610,7 +609,7 @@ async fn main() -> Result<()> {
             let runtime_db = RuntimeDb::open(&config.runtime_db_path())?;
 
             // 2a. Repair what a crash or an older build may have left behind,
-            //     before anything is served (PLAN.md section 96.3).
+            //     before anything is served.
             match backup::clear_stale_staging(&config) {
                 Ok(removed) if !removed.is_empty() => {
                     info!("Cleared {} stale staging director(ies)", removed.len())
@@ -789,8 +788,8 @@ async fn main() -> Result<()> {
                 _ = update_signal.recv() => {}
             }
 
-            // Graceful shutdown (PLAN.md section 52). Systemd may restart us, so
-            // what matters is leaving no state that a fresh start would misread:
+            // Graceful shutdown. Systemd may restart us, so what matters is
+            // leaving no state that a fresh start would misread:
             // no phantom typing indicator, no stale socket.
             info!("Shutting down: clearing typing state and releasing the socket");
             if let Some(chat) = session.chat() {

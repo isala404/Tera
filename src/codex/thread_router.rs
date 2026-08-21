@@ -1,4 +1,4 @@
-//! Thread-selection policy for the main conversation (PLAN.md section 12.3).
+//! Thread-selection policy for the main conversation.
 //!
 //! This decides *whether* to keep talking on the current thread. It deliberately
 //! does not mint thread ids: only the app-server can, and an earlier version that
@@ -73,8 +73,8 @@ impl ThreadRouter {
     /// Pointers handed to a thread that starts with nothing. The caller adds
     /// the recent conversation itself.
     ///
-    /// Kept deliberately small. PLAN.md section 12.4 is explicit that a fresh
-    /// thread should not receive a synthesized context blob. `AGENTS.md` tells
+    /// Kept deliberately small. A fresh thread gets pointers, never a
+    /// synthesized context blob. `AGENTS.md` tells
     /// the agent to read `HORIZON.md` and `INDEX.md` itself, and it reads them
     /// better than we can summarize them.
     pub fn build_bootstrap_context(config: &Config) -> String {

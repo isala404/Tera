@@ -3,8 +3,7 @@
 //!
 //! One loop owns both because they share the same precondition, nothing else is
 //! using the app-server, and the same transaction shape. Its whole job is to
-//! wait for an idle window and then not be in the way (PLAN.md sections 40, 41
-//! and 11.2).
+//! wait for an idle window and then not be in the way.
 
 use crate::codex::models::{ModelDescriptor, ModelDiscovery};
 use crate::codex::CodexSupervisor;
@@ -33,7 +32,7 @@ const NIGHTLY_WINDOW: std::ops::Range<u32> = 0..4;
 /// again.
 const STARVATION_DAYS: i64 = 3;
 
-/// How often to re-check the default model (PLAN.md 11.2: startup, then daily).
+/// How often to re-check the default model, on top of the check at startup.
 const MODEL_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 
 const LAST_OPTIMIZED_KEY: &str = "memory_optimizer_last_run_date";
@@ -187,7 +186,7 @@ impl MaintenanceRunner {
     }
 
     /// Ask the app-server what it is running now, and flag a rebuild if the
-    /// default model has changed since last time (PLAN.md section 11.2).
+    /// default model has changed since last time.
     async fn check_default_model(&self) -> Result<()> {
         let response = self.codex.list_models().await?;
         let models = Self::parse_models(&response);

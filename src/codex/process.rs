@@ -131,7 +131,7 @@ impl TurnInput {
 ///
 /// The difference matters beyond logging: a resumed thread already knows the
 /// user, while a fresh one needs bootstrap context before it can behave like the
-/// same assistant (PLAN.md section 12.4).
+/// same assistant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadOrigin {
     /// Rejoined a thread from a previous daemon run; history intact.
@@ -364,8 +364,7 @@ impl CodexProcessManager {
     }
 
     /// Thread creation settings. The assistant runs unattended over WhatsApp, so
-    /// it cannot answer approval prompts. Hence `never` / full access, per
-    /// PLAN.md section 10.
+    /// it cannot answer approval prompts. Hence `never` and full access.
     fn thread_params(&self, opts: &ThreadOptions) -> Value {
         json!({
             "cwd": opts.cwd.to_string_lossy(),
@@ -505,7 +504,7 @@ impl CodexProcessManager {
     }
 
     /// Ask the app-server which models it offers and which is default, so memory
-    /// regeneration can be triggered when the default changes (PLAN.md 11).
+    /// regeneration can be triggered when the default changes.
     pub async fn list_models(&self) -> Result<Value> {
         self.send_request("model/list", Some(json!({}))).await
     }
@@ -723,7 +722,7 @@ impl CodexProcessManager {
     ///
     /// This is what makes "actually, make it Japanese" work while the agent is
     /// mid-search, instead of starting a second concurrent turn on the same
-    /// thread (PLAN.md section 13.2).
+    /// thread.
     pub async fn steer(&self, thread_id: &str, inputs: &[TurnInput]) -> Result<()> {
         let turn_id = self
             .active_turn_of(thread_id)
@@ -745,7 +744,7 @@ impl CodexProcessManager {
     }
 
     /// Stop the turn running on a thread. Used to get out of the way of real work
-    /// when maintenance is holding the app-server (PLAN.md section 65).
+    /// when maintenance is holding the app-server.
     pub async fn interrupt(&self, thread_id: &str) -> Result<()> {
         let Some(turn_id) = self.active_turn_of(thread_id).await else {
             return Ok(());

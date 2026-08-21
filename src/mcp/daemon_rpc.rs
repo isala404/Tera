@@ -425,7 +425,7 @@ impl DaemonRpcServer {
 
             // Reading history is deliberately NOT a tool. The agent has a shell,
             // jq, sqlite3 and Python, and the projection is designed for them
-            // (PLAN.md section 18). A tool here would only be a worse query
+            //. A tool here would only be a worse query
             // language than the ones it already knows.
             _ => Err(anyhow!("Unknown MCP tool name: '{}'", name)),
         }
