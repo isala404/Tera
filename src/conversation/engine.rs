@@ -7,7 +7,7 @@ use crate::conversation::session::ConversationSession;
 use crate::conversation::typing::TypingGuard;
 use crate::history::assets::AssetStorage;
 use crate::conversation::record_assistant_message;
-use crate::history::db::{Attachment, ConversationEvent, HistoryDb, ProviderRef};
+use crate::history::db::{Attachment, ConversationEvent, EventKind, HistoryDb, ProviderRef};
 use crate::runtime::{ActivityTracker, RuntimeDb};
 use crate::secrets::{Capture, SecretStore};
 use crate::transport::{InboundMessage, OwnerPolicy, Transport, Verdict};
@@ -130,7 +130,7 @@ impl TurnEngine {
             seq: None,
             id: event_id.clone(),
             occurred_at_ms: msg.timestamp_ms,
-            kind: "message".to_string(),
+            kind: EventKind::Message,
             actor: "user".to_string(),
             text: msg.text.clone(),
             reply_to_id: self.resolve_reply_target(msg.reply_to_provider_msg_id.as_deref()),

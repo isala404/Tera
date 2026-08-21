@@ -67,12 +67,51 @@ pub struct Attachment {
     pub original_name: Option<String>,
 }
 
+/// What a row in `events` is.
+///
+/// Stored as the lowercase name because the agent queries the `kind` column
+/// with `sqlite3` directly, so the text is part of the interface, not an
+/// implementation detail we are free to rename.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EventKind {
+    Message,
+    Reaction,
+}
+
+impl EventKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            EventKind::Message => "message",
+            EventKind::Reaction => "reaction",
+        }
+    }
+}
+
+impl rusqlite::ToSql for EventKind {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(self.as_str().into())
+    }
+}
+
+impl rusqlite::types::FromSql for EventKind {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        match value.as_str()? {
+            "message" => Ok(EventKind::Message),
+            "reaction" => Ok(EventKind::Reaction),
+            other => Err(rusqlite::types::FromSqlError::Other(
+                format!("unknown event kind {other:?}").into(),
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationEvent {
     pub seq: Option<i64>,
     pub id: String,
     pub occurred_at_ms: i64,
-    pub kind: String,
+    pub kind: EventKind,
     pub actor: String,
     pub text: Option<String>,
     pub reply_to_id: Option<String>,
@@ -449,7 +488,7 @@ mod migration_tests {
                 seq: None,
                 id: id.to_string(),
                 occurred_at_ms: 1_786_962_664_000,
-                kind: "message".to_string(),
+                kind: EventKind::Message,
                 actor: actor.to_string(),
                 text: Some(format!("from {actor}")),
                 reply_to_id: None,
@@ -480,7 +519,7 @@ mod migration_tests {
                 seq: None,
                 id: format!("m_{index}"),
                 occurred_at_ms: 1_786_962_664_000 + index,
-                kind: "message".to_string(),
+                kind: EventKind::Message,
                 actor: if index % 2 == 0 { "user" } else { "assistant" }.to_string(),
                 text: Some(format!("message {index}")),
                 reply_to_id: None,

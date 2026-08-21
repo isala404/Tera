@@ -9,7 +9,7 @@
 //! never appended, which silently dropped every assistant message and reaction
 //! from the projection.
 
-use crate::history::db::{ConversationEvent, HistoryDb};
+use crate::history::db::{ConversationEvent, EventKind, HistoryDb};
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -68,7 +68,7 @@ impl ProjectionEngine {
         let dt: DateTime<Utc> = Utc.timestamp_millis_opt(event.occurred_at_ms).unwrap();
         let t_str = dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
-        if event.kind == "reaction" {
+        if event.kind == EventKind::Reaction {
             JsonlRecord::Reaction(JsonlReaction {
                 id: event.id.clone(),
                 t: t_str,
@@ -271,7 +271,7 @@ mod tests {
             seq: None,
             id: id.to_string(),
             occurred_at_ms: at_ms,
-            kind: "message".to_string(),
+            kind: EventKind::Message,
             actor: actor.to_string(),
             text: Some(text.to_string()),
             reply_to_id: None,
@@ -298,7 +298,7 @@ mod tests {
     #[test]
     fn test_reaction_renders_as_a_reaction_record() {
         let mut ev = message("r_1", "user", 1_786_962_664_000, "");
-        ev.kind = "reaction".to_string();
+        ev.kind = EventKind::Reaction;
         ev.text = None;
         ev.reaction_emoji = Some("❤️".to_string());
         ev.reaction_target_id = Some("m_1".to_string());

@@ -108,6 +108,7 @@ impl InputRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::db::EventKind;
 
     #[test]
     fn test_render_burst() {
@@ -115,7 +116,7 @@ mod tests {
             seq: None,
             id: "m_test".to_string(),
             occurred_at_ms: 1700000000000,
-            kind: "message".to_string(),
+            kind: EventKind::Message,
             actor: "user".to_string(),
             text: Some("Test query".to_string()),
             reply_to_id: None,
@@ -139,7 +140,7 @@ mod tests {
                 seq: None,
                 id: "m_user".to_string(),
                 occurred_at_ms: user_at,
-                kind: "message".to_string(),
+                kind: EventKind::Message,
                 actor: "user".to_string(),
                 text: Some("What happened yesterday?".to_string()),
                 reply_to_id: None,
@@ -152,7 +153,7 @@ mod tests {
                 seq: None,
                 id: "m_assistant".to_string(),
                 occurred_at_ms: assistant_at,
-                kind: "message".to_string(),
+                kind: EventKind::Message,
                 actor: "assistant".to_string(),
                 text: Some("You asked about yesterday.".to_string()),
                 reply_to_id: None,
@@ -188,7 +189,7 @@ mod tests {
             seq: None,
             id: "m_quoted".to_string(),
             occurred_at_ms: 1_700_000_000_000,
-            kind: "message".to_string(),
+            kind: EventKind::Message,
             actor: "assistant".to_string(),
             text: Some("The answer is 42.".to_string()),
             reply_to_id: None,
@@ -201,7 +202,7 @@ mod tests {
             seq: None,
             id: "m_reply".to_string(),
             occurred_at_ms: 1_700_000_001_000,
-            kind: "message".to_string(),
+            kind: EventKind::Message,
             actor: "user".to_string(),
             text: Some("Why?".to_string()),
             reply_to_id: Some("m_quoted".to_string()),

@@ -1,7 +1,7 @@
 use crate::codex::tier;
 use crate::config::Config;
 use crate::conversation::ConversationSession;
-use crate::history::db::{ConversationEvent, HistoryDb, ProviderRef};
+use crate::history::db::{ConversationEvent, EventKind, HistoryDb, ProviderRef};
 use crate::runtime::RuntimeDb;
 use crate::scheduler::db::SchedulerDb;
 use crate::scheduler::recurrence::{self as recurrence, ScheduleTiming};
@@ -251,7 +251,7 @@ impl DaemonRpcServer {
                     seq: None,
                     id: format!("m_{}", Uuid::new_v4().simple()),
                     occurred_at_ms: Utc::now().timestamp_millis(),
-                    kind: "message".to_string(),
+                    kind: EventKind::Message,
                     actor: "assistant".to_string(),
                     text: authored,
                     reply_to_id: reply_to.map(|id| id.to_string()),
@@ -315,7 +315,7 @@ impl DaemonRpcServer {
                     seq: None,
                     id: format!("r_{}", Uuid::new_v4().simple()),
                     occurred_at_ms: Utc::now().timestamp_millis(),
-                    kind: "reaction".to_string(),
+                    kind: EventKind::Reaction,
                     actor: "assistant".to_string(),
                     text: None,
                     reply_to_id: None,
@@ -586,7 +586,7 @@ mod tests {
                 seq: None,
                 id: String::new(),
                 occurred_at_ms: 0,
-                kind: "message".to_string(),
+                kind: EventKind::Message,
                 actor: "user".to_string(),
                 text: Some("which one?".to_string()),
                 reply_to_id: None,

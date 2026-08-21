@@ -153,7 +153,7 @@ pub fn verify_memories_link(config: &Config) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::db::{Attachment, ConversationEvent, HistoryDb};
+    use crate::history::db::{Attachment, ConversationEvent, EventKind, HistoryDb};
     use crate::workspace::init::WorkspaceInit;
 
     fn workspace() -> (tempfile::TempDir, Config) {
@@ -171,7 +171,7 @@ mod tests {
             seq: None,
             id: "m_1".to_string(),
             occurred_at_ms: 1_786_962_664_000,
-            kind: "message".to_string(),
+            kind: EventKind::Message,
             actor: "user".to_string(),
             text: Some("remember this".to_string()),
             reply_to_id: None,
@@ -200,7 +200,7 @@ mod tests {
             seq: None,
             id: "m_2".to_string(),
             occurred_at_ms: 1_786_962_664_000,
-            kind: "message".to_string(),
+            kind: EventKind::Message,
             actor: "user".to_string(),
             text: None,
             reply_to_id: None,
@@ -234,7 +234,7 @@ mod tests {
             seq: None,
             id: "m_3".to_string(),
             occurred_at_ms: 1_786_962_664_000,
-            kind: "message".to_string(),
+            kind: EventKind::Message,
             actor: "assistant".to_string(),
             text: Some("fine".to_string()),
             reply_to_id: None,
