@@ -10,4 +10,6 @@ pub mod runtime;
 pub mod scheduler;
 pub mod secrets;
 pub mod transport;
+pub mod update;
+pub mod version;
 pub mod workspace;

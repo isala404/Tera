@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+workspace=$(cd "$script_dir/../../../.." && pwd -P)
+tera_bin=$(awk -F '"' '/^command = / { print $2; exit }' "$workspace/.codex-home/config.toml")
+
+if [ -z "$tera_bin" ] || [ ! -x "$tera_bin" ]; then
+    echo "Cannot find the Tera binary from $workspace/.codex-home/config.toml" >&2
+    exit 1
+fi
+
+if [ "${1:-}" = "version" ]; then
+    exec "$tera_bin" version
+fi
+
+exec "$tera_bin" update --workspace "$workspace" "$@"

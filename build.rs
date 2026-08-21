@@ -1,12 +1,16 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_DESCRIPTION_CHARS: usize = 100;
 const MAX_BODY_BYTES: usize = 4 * 1024;
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    emit_build_metadata(&manifest_dir);
+
     let skills_dir = manifest_dir.join("data/skills");
     println!("cargo:rerun-if-changed={}", skills_dir.display());
 
@@ -65,6 +69,86 @@ fn main() {
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("builtin_skills.rs");
     fs::write(&output, generated)
         .unwrap_or_else(|error| panic!("cannot write {}: {error}", output.display()));
+}
+
+fn emit_build_metadata(manifest_dir: &Path) {
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    println!("cargo:rerun-if-env-changed=TERA_GIT_SHA");
+
+    let commit_sha = env::var("TERA_GIT_SHA")
+        .ok()
+        .filter(|sha| !sha.trim().is_empty())
+        .unwrap_or_else(|| {
+            git_output(manifest_dir, &["rev-parse", "HEAD"])
+                .unwrap_or_else(|| "unknown".to_string())
+        });
+
+    // HEAD itself usually contains only the name of the current branch. Watching
+    // its resolved ref makes a commit rebuild the metadata even when no source
+    // file changed after the last verification build.
+    if let Some(git_dir) = git_output(manifest_dir, &["rev-parse", "--absolute-git-dir"]) {
+        println!("cargo:rerun-if-changed={git_dir}/HEAD");
+        if let Some(reference) = git_output(manifest_dir, &["symbolic-ref", "-q", "HEAD"]) {
+            println!("cargo:rerun-if-changed={git_dir}/{reference}");
+        }
+    }
+
+    let built_at = env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is before the Unix epoch")
+                .as_secs()
+        });
+
+    println!("cargo:rustc-env=TERA_GIT_SHA={commit_sha}");
+    println!("cargo:rustc-env=TERA_BUILD_TIME={}", rfc3339(built_at));
+    println!(
+        "cargo:rustc-env=TERA_BUILD_TARGET={}",
+        env::var("TARGET").unwrap_or_else(|_| "unknown".to_string())
+    );
+}
+
+fn git_output(manifest_dir: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(manifest_dir)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Format a Unix timestamp without adding a build dependency solely for a date.
+fn rfc3339(timestamp: u64) -> String {
+    let days = (timestamp / 86_400) as i64;
+    let seconds = timestamp % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds / 3_600;
+    let minute = seconds % 3_600 / 60;
+    let second = seconds % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+// Howard Hinnant's civil calendar conversion, with the Unix epoch as day zero.
+fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month, day)
 }
 
 fn read_dirs(path: &Path) -> Vec<PathBuf> {

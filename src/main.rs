@@ -15,7 +15,7 @@ use tera::scheduler::SchedulerRunner;
 use tera::transport::{InboundEvent, MockTransport, Transport, WhatsAppWebTransport};
 use tera::workspace::WorkspaceInit;
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -26,7 +26,11 @@ const PHOENIX_REPORT_ATTEMPTS: u32 = 10;
 use tracing::{error, info, warn};
 
 #[derive(Parser)]
-#[command(name = "tera")]
+#[command(
+    name = "tera",
+    version = env!("CARGO_PKG_VERSION"),
+    long_version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("TERA_GIT_SHA"), ", built ", env!("TERA_BUILD_TIME"), ")")
+)]
 #[command(about = "Persistent Personal Helper Daemon", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -35,6 +39,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Print Tera and Codex version details
+    Version {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Update Tera and Codex, then restart the daemon safely
+    Update {
+        #[arg(long, default_value = "/workspace")]
+        workspace: PathBuf,
+        #[arg(long, value_enum, default_value_t = UpdateComponent::All)]
+        component: UpdateComponent,
+        /// Reinstall the current Tera release
+        #[arg(long)]
+        force: bool,
+    },
     /// Start the long-running assistant daemon
     Daemon {
         #[arg(long, default_value = "/workspace")]
@@ -72,6 +91,37 @@ enum Commands {
         #[command(subcommand)]
         sub: SecretSubcommands,
     },
+    #[command(name = "__signal-update", hide = true)]
+    InternalSignalUpdate {
+        #[arg(long)]
+        lock: PathBuf,
+        #[arg(long)]
+        pid: u32,
+    },
+    #[command(name = "__restart-daemon", hide = true)]
+    InternalRestartDaemon {
+        #[arg(long)]
+        workspace: PathBuf,
+        #[arg(long)]
+        old_pid: u32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum UpdateComponent {
+    All,
+    Tera,
+    Codex,
+}
+
+impl From<UpdateComponent> for tera::update::Component {
+    fn from(value: UpdateComponent) -> Self {
+        match value {
+            UpdateComponent::All => Self::All,
+            UpdateComponent::Tera => Self::Tera,
+            UpdateComponent::Codex => Self::Codex,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -160,11 +210,15 @@ impl Commands {
         match self {
             Commands::Daemon { workspace, .. }
             | Commands::Init { workspace }
-            | Commands::Status { workspace } => Some(workspace),
+            | Commands::Status { workspace }
+            | Commands::Update { workspace, .. }
+            | Commands::InternalRestartDaemon { workspace, .. } => Some(workspace),
             Commands::History { sub } => Some(sub.workspace()),
             Commands::Memory { sub } => Some(sub.workspace()),
             Commands::Secret { sub } => Some(sub.workspace()),
-            Commands::Mcp { .. } => None,
+            Commands::Mcp { .. }
+            | Commands::Version { .. }
+            | Commands::InternalSignalUpdate { .. } => None,
         }
     }
 }
@@ -202,6 +256,38 @@ async fn main() -> Result<()> {
     tera::observability::init_tracing(log_dir.as_deref());
 
     match cli.command {
+        Commands::Version { json } => {
+            tera::version::VersionReport::current().print(json)?;
+        }
+
+        Commands::Update {
+            workspace,
+            component,
+            force,
+        } => {
+            let config = Config::new(workspace, false);
+            let outcome = tera::update::run(&config, component.into(), force)?;
+            println!(
+                "Tera: {} ({})",
+                outcome.tera.version,
+                outcome.tera.short_sha()
+            );
+            if let Some(codex) = outcome.codex {
+                println!("Codex: {codex}");
+            }
+            if outcome.restart_scheduled {
+                println!("The daemon will restart in a few seconds. Phoenix will report the result.");
+            }
+        }
+
+        Commands::InternalSignalUpdate { lock, pid } => {
+            tera::update::signal_update(&lock, pid)?;
+        }
+
+        Commands::InternalRestartDaemon { workspace, old_pid } => {
+            tera::update::restart_daemon(workspace, old_pid)?;
+        }
+
         Commands::Init { workspace } => {
             let config = Config::new(workspace, false);
             WorkspaceInit::init(&config)?;
@@ -511,6 +597,15 @@ async fn main() -> Result<()> {
             if let Some(mark) = &crashed {
                 warn!("Previous tera {} (started {})", mark.describe(), mark.started_at_ms);
             }
+            let update_notice = match tera::update::startup_action(&config, crashed.is_some())? {
+                tera::update::StartupAction::Continue(notice) => notice.map(|notice| *notice),
+                tera::update::StartupAction::RestartAfterRollback => {
+                    runtime::phoenix::disarm(&config.runtime_dir());
+                    return Err(anyhow::anyhow!(
+                        "the failed update was rolled back; restarting the restored binary"
+                    ));
+                }
+            };
 
             // 2. Initialize workspace & databases
             WorkspaceInit::init(&config)?;
@@ -563,7 +658,13 @@ async fn main() -> Result<()> {
             // One app-server process, shared by the conversation and the scheduler.
             let codex =
                 CodexSupervisor::new(config.clone(), runtime_db.clone(), history_db.clone());
-            codex.warm_in_background();
+            if update_notice.is_some() {
+                // An update is not healthy until the exact app-server protocol
+                // this daemon depends on has completed its handshake.
+                codex.ensure().await?;
+            } else {
+                codex.warm_in_background();
+            }
 
             // 3. Initialize transport & spawn bot loop
             let transport: Arc<dyn Transport> = if config.mock_transport {
@@ -597,7 +698,7 @@ async fn main() -> Result<()> {
                 );
                 tokio::spawn(async move {
                     for attempt in 1..=PHOENIX_REPORT_ATTEMPTS {
-                        match phoenix.run(crashed.clone()).await {
+                        match phoenix.run(crashed.clone(), update_notice.clone()).await {
                             Ok(()) => return,
                             Err(e) => {
                                 warn!("Phoenix could not run (attempt {attempt}): {e:?}");
@@ -683,8 +784,23 @@ async fn main() -> Result<()> {
             ));
             maintenance.start_loop();
 
+            // Everything required to serve a turn is now running, including a
+            // post-update Codex handshake. The rollback copy is no longer needed.
+            tera::update::mark_healthy(&config);
+
             info!("Daemon is fully initialized and operational. Press Ctrl+C to stop.");
-            tokio::signal::ctrl_c().await?;
+            let update_restart = {
+                let mut update_signal = tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::user_defined1(),
+                )?;
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => {
+                        result?;
+                        false
+                    }
+                    _ = update_signal.recv() => true,
+                }
+            };
 
             // Graceful shutdown (PLAN.md section 52). Systemd may restart us, so
             // what matters is leaving no state that a fresh start would misread:
@@ -703,6 +819,9 @@ async fn main() -> Result<()> {
 
             // Last thing, so anything that stops us before here reads as a crash.
             runtime::phoenix::disarm(&config.runtime_dir());
+            if update_restart {
+                tera::update::spawn_manual_restart(&config, std::process::id())?;
+            }
             info!("tera stopped.");
         }
     }

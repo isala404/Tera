@@ -48,11 +48,21 @@ Every subcommand takes `--workspace <path>`, default `/workspace`. Point it some
 | --- | --- |
 | `daemon` | the assistant itself with WhatsApp, MCP socket, scheduler and memory maintenance |
 | `init` | idempotent workspace setup, called automatically by `daemon` |
+| `version [--json]` | binary version, commit SHA, build time and installed Codex version |
+| `update [--component all\|tera\|codex]` | update Codex and Tera, then restart with Phoenix rollback protection |
 | `mcp --socket <path>` | stdio proxy Codex spawns to reach the daemon's tools, not for humans |
 | `status` | daemon state, history health, active memory generation, schedules |
 | `history rebuild-jsonl \| backup \| check` | projection, snapshot, integrity check (`check` exits 1 on failure) |
 | `memory rebuild \| optimize` | regenerate or tidy memory, each via its own Codex turn |
 | `memory status \| rollback <generation>` | list generations, or point active memory at an earlier one |
+
+## Updates
+
+Ask the assistant to update itself, or run `tera update --workspace ~/assistant-workspace`. The bundled update skill calls the native updater directly without MCP. Codex updates through its own `codex update` command. Tera downloads the release binary and checksum, verifies both the target and embedded version details, keeps the current executable as a rollback copy, and replaces it atomically.
+
+The daemon restarts only after the update command returns. A systemd service comes back through `Restart=always`. A daemon started by hand uses a small detached restarter. The update journal is committed only after Tera initializes the workspace and completes a real Codex app server handshake. If the replacement crashes before that point, the next Phoenix start restores the prior Tera and Codex executables and reports the rollback to the owner.
+
+Official release assets are `tera-x86_64-unknown-linux-gnu` and `tera-aarch64-apple-darwin`, each with a matching `.sha256` file. Builds made outside Git carry `unknown` as the commit SHA. Set `TERA_GIT_SHA` in the build environment when packaging from an exported source tree.
 
 ## Workspace
 

@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Check tag matches the package version
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          test "$GITHUB_REF_NAME" = "v$version"
+      - name: Build
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Package
+        run: |
+          asset="tera-${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/tera" "$asset"
+          shasum -a 256 "$asset" > "$asset.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tera-${{ matrix.target }}
+          path: |
+            tera-${{ matrix.target }}
+            tera-${{ matrix.target }}.sha256
+
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag

@@ -104,6 +104,10 @@ mod tests {
         ("prompts/scheduled-task-late.md", SCHEDULED_TASK_LATE_NOTE),
         ("prompts/phoenix-recovery.md", PHOENIX_RECOVERY_PROMPT),
         ("prompts/self-care.md", SELF_CARE_PROMPT),
+        (
+            "skills/self-update/SKILL.md",
+            include_str!("../data/skills/self-update/SKILL.md"),
+        ),
         ("skills/spotify/SKILL.md", include_str!("../data/skills/spotify/SKILL.md")),
         ("config/codex-config.toml", CODEX_CONFIG_TOML),
         ("config/mcp-tools.json", MCP_TOOLS_JSON),

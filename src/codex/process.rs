@@ -352,7 +352,7 @@ impl CodexProcessManager {
                 Some(json!({
                     "clientInfo": {
                         "name": "tera",
-                        "version": "0.1.0"
+                        "version": env!("CARGO_PKG_VERSION")
                     }
                 })),
             )
