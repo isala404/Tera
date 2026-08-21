@@ -23,7 +23,7 @@ use crate::data;
 use crate::history::db::HistoryDb;
 use crate::runtime::crash_mark::CrashMark;
 use crate::runtime::{ActivityTracker, ConversationTurn, RuntimeDb};
-use crate::transport::Transport;
+use crate::transport::{MessageRef, Transport};
 use crate::update::UpdateNotice;
 use anyhow::Result;
 use std::sync::Arc;
@@ -168,14 +168,21 @@ impl Phoenix {
         }
 
         let text = lines.join(" ");
+        // Quote what the owner was waiting on, so the report lands against the
+        // request it is about rather than at the bottom of a cold thread.
         let reply_to = recoverable
             .first()
             .or(abandoned.first())
-            .map(|t| t.last_provider_msg_id.clone());
+            .map(|t| MessageRef {
+                provider_msg_id: t.last_provider_msg_id.clone(),
+                chat_jid: chat_jid.to_string(),
+                from_me: false,
+                text: self.quoted_text(&t.last_provider_msg_id),
+            });
 
         let provider_msg_id = self
             .transport
-            .send_text(chat_jid, &text, reply_to.as_deref())
+            .send_text(chat_jid, &text, reply_to.as_ref())
             .await?;
         record_assistant_message(
             &self.history_db,
@@ -187,6 +194,17 @@ impl Phoenix {
         )?;
         info!("Phoenix reported to {chat_jid}: {text}");
         Ok(())
+    }
+
+    /// The text of a message we only know by its wire id. Best effort: a quote
+    /// that renders empty is better than a report that never goes out.
+    fn quoted_text(&self, provider_msg_id: &str) -> Option<String> {
+        self.history_db
+            .event_id_for_provider_ref("whatsapp", provider_msg_id)
+            .ok()
+            .flatten()
+            .and_then(|event_id| self.history_db.get_event(&event_id).ok().flatten())
+            .and_then(|event| event.text)
     }
 
     /// One isolated thread, rooted in the workspace, that finishes what was

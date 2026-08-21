@@ -10,7 +10,7 @@ use crate::conversation::record_assistant_message;
 use crate::history::db::{Attachment, ConversationEvent, EventKind, HistoryDb, ProviderRef};
 use crate::runtime::{ActivityTracker, RuntimeDb};
 use crate::secrets::{Capture, SecretStore};
-use crate::transport::{InboundMessage, OwnerPolicy, Transport, Verdict};
+use crate::transport::{InboundMessage, MessageRef, OwnerPolicy, Transport, Verdict};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -527,9 +527,18 @@ impl TurnEngine {
                 reply_text
             };
 
+            // The fallback answers the burst, so it quotes the message that
+            // closed it, which is the one the owner is still looking at.
+            let reply_target = burst.events.last().map(|last| MessageRef {
+                provider_msg_id: last_provider_msg_id.to_string(),
+                chat_jid: chat_jid.clone(),
+                from_me: false,
+                text: last.text.clone(),
+            });
+
             let outbound_msg_id = self
                 .transport
-                .send_text(sender, &reply_text, Some(last_provider_msg_id))
+                .send_text(sender, &reply_text, reply_target.as_ref())
                 .await?;
 
             record_assistant_message(

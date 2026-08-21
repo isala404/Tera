@@ -36,32 +36,37 @@ pub struct InboundMedia {
     pub data: Vec<u8>,
 }
 
-/// Everything needed to address a reaction at an existing message.
+/// Everything needed to point at an existing message: to react to it, or to
+/// quote it in a reply.
 ///
-/// A provider message id alone is not enough: WhatsApp keys a reaction by chat,
-/// sender-side and id together. Passing only the id meant guessing the other
-/// two, and a wrong guess is accepted by the server and then silently dropped.
+/// A provider message id alone is not enough. WhatsApp keys a message by chat,
+/// sender-side and id together, and renders a quote from a copy of the original
+/// carried in the reply itself. Passing only the id meant guessing the rest, and
+/// a wrong guess is accepted by the server and then silently dropped.
 #[derive(Debug, Clone)]
-pub struct ReactionTarget {
+pub struct MessageRef {
     pub provider_msg_id: String,
     /// Chat the message lives in, without any device suffix.
     pub chat_jid: String,
     /// Whether the target message was sent by this account.
     pub from_me: bool,
+    /// The message's own text, so a quote of it can render on the recipient's
+    /// phone. `None` where there is no text to show, such as a bare attachment.
+    pub text: Option<String>,
 }
 
 #[async_trait]
 pub trait Transport: Send + Sync {
-    async fn send_text(&self, recipient: &str, text: &str, reply_to_provider_id: Option<&str>) -> Result<String>;
+    async fn send_text(&self, recipient: &str, text: &str, reply_to: Option<&MessageRef>) -> Result<String>;
     async fn send_media(
         &self,
         recipient: &str,
         media_type: &str,
         file_path: &Path,
         caption: Option<&str>,
-        reply_to_provider_id: Option<&str>,
+        reply_to: Option<&MessageRef>,
     ) -> Result<String>;
-    async fn send_reaction(&self, recipient: &str, target: &ReactionTarget, emoji: &str) -> Result<()>;
+    async fn send_reaction(&self, recipient: &str, target: &MessageRef, emoji: &str) -> Result<()>;
     async fn set_typing_status(&self, recipient: &str, typing: bool) -> Result<()>;
 }
 
