@@ -14,7 +14,7 @@ Everything said in either direction lands in a SQLite event store with a JSONL p
 
 - **`codex` on PATH and logged in.** Tera has no API key of its own. It symlinks `<workspace>/.codex-home/auth.json` to `~/.codex/auth.json` and borrows your login. Run `codex login` once first or every turn fails to authenticate.
 - **A WhatsApp account to link a device to.** Your own number is the easy path.
-- Optionally `git`, `sqlite3`, `jq` and `ffmpeg`. `tera init` warns if they are missing but starts anyway.
+- Optionally `git`, `sqlite3`, `jq` and `ffmpeg`. `tera init` warns if they are missing but starts anyway. The bundled audio skill decodes everything through `ffmpeg`, so it needs that one present.
 
 The wire format was verified against **Codex CLI 0.147.0**. A materially different version may break parsing.
 
@@ -83,6 +83,8 @@ Official release assets are `tera-x86_64-unknown-linux-gnu`, `tera-aarch64-unkno
 Generated files carry an HTML comment marker and are rewritten every start, so an improved template reaches an existing workspace. Edit one by hand and Tera backs your copy up to `<file>.md.user-backup` and installs its own, so put your instructions in `PERSONA.md`, which is written once and left alone.
 
 Bundled skills are stored under `.agents/skills/`, the native Codex repository location. Every package in `data/skills/` is discovered at build time, with no individual Rust registration. Tera installs each package once, updates an untouched managed package when its embedded files change, and remembers user edits, existing paths, symlinks, and deletions. The nightly memory pass also compacts repeated technical work into one candidate for a new or improved skill. It only suggests. Implementation waits for approval and runs on the heavy Sol tier.
+
+The audio skill transcribes voice notes, audio files and video soundtracks on this machine with [parakeet.cpp](https://github.com/mudler/parakeet.cpp). Its first run downloads a pinned release binary and the 0.9GB parakeet tdt 0.6b v3 weights into `<workspace>/.runtime/parakeet/`, checks both against pinned checksums, and installs nothing that does not match. That covers 25 European languages with automatic detection, and costs nothing per minute because no audio leaves the machine.
 
 Codex reaches the daemon through five tools. They are `send_message`, `react`, `schedule`, `list_schedules` and `cancel_schedule`. Schedules name a tier rather than a model id in `src/codex/tier.rs`. The `routine` tier is luna at low effort and the default, `default` is luna at xhigh for conversation, and `heavy` is sol at high.
 

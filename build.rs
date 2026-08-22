@@ -169,12 +169,27 @@ fn read_dirs(path: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Names that appear inside a skill directory without anyone putting them there.
+///
+/// Embedding one is worse than untidy. `WorkspaceInit` reads any edit inside a
+/// built-in skill as the user adopting it and freezes that skill at its current
+/// version, so a `.pyc` that regenerates the first time somebody runs the script
+/// would stop the skill ever being updated again.
+const LOCAL_BYPRODUCTS: &[&str] = &["__pycache__", ".DS_Store"];
+
 fn collect_files(root: &Path, current: &Path, output: &mut Vec<String>) {
     let entries = fs::read_dir(current)
         .unwrap_or_else(|error| panic!("cannot read {}: {error}", current.display()));
     for entry in entries {
         let entry = entry.unwrap_or_else(|error| panic!("cannot read a skill entry: {error}"));
         let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| LOCAL_BYPRODUCTS.contains(&name))
+        {
+            continue;
+        }
         let metadata = fs::symlink_metadata(&path)
             .unwrap_or_else(|error| panic!("cannot inspect {}: {error}", path.display()));
         if metadata.file_type().is_symlink() {

@@ -117,6 +117,7 @@ mod tests {
             include_str!("../data/skills/self-update/SKILL.md"),
         ),
         ("skills/spotify/SKILL.md", include_str!("../data/skills/spotify/SKILL.md")),
+        ("skills/audio/SKILL.md", include_str!("../data/skills/audio/SKILL.md")),
         ("config/codex-config.toml", CODEX_CONFIG_TOML),
         ("config/mcp-tools.json", MCP_TOOLS_JSON),
     ];

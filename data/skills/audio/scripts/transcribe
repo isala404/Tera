@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""Local speech to text for tera, on top of parakeet.cpp.
+
+Everything runs on this machine. The model and the binary are pinned by
+checksum and cached under the workspace runtime directory, never beside the
+skill: tera treats any edit inside a built-in skill as the user adopting it,
+which would freeze the skill at whatever version first downloaded a model.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.error
+import urllib.request
+import wave
+from pathlib import Path
+
+PARAKEET_VERSION = "v0.5.0"
+RELEASE_URL = "https://github.com/mudler/parakeet.cpp/releases/download"
+
+# parakeet-tdt-0.6b-v3. Multilingual across 25 European languages with automatic
+# detection, punctuation and casing, and long form audio in one pass.
+#
+# q8_0 rather than f16. Upstream measures both at 0.0000 WER against the NeMo
+# reference, so this is the smallest weight with published accuracy behind it,
+# and it saves 500MB of download on a setup that already takes minutes. Over
+# 513s of speech the two were a wash on time and word count.
+#
+# It buys no memory headroom, which is worth knowing before someone reaches for
+# a smaller quantization to fit a small machine. Peak resident memory here is
+# dominated by activations, not weights, and it varies more between two runs of
+# one model than between models. Measured peaks ran 5.8GB to 9.8GB for f16 and
+# 8.8GB for q8_0 on identical input. PIECE_SECONDS is the lever for memory.
+MODEL_FILE = "tdt-0.6b-v3-q8_0.gguf"
+MODEL_SHA256 = "4d69a4a6683f4f2d952bad794c1357ca6eb628027695b4699c5a9ad4cd07d757"
+MODEL_REVISION = "bf0af9f425fa01809cadec671b3cb672709d13e9"
+MODEL_URL = (
+    f"https://huggingface.co/mudler/parakeet-cpp-gguf/resolve/{MODEL_REVISION}/{MODEL_FILE}"
+)
+
+# Pinned by checksum because setup downloads an executable and then runs it.
+# Keyed by what platform.system() and platform.machine() actually report.
+RELEASES = {
+    ("Darwin", "arm64"): (
+        "macos-metal-arm64",
+        "819999afb74cfcbb2c8bf4cfff398ef35616c016bca1a311e0ef9660bb4708ee",
+    ),
+    ("Darwin", "x86_64"): (
+        "macos-cpu-x64",
+        "7acddf9cc47684f6e3fba54d50768f8b301947fcb6a9ec65c64443704cc4896f",
+    ),
+    ("Linux", "x86_64"): (
+        "linux-cpu-x64",
+        "636a9fc48ac023096037790f9b77d7e5043b200dd6399ec0438bd648c35d79b9",
+    ),
+    ("Linux", "aarch64"): (
+        "linux-cpu-arm64",
+        "a7c9064c64b84f6b041252d5d2334d4a47693636e9c7c6ab2c535fcef11cf88b",
+    ),
+}
+
+SAMPLE_RATE = 16000
+
+# Memory for one pass grows with the length of the audio, and on a Metal GPU it
+# grows past what the device will allocate. Measured against v0.5.0, everything
+# from roughly nine to eleven minutes died with kIOGPUCommandBufferCallbackErrorOutOfMemory,
+# while five minutes stayed comfortable and a longer file quietly took a cheaper
+# internal path. Pieces of five minutes sit below that cliff on any machine
+# rather than only on a large one. The cost is that a word straddling a cut can
+# come out garbled, once every five minutes at worst.
+PIECE_SECONDS = 300
+
+DOWNLOAD_TIMEOUT_SECONDS = 60
+
+
+class AudioError(Exception):
+    pass
+
+
+def workspace_root():
+    # .../<workspace>/.agents/skills/audio/scripts/transcribe
+    return Path(__file__).resolve().parents[4]
+
+
+def runtime_root():
+    configured = os.environ.get("TERA_PARAKEET_ROOT")
+    if configured:
+        return Path(configured)
+    return workspace_root() / ".runtime" / "parakeet"
+
+
+def cli_path():
+    return runtime_root() / "parakeet-cli"
+
+
+def model_path():
+    return runtime_root() / MODEL_FILE
+
+
+def platform_release():
+    key = (platform.system(), platform.machine())
+    if key not in RELEASES:
+        supported = ", ".join(f"{system} {machine}" for system, machine in sorted(RELEASES))
+        raise AudioError(f"No parakeet.cpp build for {key[0]} {key[1]}. Supported: {supported}.")
+    return RELEASES[key]
+
+
+def ffmpeg_binary():
+    found = shutil.which("ffmpeg")
+    if not found:
+        raise AudioError("ffmpeg is not on PATH, and every input is decoded through it.")
+    return found
+
+
+def download(url, destination, expected_sha256):
+    """Stream to a temporary file, check the digest, then rename into place.
+
+    A half written model that survives a dropped connection is worse than no
+    model, because the next run reads it as installed and fails somewhere far
+    less obvious.
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = destination.with_name(f".{destination.name}.part")
+    digest = hashlib.sha256()
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "tera-audio-skill"})
+        with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
+            with partial.open("wb") as handle:
+                while True:
+                    block = response.read(1 << 20)
+                    if not block:
+                        break
+                    digest.update(block)
+                    handle.write(block)
+    except (urllib.error.URLError, OSError) as error:
+        partial.unlink(missing_ok=True)
+        raise AudioError(f"Cannot download {url}: {error}") from error
+
+    if digest.hexdigest() != expected_sha256:
+        partial.unlink(missing_ok=True)
+        raise AudioError(f"{url} does not match its pinned checksum. Refusing to install it.")
+    partial.replace(destination)
+
+
+def install_cli():
+    flavour, expected_sha256 = platform_release()
+    archive_name = f"parakeet-{PARAKEET_VERSION}-bin-{flavour}.tar.gz"
+    url = f"{RELEASE_URL}/{PARAKEET_VERSION}/{archive_name}"
+
+    with tempfile.TemporaryDirectory() as scratch:
+        archive = Path(scratch) / archive_name
+        download(url, archive, expected_sha256)
+        with tarfile.open(archive) as bundle:
+            member = next(
+                (entry for entry in bundle if Path(entry.name).name == "parakeet-cli"),
+                None,
+            )
+            if member is None:
+                raise AudioError(f"{archive_name} contains no parakeet-cli.")
+            source = bundle.extractfile(member)
+            if source is None:
+                raise AudioError(f"parakeet-cli in {archive_name} is not a regular file.")
+            destination = cli_path()
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            partial = destination.with_name(f".{destination.name}.part")
+            with partial.open("wb") as handle:
+                shutil.copyfileobj(source, handle)
+            partial.chmod(0o755)
+            partial.replace(destination)
+
+
+def setup():
+    ffmpeg_binary()
+    if cli_path().exists():
+        print(f"parakeet-cli {PARAKEET_VERSION} is already installed.")
+    else:
+        print(f"Installing parakeet-cli {PARAKEET_VERSION}.")
+        install_cli()
+        print(f"Installed {cli_path()}.")
+
+    if model_path().exists():
+        print(f"{MODEL_FILE} is already installed.")
+    else:
+        print(f"Downloading {MODEL_FILE}, about 0.9GB. This takes a few minutes.")
+        download(MODEL_URL, model_path(), MODEL_SHA256)
+        print(f"Installed {model_path()}.")
+
+
+def status():
+    print(f"parakeet-cli: {'installed' if cli_path().exists() else 'missing'}")
+    print(f"model: {'installed' if model_path().exists() else 'missing'}")
+    print(f"ffmpeg: {'found' if shutil.which('ffmpeg') else 'missing'}")
+    print(f"root: {runtime_root()}")
+
+
+def decode_to_wav(source, destination):
+    """Any container or codec ffmpeg knows, down to what the model expects.
+
+    `-vn` matters: a video file transcribes as its soundtrack, which is the whole
+    reason this handles video at all.
+    """
+    command = [
+        ffmpeg_binary(),
+        "-v", "error",
+        "-y",
+        "-i", str(source),
+        "-vn",
+        "-ac", "1",
+        "-ar", str(SAMPLE_RATE),
+        "-f", "wav",
+        str(destination),
+    ]
+    finished = subprocess.run(command, capture_output=True, text=True)
+    if finished.returncode != 0:
+        detail = finished.stderr.strip().splitlines()
+        raise AudioError(f"ffmpeg could not decode {source}: {detail[-1] if detail else 'no output'}")
+
+
+def split_wav(source, scratch):
+    """The decoded wav as a list of (path, offset in seconds) pieces.
+
+    Frames are copied a window at a time rather than read whole, so peak memory
+    stays the same whether the recording is a voice note or three hours long.
+    """
+    with wave.open(str(source), "rb") as reader:
+        rate = reader.getframerate()
+        total = reader.getnframes()
+        if total <= PIECE_SECONDS * rate:
+            return [(source, 0.0)]
+
+        pieces = []
+        per_piece = PIECE_SECONDS * rate
+        index = 0
+        while reader.tell() < total:
+            offset = reader.tell() / rate
+            path = scratch / f"piece-{index:04d}.wav"
+            with wave.open(str(path), "wb") as writer:
+                writer.setnchannels(reader.getnchannels())
+                writer.setsampwidth(reader.getsampwidth())
+                writer.setframerate(rate)
+                remaining = per_piece
+                while remaining > 0:
+                    frames = reader.readframes(min(remaining, rate * 30))
+                    if not frames:
+                        break
+                    writer.writeframes(frames)
+                    remaining -= len(frames) // (reader.getnchannels() * reader.getsampwidth())
+            pieces.append((path, offset))
+            index += 1
+        return pieces
+
+
+def run_cli(wav, as_json):
+    command = [str(cli_path()), "transcribe", "--model", str(model_path()), "--input", str(wav)]
+    if as_json:
+        command.append("--json")
+    finished = subprocess.run(command, capture_output=True, text=True)
+    if finished.returncode != 0:
+        detail = finished.stderr.strip().splitlines()
+        tail = "\n".join(detail[-5:]) if detail else "no output"
+        raise AudioError(f"parakeet-cli failed on {wav.name}:\n{tail}")
+    # ggml writes a page of backend chatter to stderr on every run. Discarding it
+    # here is what keeps a transcript readable.
+    return finished.stdout.strip()
+
+
+def transcribe(source, as_json):
+    source = Path(source).expanduser()
+    if not source.is_file():
+        raise AudioError(f"{source} is not a file.")
+    if not cli_path().exists() or not model_path().exists():
+        raise AudioError("parakeet is not installed yet. Run `scripts/transcribe setup` first.")
+
+    with tempfile.TemporaryDirectory() as name:
+        scratch = Path(name)
+        decoded = scratch / "input.wav"
+        decode_to_wav(source, decoded)
+        pieces = split_wav(decoded, scratch)
+
+        if not as_json:
+            return " ".join(filter(None, (run_cli(wav, False) for wav, _ in pieces)))
+
+        text = []
+        words = []
+        for wav, offset in pieces:
+            result = json.loads(run_cli(wav, True))
+            text.append(result.get("text", ""))
+            for word in result.get("words") or []:
+                word["start"] = round(word.get("start", 0.0) + offset, 3)
+                word["end"] = round(word.get("end", 0.0) + offset, 3)
+                words.append(word)
+        return json.dumps({"text": " ".join(filter(None, text)), "words": words})
+
+
+def parser():
+    root = argparse.ArgumentParser(prog="transcribe")
+    commands = root.add_subparsers(dest="command", required=True)
+    commands.add_parser("setup")
+    commands.add_parser("status")
+    run = commands.add_parser("run")
+    run.add_argument("file")
+    run.add_argument("--json", action="store_true")
+    return root
+
+
+def main():
+    # `transcribe FILE` is the common case and the one the skill documents, so
+    # the run subcommand stays available but never has to be typed.
+    argv = sys.argv[1:]
+    if argv and argv[0] not in ("setup", "status", "run", "-h", "--help"):
+        argv = ["run", *argv]
+
+    args = parser().parse_args(argv)
+    if args.command == "setup":
+        setup()
+    elif args.command == "status":
+        status()
+    else:
+        print(transcribe(args.file, args.json))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except AudioError as error:
+        print(f"transcribe: {error}", file=sys.stderr)
+        raise SystemExit(1)
