@@ -86,7 +86,9 @@ pub fn log_notification(v: &Value) {
 
         "turn/started" => info!(target: "codex::turn", "turn started"),
         "turn/completed" => info!(target: "codex::turn", "turn completed"),
-        "turn/failed" => warn!(target: "codex::turn", "turn failed: {}", truncate(&params.to_string(), 500)),
+        "turn/failed" => {
+            warn!(target: "codex::turn", "turn failed: {}", truncate(&params.to_string(), 500))
+        }
 
         "thread/tokenUsage/updated" => {
             if let Some(last) = params.get("tokenUsage").and_then(|u| u.get("last")) {
@@ -113,7 +115,9 @@ pub fn log_notification(v: &Value) {
         "error" | "guardianWarning" | "configWarning" | "deprecationNotice" => {
             warn!(target: "codex", "{method}: {}", truncate(&params.to_string(), 500));
         }
-        "model/rerouted" => info!(target: "codex", "model rerouted: {}", truncate(&params.to_string(), 200)),
+        "model/rerouted" => {
+            info!(target: "codex", "model rerouted: {}", truncate(&params.to_string(), 200))
+        }
 
         _ => debug!(target: "codex::raw", "{method}: {}", truncate(&params.to_string(), 300)),
     }
@@ -122,8 +126,12 @@ pub fn log_notification(v: &Value) {
 /// One line per thread item, with the detail that makes it identifiable:
 /// which command ran, which MCP tool was called, which files changed.
 fn log_item(method: &str, params: &Value) {
-    let Some(item) = params.get("item") else { return };
-    let Some(kind) = item.get("type").and_then(|t| t.as_str()) else { return };
+    let Some(item) = params.get("item") else {
+        return;
+    };
+    let Some(kind) = item.get("type").and_then(|t| t.as_str()) else {
+        return;
+    };
     let finished = method == "item/completed";
 
     match kind {
@@ -148,9 +156,16 @@ fn log_item(method: &str, params: &Value) {
             let tool = text_of(item, "tool").unwrap_or_default();
             if finished {
                 let ms = num_of(item, "durationMs");
-                match item.get("error").and_then(|e| if e.is_null() { None } else { Some(e) }) {
-                    Some(err) => warn!(target: "codex::mcp", "{server}.{tool} failed in {ms}ms: {}", truncate(&err.to_string(), 400)),
-                    None => info!(target: "codex::mcp", "{server}.{tool} ok in {ms}ms -> {}", truncate(&item.get("result").map(|r| r.to_string()).unwrap_or_default(), 400)),
+                match item
+                    .get("error")
+                    .and_then(|e| if e.is_null() { None } else { Some(e) })
+                {
+                    Some(err) => {
+                        warn!(target: "codex::mcp", "{server}.{tool} failed in {ms}ms: {}", truncate(&err.to_string(), 400))
+                    }
+                    None => {
+                        info!(target: "codex::mcp", "{server}.{tool} ok in {ms}ms -> {}", truncate(&item.get("result").map(|r| r.to_string()).unwrap_or_default(), 400))
+                    }
                 }
             } else {
                 info!(target: "codex::mcp", "{server}.{tool} calling with {}", truncate(&item.get("arguments").map(|a| a.to_string()).unwrap_or_default(), 400));
@@ -161,7 +176,11 @@ fn log_item(method: &str, params: &Value) {
             let files: Vec<String> = item
                 .get("changes")
                 .and_then(|c| c.as_array())
-                .map(|arr| arr.iter().filter_map(|c| c.get("path").and_then(|p| p.as_str()).map(str::to_string)).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|c| c.get("path").and_then(|p| p.as_str()).map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_default();
             info!(target: "codex::files", "edited {} file(s): {}", files.len(), files.join(", "));
         }

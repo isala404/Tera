@@ -87,9 +87,7 @@ impl CodexSupervisor {
         let now_ms = Utc::now().timestamp_millis();
         let existing = persisted.as_ref().filter(|p| p.thread_id == info.id);
         let started_at_ms = existing.map(|p| p.started_at_ms).unwrap_or(now_ms);
-        let last_activity_at_ms = existing
-            .map(|p| p.last_activity_at_ms)
-            .unwrap_or(now_ms);
+        let last_activity_at_ms = existing.map(|p| p.last_activity_at_ms).unwrap_or(now_ms);
         let estimated_cache_warm_until_ms = existing
             .map(|p| p.estimated_cache_warm_until_ms)
             .unwrap_or(now_ms + crate::codex::CACHE_TTL_MS);
@@ -163,8 +161,9 @@ impl CodexSupervisor {
         //, then given the last few messages verbatim so the
         // rotation does not read as amnesia to the person on the other end.
         if started_fresh {
-            let mut with_bootstrap =
-                vec![TurnInput::Text(ThreadRouter::build_bootstrap_context(&self.config))];
+            let mut with_bootstrap = vec![TurnInput::Text(ThreadRouter::build_bootstrap_context(
+                &self.config,
+            ))];
             let recent = self.history_db.recent_messages(10)?;
             if !recent.is_empty() {
                 with_bootstrap.push(TurnInput::Text(InputRenderer::render_history(&recent)));

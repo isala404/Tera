@@ -24,8 +24,7 @@ pub const MCP_SERVER_NAME: &str = "tera";
 /// from a broken file.
 fn tool_definitions(owner: &str) -> Result<Value> {
     let rendered = crate::data::render(crate::data::MCP_TOOLS_JSON, &[("OWNER", owner)]);
-    serde_json::from_str(&rendered)
-        .context("embedded data/config/mcp-tools.json is not valid JSON")
+    serde_json::from_str(&rendered).context("embedded data/config/mcp-tools.json is not valid JSON")
 }
 
 /// Writes a JSON-RPC message as a line and flushes. The flush is required: a
@@ -149,7 +148,12 @@ impl StdioMcpProxy {
     async fn forward_to_daemon(&self, id: u64, name: &str, args: Value) -> Result<Value> {
         let stream = UnixStream::connect(&self.socket_path)
             .await
-            .with_context(|| format!("Failed to connect to daemon socket at {:?}", self.socket_path))?;
+            .with_context(|| {
+                format!(
+                    "Failed to connect to daemon socket at {:?}",
+                    self.socket_path
+                )
+            })?;
 
         let (reader, mut writer) = stream.into_split();
 

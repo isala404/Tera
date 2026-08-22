@@ -100,7 +100,10 @@ mod tests {
     #[test]
     fn test_unconfigured_policy_accepts_only_the_paired_account() {
         let policy = OwnerPolicy::new(None);
-        assert_eq!(policy.evaluate(&msg("254910671147212@lid", true, false)), Verdict::Accept);
+        assert_eq!(
+            policy.evaluate(&msg("254910671147212@lid", true, false)),
+            Verdict::Accept
+        );
         assert_eq!(
             policy.evaluate(&msg("94770000000@s.whatsapp.net", false, false)),
             Verdict::Reject(RejectReason::NotOwner)

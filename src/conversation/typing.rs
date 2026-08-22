@@ -25,7 +25,9 @@ impl TypingGuard {
 
         let heartbeat = tokio::spawn(async move {
             loop {
-                let _ = beat_transport.set_typing_status(&beat_recipient, true).await;
+                let _ = beat_transport
+                    .set_typing_status(&beat_recipient, true)
+                    .await;
                 sleep(HEARTBEAT_INTERVAL).await;
             }
         });
@@ -65,7 +67,10 @@ mod tests {
         {
             let _guard = TypingGuard::start(transport, "owner@s.whatsapp.net".into());
             tokio::time::sleep(Duration::from_millis(50)).await;
-            assert_eq!(mock.typing_states.lock().unwrap().first(), Some(&("owner@s.whatsapp.net".to_string(), true)));
+            assert_eq!(
+                mock.typing_states.lock().unwrap().first(),
+                Some(&("owner@s.whatsapp.net".to_string(), true))
+            );
         }
 
         // Drop clears asynchronously.

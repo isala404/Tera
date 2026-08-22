@@ -1,22 +1,22 @@
-use tera::config::Config;
-use tera::codex::tier;
-use tera::codex::CodexSupervisor;
-use tera::conversation::{ConversationSession, Phoenix, TurnEngine};
-use tera::history::{backup, HistoryDb, ProjectionEngine};
-use tera::memory::generations::GenerationManager;
-use tera::scheduler::db::SchedulerDb;
-use tera::scheduler::recurrence;
-use tera::secrets::SecretStore;
-use tera::mcp::{DaemonRpcServer, StdioMcpProxy};
-use tera::memory::{self, MaintenanceRunner, Outcome};
-use tera::runtime::{self, ActivityTracker, DaemonLock, RuntimeDb};
-use tera::scheduler::SchedulerRunner;
-use tera::transport::{MockTransport, Transport, WhatsAppWebTransport};
-use tera::workspace::WorkspaceInit;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tera::codex::tier;
+use tera::codex::CodexSupervisor;
+use tera::config::Config;
+use tera::conversation::{ConversationSession, Phoenix, TurnEngine};
+use tera::history::{backup, HistoryDb, ProjectionEngine};
+use tera::mcp::{DaemonRpcServer, StdioMcpProxy};
+use tera::memory::generations::GenerationManager;
+use tera::memory::{self, MaintenanceRunner, Outcome};
+use tera::runtime::{self, ActivityTracker, DaemonLock, RuntimeDb};
+use tera::scheduler::db::SchedulerDb;
+use tera::scheduler::recurrence;
+use tera::scheduler::SchedulerRunner;
+use tera::secrets::SecretStore;
+use tera::transport::{MockTransport, Transport, WhatsAppWebTransport};
+use tera::workspace::WorkspaceInit;
 
 /// How many times Phoenix retries before giving up on reaching the owner. Ten
 /// tries at ten-second spacing outlasts any normal WhatsApp reconnect.
@@ -283,7 +283,9 @@ async fn main() -> Result<()> {
                 println!("Codex: {codex}");
             }
             if outcome.restart_scheduled {
-                println!("The daemon will restart in a few seconds. Phoenix will report the result.");
+                println!(
+                    "The daemon will restart in a few seconds. Phoenix will report the result."
+                );
             }
         }
 
@@ -291,7 +293,9 @@ async fn main() -> Result<()> {
             tera::update::signal_update(&lock, pid)?;
         }
 
-        Commands::Init { workspace: WorkspaceArg { workspace } } => {
+        Commands::Init {
+            workspace: WorkspaceArg { workspace },
+        } => {
             let config = Config::new(workspace, false);
             WorkspaceInit::init(&config)?;
             let _ = HistoryDb::open_for(&config)?;
@@ -301,7 +305,9 @@ async fn main() -> Result<()> {
 
         // Reports what is degraded, not just what is configured: a status command
         // that only echoes paths back cannot tell you why the assistant is quiet.
-        Commands::Status { workspace: WorkspaceArg { workspace } } => {
+        Commands::Status {
+            workspace: WorkspaceArg { workspace },
+        } => {
             let config = Config::new(workspace, false);
             println!("=== tera status ===");
             println!("Workspace:   {}", config.workspace_dir.display());
@@ -320,7 +326,12 @@ async fn main() -> Result<()> {
             );
 
             let writable = |dir: &std::path::Path| {
-                if dir.is_dir() && !dir.metadata().map(|m| m.permissions().readonly()).unwrap_or(true) {
+                if dir.is_dir()
+                    && !dir
+                        .metadata()
+                        .map(|m| m.permissions().readonly())
+                        .unwrap_or(true)
+                {
                     "writable"
                 } else {
                     "NOT WRITABLE"
@@ -340,7 +351,11 @@ async fn main() -> Result<()> {
                             "History:     {} events, {} projected{}{}",
                             report.event_count,
                             report.projected_records,
-                            if report.sqlite_ok { "" } else { ", SQLITE INTEGRITY FAILED" },
+                            if report.sqlite_ok {
+                                ""
+                            } else {
+                                ", SQLITE INTEGRITY FAILED"
+                            },
                             if report.missing_assets.is_empty() {
                                 String::new()
                             } else {
@@ -364,7 +379,10 @@ async fn main() -> Result<()> {
                 _ => println!("Memory:      MEMORIES link is BROKEN"),
             }
 
-            println!("Owner:       {} (set TERA_OWNER to change)", config.owner_name);
+            println!(
+                "Owner:       {} (set TERA_OWNER to change)",
+                config.owner_name
+            );
             println!(
                 "Models:      {} ({}) conversation / {} ({}) heavy / {} ({}) routine",
                 tier::CONVERSATION.model,
@@ -440,7 +458,9 @@ async fn main() -> Result<()> {
         }
 
         Commands::History { sub } => match sub {
-            HistorySubcommands::RebuildJsonl { workspace: WorkspaceArg { workspace } } => {
+            HistorySubcommands::RebuildJsonl {
+                workspace: WorkspaceArg { workspace },
+            } => {
                 let config = Config::new(workspace, false);
                 let history_db = HistoryDb::open_for(&config)?;
                 ProjectionEngine::rebuild_all(
@@ -450,18 +470,25 @@ async fn main() -> Result<()> {
                 )?;
             }
 
-            HistorySubcommands::Backup { workspace: WorkspaceArg { workspace } } => {
+            HistorySubcommands::Backup {
+                workspace: WorkspaceArg { workspace },
+            } => {
                 let config = Config::new(workspace, false);
                 let path = backup::backup_history(&config, &backup::timestamp_now())?;
                 println!("Backed up history to {}", path.display());
             }
 
-            HistorySubcommands::Check { workspace: WorkspaceArg { workspace } } => {
+            HistorySubcommands::Check {
+                workspace: WorkspaceArg { workspace },
+            } => {
                 let config = Config::new(workspace, false);
                 let history_db = HistoryDb::open_for(&config)?;
                 let report = backup::check_integrity(&config, &history_db)?;
 
-                println!("SQLite integrity:   {}", if report.sqlite_ok { "ok" } else { "FAILED" });
+                println!(
+                    "SQLite integrity:   {}",
+                    if report.sqlite_ok { "ok" } else { "FAILED" }
+                );
                 println!("Canonical events:   {}", report.event_count);
                 println!("Projected records:  {}", report.projected_records);
                 println!("Projection dirty:   {}", report.projection_dirty);
@@ -480,7 +507,9 @@ async fn main() -> Result<()> {
         // Both of these drive a real Codex turn, so they need a workspace that is
         // set up and a live app-server, the same path the daemon uses.
         Commands::Memory { sub } => match sub {
-            MemorySubcommands::Rebuild { workspace: WorkspaceArg { workspace } } => {
+            MemorySubcommands::Rebuild {
+                workspace: WorkspaceArg { workspace },
+            } => {
                 let config = Config::new(workspace, false);
                 WorkspaceInit::init(&config)?;
                 let history_db = HistoryDb::open_for(&config)?;
@@ -494,7 +523,9 @@ async fn main() -> Result<()> {
                 );
             }
 
-            MemorySubcommands::Optimize { workspace: WorkspaceArg { workspace } } => {
+            MemorySubcommands::Optimize {
+                workspace: WorkspaceArg { workspace },
+            } => {
                 let config = Config::new(workspace, false);
                 WorkspaceInit::init(&config)?;
                 let runtime_db = RuntimeDb::open(&config.runtime_db_path())?;
@@ -508,7 +539,9 @@ async fn main() -> Result<()> {
                 );
             }
 
-            MemorySubcommands::Status { workspace: WorkspaceArg { workspace } } => {
+            MemorySubcommands::Status {
+                workspace: WorkspaceArg { workspace },
+            } => {
                 let config = Config::new(workspace, false);
                 let active = GenerationManager::active_generation(&config);
                 let latest = GenerationManager::get_current_generation_num(&config)?;
@@ -527,7 +560,11 @@ async fn main() -> Result<()> {
                 generations.sort();
                 let active_name = active.map(|g| format!("{g:08}"));
                 for name in generations {
-                    let marker = if Some(&name) == active_name.as_ref() { " (active)" } else { "" };
+                    let marker = if Some(&name) == active_name.as_ref() {
+                        " (active)"
+                    } else {
+                        ""
+                    };
                     println!("  {name}{marker}");
                 }
             }
@@ -539,7 +576,9 @@ async fn main() -> Result<()> {
                 let config = Config::new(workspace, false);
                 let target = config.generations_dir().join(format!("{generation:08}"));
                 if !target.is_dir() {
-                    return Err(anyhow::anyhow!("No memory generation {generation:08} at {target:?}"));
+                    return Err(anyhow::anyhow!(
+                        "No memory generation {generation:08} at {target:?}"
+                    ));
                 }
                 GenerationManager::validate_generation_dir(&target)?;
                 GenerationManager::point_memories_at(&config, generation)?;
@@ -548,7 +587,8 @@ async fn main() -> Result<()> {
         },
 
         Commands::Secret { sub } => {
-            let store = SecretStore::new(Config::new(sub.workspace().clone(), false).secrets_path());
+            let store =
+                SecretStore::new(Config::new(sub.workspace().clone(), false).secrets_path());
             match sub {
                 SecretSubcommands::List { .. } => {
                     let names = store.names()?;
@@ -592,7 +632,11 @@ async fn main() -> Result<()> {
             // exit further down. Whatever this returns is the previous life.
             let crashed = runtime::crash_mark::arm(&config.runtime_dir())?;
             if let Some(mark) = &crashed {
-                warn!("Previous tera {} (started {})", mark.describe(), mark.started_at_ms);
+                warn!(
+                    "Previous tera {} (started {})",
+                    mark.describe(),
+                    mark.started_at_ms
+                );
             }
             let update_notice = match tera::update::startup_action(&config, crashed.is_some())? {
                 tera::update::StartupAction::Continue(notice) => notice.map(|notice| *notice),
@@ -723,7 +767,9 @@ async fn main() -> Result<()> {
                             .await;
 
                         match result {
-                            Ok(()) => warn!("WhatsApp transport stopped; reconnecting in {backoff:?}"),
+                            Ok(()) => {
+                                warn!("WhatsApp transport stopped; reconnecting in {backoff:?}")
+                            }
                             Err(e) => tracing::error!(
                                 "WhatsApp transport failed ({e:?}); reconnecting in {backoff:?}"
                             ),

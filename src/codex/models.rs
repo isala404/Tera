@@ -138,7 +138,10 @@ mod tests {
 
         ModelDiscovery::process_models_response(&runtime_db, listing()).unwrap();
         assert_eq!(
-            runtime_db.get_state_value("rebuild_pending").unwrap().as_deref(),
+            runtime_db
+                .get_state_value("rebuild_pending")
+                .unwrap()
+                .as_deref(),
             Some("true")
         );
     }
@@ -157,7 +160,11 @@ mod tests {
         let found = ModelDiscovery::process_models_response(&runtime_db, without_ours).unwrap();
         assert!(found.is_none());
         assert_eq!(
-            runtime_db.get_last_default_model().unwrap().unwrap().model_id,
+            runtime_db
+                .get_last_default_model()
+                .unwrap()
+                .unwrap()
+                .model_id,
             tier::CONVERSATION.model
         );
     }

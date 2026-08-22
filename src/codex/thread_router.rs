@@ -25,11 +25,14 @@ pub struct ThreadRouter;
 impl ThreadRouter {
     pub fn decide(runtime_db: &RuntimeDb, current_model_id: &str) -> Result<ThreadDecision> {
         Ok(Self::decide_at(
-            runtime_db.get_main_thread()?.as_ref().map(|s| PersistedThread {
-                thread_id: s.thread_id.clone(),
-                estimated_cache_warm_until_ms: s.estimated_cache_warm_until_ms,
-                model_id: s.model_id.clone(),
-            }),
+            runtime_db
+                .get_main_thread()?
+                .as_ref()
+                .map(|s| PersistedThread {
+                    thread_id: s.thread_id.clone(),
+                    estimated_cache_warm_until_ms: s.estimated_cache_warm_until_ms,
+                    model_id: s.model_id.clone(),
+                }),
             current_model_id,
             Utc::now().timestamp_millis(),
         ))
@@ -96,7 +99,10 @@ impl ThreadRouter {
         }
 
         let jsonl = config.history_jsonl_dir();
-        if fs::read_dir(&jsonl).map(|mut d| d.next().is_some()).unwrap_or(false) {
+        if fs::read_dir(&jsonl)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false)
+        {
             context.push_str(&format!(
                 "\nRecent conversation, if you need it: `cat {}/*.jsonl | tail -20 | jq -c .`\n",
                 jsonl.display()
@@ -161,8 +167,7 @@ mod tests {
 
     #[test]
     fn test_model_change_rotates_even_when_warm() {
-        let decision =
-            ThreadRouter::decide_at(persisted(NOW + TTL, "gpt-5.6-sol"), "gpt-6", NOW);
+        let decision = ThreadRouter::decide_at(persisted(NOW + TTL, "gpt-5.6-sol"), "gpt-6", NOW);
         match decision {
             ThreadDecision::Rotate { reason } => assert!(reason.contains("gpt-6"), "{reason}"),
             other => panic!("expected rotation, got {other:?}"),
@@ -172,8 +177,7 @@ mod tests {
     /// An unknown current model is not evidence of a change.
     #[test]
     fn test_unknown_model_does_not_force_rotation() {
-        let decision =
-            ThreadRouter::decide_at(persisted(NOW + TTL, "gpt-5.6-sol"), "", NOW);
+        let decision = ThreadRouter::decide_at(persisted(NOW + TTL, "gpt-5.6-sol"), "", NOW);
         assert!(matches!(decision, ThreadDecision::Continue { .. }));
     }
 }

@@ -57,7 +57,12 @@ pub struct MessageRef {
 
 #[async_trait]
 pub trait Transport: Send + Sync {
-    async fn send_text(&self, recipient: &str, text: &str, reply_to: Option<&MessageRef>) -> Result<String>;
+    async fn send_text(
+        &self,
+        recipient: &str,
+        text: &str,
+        reply_to: Option<&MessageRef>,
+    ) -> Result<String>;
     async fn send_media(
         &self,
         recipient: &str,

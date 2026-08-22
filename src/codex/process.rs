@@ -140,7 +140,10 @@ pub struct CodexProcessManager {
 
 impl CodexProcessManager {
     pub async fn spawn(codex_home: Option<&std::path::Path>) -> Result<Self> {
-        info!("Spawning persistent 'codex app-server' process (codex_home={:?})", codex_home);
+        info!(
+            "Spawning persistent 'codex app-server' process (codex_home={:?})",
+            codex_home
+        );
 
         let mut cmd = Command::new("codex");
         cmd.arg("app-server")
@@ -166,9 +169,18 @@ impl CodexProcessManager {
             .spawn()
             .with_context(|| "Failed to spawn 'codex app-server' process")?;
 
-        let stdin = child.stdin.take().ok_or_else(|| anyhow!("Failed to capture stdin"))?;
-        let stdout = child.stdout.take().ok_or_else(|| anyhow!("Failed to capture stdout"))?;
-        let stderr = child.stderr.take().ok_or_else(|| anyhow!("Failed to capture stderr"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("Failed to capture stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("Failed to capture stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("Failed to capture stderr"))?;
 
         let (stdin_tx, mut stdin_rx) = mpsc::channel::<String>(100);
 
@@ -216,7 +228,8 @@ impl CodexProcessManager {
             Arc::new(Mutex::new(HashMap::new()));
         let listeners_clone = turn_listeners.clone();
 
-        let active_turns: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+        let active_turns: Arc<Mutex<HashMap<String, String>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let turns_clone = active_turns.clone();
 
         let dead = Arc::new(AtomicBool::new(false));
@@ -245,7 +258,10 @@ impl CodexProcessManager {
                     continue;
                 }
                 let Ok(v) = serde_json::from_str::<Value>(&line) else {
-                    warn!("Unparseable line from codex app-server: {}", truncate(&line, 300));
+                    warn!(
+                        "Unparseable line from codex app-server: {}",
+                        truncate(&line, 300)
+                    );
                     continue;
                 };
 
@@ -389,7 +405,10 @@ impl CodexProcessManager {
             .send_request("thread/start", Some(self.thread_params(opts)))
             .await?;
         let info = ThreadInfo::from_result(&res, ThreadOrigin::Created)?;
-        debug!("thread/start -> {} (model {}) at {:?}", info.id, info.model, opts.cwd);
+        debug!(
+            "thread/start -> {} (model {}) at {:?}",
+            info.id, info.model, opts.cwd
+        );
         Ok(info)
     }
 
@@ -471,7 +490,9 @@ impl CodexProcessManager {
         let thread_id = params.get("threadId")?.as_str()?.to_string();
 
         let event = match method {
-            "item/agentMessage/delta" => TurnEvent::Delta(params.get("delta")?.as_str()?.to_string()),
+            "item/agentMessage/delta" => {
+                TurnEvent::Delta(params.get("delta")?.as_str()?.to_string())
+            }
             "item/completed" => {
                 let item = params.get("item")?;
                 if item.get("type")?.as_str()? != "agentMessage" {
@@ -503,7 +524,9 @@ impl CodexProcessManager {
         let Some(method) = v.get("method").and_then(|m| m.as_str()) else {
             return;
         };
-        let Some(params) = v.get("params") else { return };
+        let Some(params) = v.get("params") else {
+            return;
+        };
         let Some(thread_id) = params.get("threadId").and_then(|t| t.as_str()) else {
             return;
         };
@@ -591,15 +614,10 @@ impl CodexProcessManager {
         }
     }
 
-    async fn fail_listeners(
-        listeners: &Arc<Mutex<HashMap<String, TurnListener>>>,
-        reason: &str,
-    ) {
+    async fn fail_listeners(listeners: &Arc<Mutex<HashMap<String, TurnListener>>>, reason: &str) {
         let lock = listeners.lock().await;
         for listener in lock.values() {
-            let _ = listener
-                .tx
-                .try_send(TurnEvent::Failed(reason.to_string()));
+            let _ = listener.tx.try_send(TurnEvent::Failed(reason.to_string()));
         }
     }
 
@@ -644,7 +662,11 @@ impl CodexProcessManager {
             .map_err(|_| anyhow!("Timeout waiting for response to method '{}'", method))??;
 
         if let Some(err) = resp.error {
-            return Err(anyhow!("Codex JSON-RPC error ({}): {}", err.code, err.message));
+            return Err(anyhow!(
+                "Codex JSON-RPC error ({}): {}",
+                err.code,
+                err.message
+            ));
         }
 
         Ok(resp.result.unwrap_or(Value::Null))
@@ -659,7 +681,8 @@ impl CodexProcessManager {
     pub async fn run_turn_inputs(&self, inputs: &[TurnInput], tier: ModelTier) -> Result<String> {
         let thread_id = {
             let lock = self.active_thread_id.lock().await;
-            lock.clone().ok_or_else(|| anyhow!("No active Codex thread"))?
+            lock.clone()
+                .ok_or_else(|| anyhow!("No active Codex thread"))?
         };
         self.run_turn_on(&thread_id, inputs, tier).await
     }
@@ -710,7 +733,11 @@ impl CodexProcessManager {
                 // Record the turn id from the response as well as the event
                 // stream: a burst arriving immediately after turn/start must be
                 // steerable without waiting for the turn/started notification.
-                if let Some(turn_id) = res.get("turn").and_then(|t| t.get("id")).and_then(|i| i.as_str()) {
+                if let Some(turn_id) = res
+                    .get("turn")
+                    .and_then(|t| t.get("id"))
+                    .and_then(|i| i.as_str())
+                {
                     self.active_turns
                         .lock()
                         .await
@@ -793,7 +820,10 @@ mod tests {
         ] {
             let reply = CodexProcessManager::answer_server_request(&json!(7), method, None);
             assert_eq!(reply["id"], 7);
-            assert!(reply.get("error").is_none(), "{method} was refused: {reply}");
+            assert!(
+                reply.get("error").is_none(),
+                "{method} was refused: {reply}"
+            );
             let result = &reply["result"];
             let granted = matches!(
                 result["decision"].as_str(),
@@ -867,7 +897,10 @@ mod tests {
 
     #[test]
     fn test_noise_notifications_are_ignored() {
-        for method in ["mcpServer/startupStatus/updated", "thread/tokenUsage/updated"] {
+        for method in [
+            "mcpServer/startupStatus/updated",
+            "thread/tokenUsage/updated",
+        ] {
             let v = json!({"method": method, "params": {"threadId": "t1"}});
             assert!(CodexProcessManager::classify_notification(&v).is_none());
         }
@@ -880,7 +913,10 @@ mod tests {
         tx.send(TurnEvent::Delta("ng".into())).await.unwrap();
         tx.send(TurnEvent::Message("pong".into())).await.unwrap();
         tx.send(TurnEvent::Completed).await.unwrap();
-        assert_eq!(CodexProcessManager::collect_turn(&mut rx).await.unwrap(), "pong");
+        assert_eq!(
+            CodexProcessManager::collect_turn(&mut rx).await.unwrap(),
+            "pong"
+        );
     }
 
     /// Regression: a turn that answers entirely through send_message ends with
@@ -891,7 +927,10 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         tx.send(TurnEvent::Message(String::new())).await.unwrap();
         tx.send(TurnEvent::Completed).await.unwrap();
-        assert_eq!(CodexProcessManager::collect_turn(&mut rx).await.unwrap(), "");
+        assert_eq!(
+            CodexProcessManager::collect_turn(&mut rx).await.unwrap(),
+            ""
+        );
     }
 
     #[tokio::test]
@@ -899,7 +938,10 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         tx.send(TurnEvent::Delta("pong".into())).await.unwrap();
         tx.send(TurnEvent::Completed).await.unwrap();
-        assert_eq!(CodexProcessManager::collect_turn(&mut rx).await.unwrap(), "pong");
+        assert_eq!(
+            CodexProcessManager::collect_turn(&mut rx).await.unwrap(),
+            "pong"
+        );
     }
 
     /// Steering is only legal between `turn/started` and the turn ending, and
@@ -926,7 +968,10 @@ mod tests {
     #[tokio::test]
     async fn test_a_failed_turn_is_no_longer_steerable() {
         let turns = Arc::new(Mutex::new(HashMap::new()));
-        turns.lock().await.insert("t1".to_string(), "u1".to_string());
+        turns
+            .lock()
+            .await
+            .insert("t1".to_string(), "u1".to_string());
 
         CodexProcessManager::track_active_turn(
             &turns,
@@ -962,8 +1007,12 @@ mod tests {
     #[tokio::test]
     async fn test_collect_turn_surfaces_failure() {
         let (tx, mut rx) = mpsc::channel(8);
-        tx.send(TurnEvent::Failed("model exploded".into())).await.unwrap();
-        let err = CodexProcessManager::collect_turn(&mut rx).await.unwrap_err();
+        tx.send(TurnEvent::Failed("model exploded".into()))
+            .await
+            .unwrap();
+        let err = CodexProcessManager::collect_turn(&mut rx)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("model exploded"));
     }
 
@@ -979,13 +1028,10 @@ mod tests {
             },
         );
 
-        let waiting = tokio::spawn(async move {
-            CodexProcessManager::collect_turn(&mut rx).await
-        });
+        let waiting = tokio::spawn(async move { CodexProcessManager::collect_turn(&mut rx).await });
         CodexProcessManager::fail_listeners(&listeners, "codex app-server exited").await;
 
         let error = waiting.await.unwrap().unwrap_err();
         assert!(error.to_string().contains("codex app-server exited"));
     }
 }
-

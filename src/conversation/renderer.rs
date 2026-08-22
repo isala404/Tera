@@ -215,9 +215,15 @@ mod tests {
 
         let rendered = InputRenderer::render_burst_with_replies(&[reply], &targets);
 
-        assert!(rendered.contains("[Quoted message for m_reply."), "{rendered}");
+        assert!(
+            rendered.contains("[Quoted message for m_reply."),
+            "{rendered}"
+        );
         assert!(rendered.contains("Assistant m_quoted:"), "{rendered}");
         assert!(rendered.contains("The answer is 42."), "{rendered}");
-        assert!(rendered.contains("User m_reply (replying to m_quoted):"), "{rendered}");
+        assert!(
+            rendered.contains("User m_reply (replying to m_quoted):"),
+            "{rendered}"
+        );
     }
 }

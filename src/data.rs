@@ -116,17 +116,43 @@ mod tests {
             "skills/self-update/SKILL.md",
             include_str!("../data/skills/self-update/SKILL.md"),
         ),
-        ("skills/spotify/SKILL.md", include_str!("../data/skills/spotify/SKILL.md")),
-        ("skills/audio/SKILL.md", include_str!("../data/skills/audio/SKILL.md")),
+        (
+            "skills/spotify/SKILL.md",
+            include_str!("../data/skills/spotify/SKILL.md"),
+        ),
+        (
+            "skills/audio/SKILL.md",
+            include_str!("../data/skills/audio/SKILL.md"),
+        ),
         ("config/codex-config.toml", CODEX_CONFIG_TOML),
         ("config/mcp-tools.json", MCP_TOOLS_JSON),
     ];
 
     /// Every placeholder some call site actually fills in.
     const SUPPLIED: &[&str] = &[
-        "WORKSPACE", "STAGING", "MEMORIES", "HISTORY", "JSONL", "SQLITE", "ASSETS", "SCHEMA",
-        "EVENTS", "TASK_NAME", "SCHEDULE_ID", "NOW", "TASK_DIR", "LATE_NOTE", "TASK_PROMPT",
-        "LATE_MINUTES", "MISSED", "BIN", "SOCKET", "MODEL", "EFFORT", "OWNER", "WHAT_HAPPENED",
+        "WORKSPACE",
+        "STAGING",
+        "MEMORIES",
+        "HISTORY",
+        "JSONL",
+        "SQLITE",
+        "ASSETS",
+        "SCHEMA",
+        "EVENTS",
+        "TASK_NAME",
+        "SCHEDULE_ID",
+        "NOW",
+        "TASK_DIR",
+        "LATE_NOTE",
+        "TASK_PROMPT",
+        "LATE_MINUTES",
+        "MISSED",
+        "BIN",
+        "SOCKET",
+        "MODEL",
+        "EFFORT",
+        "OWNER",
+        "WHAT_HAPPENED",
         "PENDING_REQUEST",
     ];
 
@@ -281,7 +307,10 @@ mod tests {
 
     #[test]
     fn test_render_substitutes_and_leaves_single_braces_alone() {
-        let rendered = render("cd {{WORKSPACE}} && jq '{t, from}'", &[("WORKSPACE", "/ws")]);
+        let rendered = render(
+            "cd {{WORKSPACE}} && jq '{t, from}'",
+            &[("WORKSPACE", "/ws")],
+        );
         assert_eq!(rendered, "cd /ws && jq '{t, from}'");
     }
 
@@ -355,7 +384,14 @@ mod tests {
         // ban gets read as a style preference and bullets come back.
         assert!(WORKSPACE_AGENTS.contains("Hard rule. Messages are plain text."));
         assert!(WORKSPACE_AGENTS.contains("No markdown of any kind"));
-        for notation in ["headings", "bold", "italics", "bullets", "tables", "backticks"] {
+        for notation in [
+            "headings",
+            "bold",
+            "italics",
+            "bullets",
+            "tables",
+            "backticks",
+        ] {
             assert!(WORKSPACE_AGENTS.contains(notation), "{notation}");
         }
     }

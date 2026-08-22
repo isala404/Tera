@@ -77,7 +77,10 @@ mod tests {
 
         let items = SchedulerDb::list_schedules(&runtime_db).unwrap();
         assert_eq!(items.len(), 1);
-        let health = items.iter().find(|item| item.name == SELF_CARE_NAME).unwrap();
+        let health = items
+            .iter()
+            .find(|item| item.name == SELF_CARE_NAME)
+            .unwrap();
         assert_eq!(health.tier, tier::ROUTINE.name);
         assert_eq!(health.rrule.as_deref(), Some(SELF_CARE_RRULE));
         assert!(health.next_run_at_ms.is_some(), "it would never fire");

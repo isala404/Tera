@@ -5,13 +5,13 @@ use crate::workspace::templates::{self, GENERATED_MARKER_PREFIX};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::ffi::CString;
+use std::fs;
 use std::io::{self, ErrorKind};
-use std::os::unix::fs::{symlink, PermissionsExt};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use tracing::{info, warn};
@@ -91,7 +91,11 @@ impl WorkspaceInit {
         }
 
         let instructions = [
-            (config.root_agents_path(), data::WORKSPACE_AGENTS, Owned::ByUs),
+            (
+                config.root_agents_path(),
+                data::WORKSPACE_AGENTS,
+                Owned::ByUs,
+            ),
             (
                 config.projects_dir().join("AGENTS.md"),
                 data::PROJECTS_AGENTS,
@@ -135,7 +139,11 @@ impl WorkspaceInit {
             // touched again, anything it learned about the machine is not
             // recoverable from history and there is nowhere else it could have
             // been written down.
-            (config.system_notes_path(), data::SYSTEM_NOTES, Owned::ByThem),
+            (
+                config.system_notes_path(),
+                data::SYSTEM_NOTES,
+                Owned::ByThem,
+            ),
         ];
 
         for (path, template, owned) in instructions {
@@ -184,12 +192,10 @@ impl WorkspaceInit {
         }
         match fs::symlink_metadata(&legacy) {
             Err(_) => {}
-            Ok(meta) if meta.file_type().is_symlink() => {
-                match fs::remove_file(&legacy) {
-                    Ok(()) => info!("Removed the superseded {:?} symlink", legacy),
-                    Err(e) => warn!("Could not remove {:?}: {e}", legacy),
-                }
-            }
+            Ok(meta) if meta.file_type().is_symlink() => match fs::remove_file(&legacy) {
+                Ok(()) => info!("Removed the superseded {:?} symlink", legacy),
+                Err(e) => warn!("Could not remove {:?}: {e}", legacy),
+            },
             Ok(_) => warn!(
                 "{:?} exists and is not a symlink; leaving it alone. Active memory is {:?}.",
                 legacy,
@@ -249,24 +255,25 @@ impl WorkspaceInit {
                             "Built-in skill {:?} already exists at {:?}; treating it as user-owned",
                             skill.name, destination
                         );
-                        state.skills.insert(
-                            skill.name.to_string(),
-                            BuiltinSkillRecord::user_owned(),
-                        );
+                        state
+                            .skills
+                            .insert(skill.name.to_string(), BuiltinSkillRecord::user_owned());
                         continue;
                     }
 
                     if Self::install_new_skill(&config.skills_dir(), skill)? {
-                        info!("Seeded built-in skill {:?} at {:?}", skill.name, destination);
+                        info!(
+                            "Seeded built-in skill {:?} at {:?}",
+                            skill.name, destination
+                        );
                         state.skills.insert(
                             skill.name.to_string(),
                             BuiltinSkillRecord::managed(source_fingerprint, source_state),
                         );
                     } else if has_path(&destination) {
-                        state.skills.insert(
-                            skill.name.to_string(),
-                            BuiltinSkillRecord::user_owned(),
-                        );
+                        state
+                            .skills
+                            .insert(skill.name.to_string(), BuiltinSkillRecord::user_owned());
                     }
                 }
                 Some(mut record) => match record.status {
@@ -326,7 +333,10 @@ impl WorkspaceInit {
                                 skill,
                                 &expected_state,
                             )? {
-                                info!("Updated built-in skill {:?} at {:?}", skill.name, destination);
+                                info!(
+                                    "Updated built-in skill {:?} at {:?}",
+                                    skill.name, destination
+                                );
                                 record =
                                     BuiltinSkillRecord::managed(source_fingerprint, source_state);
                             } else {
@@ -346,10 +356,7 @@ impl WorkspaceInit {
         Self::write_builtin_skill_state(config, &state)
     }
 
-    fn install_new_skill(
-        skills_dir: &Path,
-        skill: &crate::data::BuiltinSkill,
-    ) -> Result<bool> {
+    fn install_new_skill(skills_dir: &Path, skill: &crate::data::BuiltinSkill) -> Result<bool> {
         let destination = skills_dir.join(skill.name);
         let staging = Self::create_skill_staging(skills_dir, skill.name)?;
         let install = (|| -> Result<bool> {
@@ -397,8 +404,9 @@ impl WorkspaceInit {
                 .with_context(|| format!("failed to stage old built-in skill {destination:?}"))?;
             match fs::rename(&staging, &destination) {
                 Ok(()) => {
-                    fs::remove_dir_all(&backup)
-                        .with_context(|| format!("failed to remove old built-in skill {backup:?}"))?;
+                    fs::remove_dir_all(&backup).with_context(|| {
+                        format!("failed to remove old built-in skill {backup:?}")
+                    })?;
                     Ok(true)
                 }
                 Err(error) => {
@@ -752,7 +760,9 @@ fn free_skill_aux_path(skills_dir: &Path, skill_name: &str, kind: &str) -> Resul
             return Ok(path);
         }
     }
-    Err(anyhow!("could not find a free {kind} path for skill {skill_name:?}"))
+    Err(anyhow!(
+        "could not find a free {kind} path for skill {skill_name:?}"
+    ))
 }
 
 fn is_safe_skill_path(path: &str) -> bool {
@@ -855,7 +865,10 @@ mod tests {
 
         let before = fs::read_to_string(config.root_agents_path()).unwrap();
         WorkspaceInit::init(&config).unwrap();
-        assert_eq!(fs::read_to_string(config.root_agents_path()).unwrap(), before);
+        assert_eq!(
+            fs::read_to_string(config.root_agents_path()).unwrap(),
+            before
+        );
     }
 
     /// The user's own file is his. Re-init must not touch it.
@@ -968,8 +981,7 @@ mod tests {
         let config = Config::new(tmp.path().to_path_buf(), true);
         WorkspaceInit::init(&config).unwrap();
 
-        let bootstrap =
-            fs::read_to_string(config.codex_home_dir().join("AGENTS.md")).unwrap();
+        let bootstrap = fs::read_to_string(config.codex_home_dir().join("AGENTS.md")).unwrap();
         assert!(bootstrap.contains(&config.root_agents_path().display().to_string()));
     }
 
@@ -1084,13 +1096,12 @@ mod tests {
         let symlink_config = Config::new(symlink_tmp.path().to_path_buf(), true);
         fs::create_dir_all(symlink_config.skills_dir()).unwrap();
         let symlink_path = symlink_config.skills_dir().join(builtin.name);
-        symlink(
-            symlink_tmp.path().join("missing-target"),
-            &symlink_path,
-        )
-        .unwrap();
+        symlink(symlink_tmp.path().join("missing-target"), &symlink_path).unwrap();
         WorkspaceInit::init(&symlink_config).unwrap();
-        assert!(fs::symlink_metadata(symlink_path).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(symlink_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]

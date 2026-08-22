@@ -79,7 +79,6 @@ pub struct ScheduleRun {
     pub error: Option<String>,
 }
 
-
 /// Every query here selects its columns in the same order, and sharing the
 /// mapper is what keeps them from drifting when a column is added.
 fn run_from_row(row: &Row) -> rusqlite::Result<ScheduleRun> {
@@ -207,7 +206,9 @@ impl SchedulerDb {
             "SELECT id, name, prompt, schedule_type, one_shot_at_ms, dtstart_local, rrule, timezone, task_path, status, next_run_at_ms, created_at_ms, cancelled_at_ms, tier
              FROM schedules WHERE id = ?1",
         )?;
-        Ok(stmt.query_row(params![schedule_id], schedule_from_row).optional()?)
+        Ok(stmt
+            .query_row(params![schedule_id], schedule_from_row)
+            .optional()?)
     }
 
     /// Whether any schedule with this name has ever existed, in any state.

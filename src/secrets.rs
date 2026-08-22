@@ -112,9 +112,7 @@ impl SecretStore {
         match fs::read_to_string(&self.path) {
             Ok(raw) => serde_json::from_str(&raw)
                 .with_context(|| format!("{} is not valid JSON", self.path.display())),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Ok(Contents::default())
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Contents::default()),
             Err(error) => {
                 Err(error).with_context(|| format!("Cannot read {}", self.path.display()))
             }
@@ -155,11 +153,7 @@ impl SecretStore {
     }
 
     pub fn get(&self, name: &str) -> Result<Option<String>> {
-        Ok(self
-            .load()?
-            .secrets
-            .remove(name)
-            .map(|secret| secret.value))
+        Ok(self.load()?.secrets.remove(name).map(|secret| secret.value))
     }
 
     /// Every stored name, and when it was set. Never the values: this is what the
@@ -370,7 +364,9 @@ fn parse_command(rest: &str) -> Result<(String, String), String> {
 
     let name = validate_name(name).map_err(|error| error.to_string())?;
     if value.is_empty() {
-        return Err(format!("No value came with {name}. Usage: /secret NAME value"));
+        return Err(format!(
+            "No value came with {name}. Usage: /secret NAME value"
+        ));
     }
     Ok((name, value.to_string()))
 }
@@ -397,8 +393,14 @@ mod tests {
     fn test_set_and_get_round_trips() {
         let (_dir, store) = store();
         store.set("SPOTIFY_CLIENT_ID", "abc123", 10).unwrap();
-        assert_eq!(store.get("SPOTIFY_CLIENT_ID").unwrap().as_deref(), Some("abc123"));
-        assert_eq!(store.names().unwrap(), vec![("SPOTIFY_CLIENT_ID".to_string(), 10)]);
+        assert_eq!(
+            store.get("SPOTIFY_CLIENT_ID").unwrap().as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(
+            store.names().unwrap(),
+            vec![("SPOTIFY_CLIENT_ID".to_string(), 10)]
+        );
     }
 
     #[test]
@@ -406,7 +408,9 @@ mod tests {
         let (_dir, store) = store();
         store.set("SPOTIFY_CLIENT_ID", "abc123", 0).unwrap();
         assert_eq!(
-            store.expand("https://accounts.spotify.com/authorize?client_id=${SPOTIFY_CLIENT_ID}&x=1"),
+            store.expand(
+                "https://accounts.spotify.com/authorize?client_id=${SPOTIFY_CLIENT_ID}&x=1"
+            ),
             "https://accounts.spotify.com/authorize?client_id=abc123&x=1"
         );
     }
@@ -415,7 +419,10 @@ mod tests {
     fn test_expand_leaves_unknown_names_alone() {
         let (_dir, store) = store();
         store.set("KNOWN", "value1", 0).unwrap();
-        assert_eq!(store.expand("${UNKNOWN} and ${KNOWN}"), "${UNKNOWN} and value1");
+        assert_eq!(
+            store.expand("${UNKNOWN} and ${KNOWN}"),
+            "${UNKNOWN} and value1"
+        );
     }
 
     /// The pair has to compose in one direction only. Redaction runs first on
@@ -441,7 +448,11 @@ mod tests {
         let (_dir, store) = store();
         store.set("TOKEN", "value", 0).unwrap();
         let mode = fs::metadata(store.path()).unwrap().permissions().mode();
-        assert_eq!(mode & 0o077, 0, "secrets.json must not be group or world readable");
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "secrets.json must not be group or world readable"
+        );
     }
 
     #[test]
@@ -455,29 +466,50 @@ mod tests {
     #[test]
     fn test_ordinary_message_passes_through() {
         let (_dir, store) = store();
-        assert_eq!(store.capture("play some music", 0).unwrap(), Capture::Passthrough);
+        assert_eq!(
+            store.capture("play some music", 0).unwrap(),
+            Capture::Passthrough
+        );
     }
 
     #[test]
     fn test_explicit_command_stores_the_value() {
         let (_dir, store) = store();
-        let outcome = store.capture("/secret SPOTIFY_CLIENT_ID abc123", 0).unwrap();
-        assert_eq!(outcome, Capture::Stored { name: "SPOTIFY_CLIENT_ID".to_string() });
-        assert_eq!(store.get("SPOTIFY_CLIENT_ID").unwrap().as_deref(), Some("abc123"));
+        let outcome = store
+            .capture("/secret SPOTIFY_CLIENT_ID abc123", 0)
+            .unwrap();
+        assert_eq!(
+            outcome,
+            Capture::Stored {
+                name: "SPOTIFY_CLIENT_ID".to_string()
+            }
+        );
+        assert_eq!(
+            store.get("SPOTIFY_CLIENT_ID").unwrap().as_deref(),
+            Some("abc123")
+        );
     }
 
     #[test]
     fn test_equals_form_stores_the_value() {
         let (_dir, store) = store();
-        store.capture("/secret SPOTIFY_CLIENT_ID=abc123", 0).unwrap();
-        assert_eq!(store.get("SPOTIFY_CLIENT_ID").unwrap().as_deref(), Some("abc123"));
+        store
+            .capture("/secret SPOTIFY_CLIENT_ID=abc123", 0)
+            .unwrap();
+        assert_eq!(
+            store.get("SPOTIFY_CLIENT_ID").unwrap().as_deref(),
+            Some("abc123")
+        );
     }
 
     /// A word that merely starts with the command is conversation.
     #[test]
     fn test_similar_word_is_not_the_command() {
         let (_dir, store) = store();
-        assert_eq!(store.capture("/secretly do the thing", 0).unwrap(), Capture::Passthrough);
+        assert_eq!(
+            store.capture("/secretly do the thing", 0).unwrap(),
+            Capture::Passthrough
+        );
     }
 
     /// A malformed command must still not fall through, or the value it was
@@ -500,8 +532,16 @@ mod tests {
         let (_dir, store) = store();
         store.request("SPOTIFY_CLIENT_ID", 0).unwrap();
         let outcome = store.capture("  abc123  ", 1_000).unwrap();
-        assert_eq!(outcome, Capture::Stored { name: "SPOTIFY_CLIENT_ID".to_string() });
-        assert_eq!(store.get("SPOTIFY_CLIENT_ID").unwrap().as_deref(), Some("abc123"));
+        assert_eq!(
+            outcome,
+            Capture::Stored {
+                name: "SPOTIFY_CLIENT_ID".to_string()
+            }
+        );
+        assert_eq!(
+            store.get("SPOTIFY_CLIENT_ID").unwrap().as_deref(),
+            Some("abc123")
+        );
     }
 
     /// One message, one claim. Otherwise every later message is swallowed.
@@ -520,7 +560,9 @@ mod tests {
         let (_dir, store) = store();
         store.request("TOKEN", 0).unwrap();
         assert_eq!(
-            store.capture("what's the weather", PENDING_LIFETIME_MS + 1).unwrap(),
+            store
+                .capture("what's the weather", PENDING_LIFETIME_MS + 1)
+                .unwrap(),
             Capture::Passthrough
         );
     }
@@ -560,7 +602,10 @@ mod tests {
         let (_dir, store) = store();
         store.set("SHORT", "abcdef", 0).unwrap();
         store.set("LONG", "abcdef-ghijkl", 0).unwrap();
-        assert_eq!(store.redact("key abcdef-ghijkl here"), "key [redacted LONG] here");
+        assert_eq!(
+            store.redact("key abcdef-ghijkl here"),
+            "key [redacted LONG] here"
+        );
     }
 
     #[test]

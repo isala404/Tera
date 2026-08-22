@@ -325,7 +325,10 @@ mod tests {
         assert!(prompt.contains(&config.history_db_path().display().to_string()));
         assert!(prompt.contains("Do not read or edit the currently active memory"));
         assert!(prompt.contains("subagents"));
-        assert!(!prompt.contains("{{"), "unfilled placeholder in the rebuild prompt");
+        assert!(
+            !prompt.contains("{{"),
+            "unfilled placeholder in the rebuild prompt"
+        );
     }
 
     #[test]
@@ -341,7 +344,10 @@ mod tests {
         assert!(prompt.contains(&config.skills_dir().display().to_string()));
         assert!(prompt.contains("existing skill should improve"));
         assert!(prompt.contains("Do not create or edit skills"));
-        assert!(!prompt.contains("{{"), "unfilled placeholder in the optimizer prompt");
+        assert!(
+            !prompt.contains("{{"),
+            "unfilled placeholder in the optimizer prompt"
+        );
     }
 
     #[test]

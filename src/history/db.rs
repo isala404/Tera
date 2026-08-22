@@ -19,7 +19,12 @@ use uuid::Uuid;
 /// here on needs a line in this function.
 fn migrate(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "provider_refs", "chat_jid", "TEXT")?;
-    add_column_if_missing(conn, "provider_refs", "from_me", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(
+        conn,
+        "provider_refs",
+        "from_me",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     Ok(())
 }
 
@@ -266,9 +271,13 @@ impl HistoryDb {
     ///
     /// Reply targets arrive as WhatsApp ids. They have to be translated before
     /// they are stored, because history is addressed by event id and the JSONL
-    /// projection must not contain provider ids at all , 
+    /// projection must not contain provider ids at all ,
     /// storing the raw provider id made `reply_to` unjoinable against anything.
-    pub fn event_id_for_provider_ref(&self, provider: &str, provider_msg_id: &str) -> Result<Option<String>> {
+    pub fn event_id_for_provider_ref(
+        &self,
+        provider: &str,
+        provider_msg_id: &str,
+    ) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT event_id FROM provider_refs WHERE provider = ?1 AND provider_message_id = ?2",
@@ -314,7 +323,12 @@ impl HistoryDb {
         Ok(res)
     }
 
-    pub fn record_delivery_event(&self, event_id: &str, state: &str, detail: Option<&str>) -> Result<()> {
+    pub fn record_delivery_event(
+        &self,
+        event_id: &str,
+        state: &str,
+        detail: Option<&str>,
+    ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO delivery_events (event_id, occurred_at_ms, state, detail) VALUES (?1, ?2, ?3, ?4)",
@@ -341,7 +355,8 @@ impl HistoryDb {
 
     pub fn count_events(&self) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM conversation_events", [], |r| r.get(0))?;
+        let count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM conversation_events", [], |r| r.get(0))?;
         Ok(count as usize)
     }
 
@@ -462,13 +477,15 @@ mod migration_tests {
         .unwrap();
 
         assert_eq!(
-            db.event_id_for_provider_ref("whatsapp", "wamid.ABC").unwrap(),
+            db.event_id_for_provider_ref("whatsapp", "wamid.ABC")
+                .unwrap(),
             Some("msg_first".to_string())
         );
         // A reply to something older than this workspace resolves to nothing,
         // which is the caller's cue to record no reply target at all.
         assert_eq!(
-            db.event_id_for_provider_ref("whatsapp", "wamid.UNKNOWN").unwrap(),
+            db.event_id_for_provider_ref("whatsapp", "wamid.UNKNOWN")
+                .unwrap(),
             None
         );
     }

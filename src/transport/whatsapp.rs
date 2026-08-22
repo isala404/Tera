@@ -1,19 +1,19 @@
 use crate::transport::owner::jid_user;
 use crate::transport::{InboundMedia, InboundMessage, MessageRef, Transport};
 use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
 use qrcode::render::unicode;
 use qrcode::QrCode;
-use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 use uuid::Uuid;
 use whatsapp_rust::bot::MessageContext;
 use whatsapp_rust::media;
+use whatsapp_rust::prelude::*;
+use whatsapp_rust::upload::{UploadOptions, UploadResponse};
 use whatsapp_rust::wacore::download::MediaType;
 use whatsapp_rust::wacore::proto_helpers::build_quote_context;
-use whatsapp_rust::upload::{UploadOptions, UploadResponse};
-use whatsapp_rust::prelude::*;
 use whatsapp_rust_sqlite_storage::SqliteStore;
 
 /// Render the pairing payload as a scannable QR block on the terminal.
@@ -354,7 +354,12 @@ impl WhatsAppWebTransport {
 
 #[async_trait]
 impl Transport for WhatsAppWebTransport {
-    async fn send_text(&self, recipient: &str, text: &str, reply_to: Option<&MessageRef>) -> Result<String> {
+    async fn send_text(
+        &self,
+        recipient: &str,
+        text: &str,
+        reply_to: Option<&MessageRef>,
+    ) -> Result<String> {
         info!("whatsapp-rust send_text to {}: {}", recipient, text);
 
         // Never invent a message id on failure: the caller records the returned
@@ -374,7 +379,10 @@ impl Transport for WhatsAppWebTransport {
             .await
             .map_err(|e| anyhow!("WhatsApp send_text to {} failed: {:?}", recipient, e))?;
 
-        info!("Sent WhatsApp message to {}: {:?}", recipient, send_res.message_id);
+        info!(
+            "Sent WhatsApp message to {}: {:?}",
+            recipient, send_res.message_id
+        );
         Ok(send_res.message_id)
     }
 
@@ -468,12 +476,7 @@ impl Transport for WhatsAppWebTransport {
         Ok(send_res.message_id)
     }
 
-    async fn send_reaction(
-        &self,
-        recipient: &str,
-        target: &MessageRef,
-        emoji: &str,
-    ) -> Result<()> {
+    async fn send_reaction(&self, recipient: &str, target: &MessageRef, emoji: &str) -> Result<()> {
         let (client, jid) = self.client_for(recipient)?;
 
         // The key must identify the message exactly as WhatsApp stored it: the
@@ -536,7 +539,12 @@ impl MockTransport {
 
 #[async_trait]
 impl Transport for MockTransport {
-    async fn send_text(&self, recipient: &str, text: &str, reply_to: Option<&MessageRef>) -> Result<String> {
+    async fn send_text(
+        &self,
+        recipient: &str,
+        text: &str,
+        reply_to: Option<&MessageRef>,
+    ) -> Result<String> {
         let msg_id = format!("wamid.mock_{}", Uuid::new_v4().simple());
         self.sent_messages.lock().unwrap().push((
             recipient.to_string(),
@@ -556,7 +564,12 @@ impl Transport for MockTransport {
     ) -> Result<String> {
         let msg_id = format!("wamid.mock_media_{}", Uuid::new_v4().simple());
         let cap_str = caption.unwrap_or("");
-        let text = format!("[MockMedia:{}:{}] {}", media_type, file_path.display(), cap_str);
+        let text = format!(
+            "[MockMedia:{}:{}] {}",
+            media_type,
+            file_path.display(),
+            cap_str
+        );
         self.sent_messages.lock().unwrap().push((
             recipient.to_string(),
             text,
@@ -575,10 +588,12 @@ impl Transport for MockTransport {
     }
 
     async fn set_typing_status(&self, recipient: &str, typing: bool) -> Result<()> {
-        self.typing_states.lock().unwrap().push((recipient.to_string(), typing));
+        self.typing_states
+            .lock()
+            .unwrap()
+            .push((recipient.to_string(), typing));
         Ok(())
     }
-
 }
 
 #[cfg(test)]
@@ -606,9 +621,14 @@ mod quote_tests {
         let ctx = quote_context(&target(false, Some("What is the price?")), own());
 
         assert_eq!(ctx.stanza_id.as_deref(), Some("3EB0ABCDEF"));
-        assert_eq!(ctx.participant.as_deref(), Some("15550001111@s.whatsapp.net"));
         assert_eq!(
-            ctx.quoted_message.as_option().and_then(|m| m.text_content()),
+            ctx.participant.as_deref(),
+            Some("15550001111@s.whatsapp.net")
+        );
+        assert_eq!(
+            ctx.quoted_message
+                .as_option()
+                .and_then(|m| m.text_content()),
             Some("What is the price?")
         );
     }
@@ -619,7 +639,10 @@ mod quote_tests {
     fn test_quoting_ourselves_names_this_account_without_its_device() {
         let ctx = quote_context(&target(true, Some("It is 42.")), own());
 
-        assert_eq!(ctx.participant.as_deref(), Some("15559998888@s.whatsapp.net"));
+        assert_eq!(
+            ctx.participant.as_deref(),
+            Some("15559998888@s.whatsapp.net")
+        );
     }
 
     #[test]
@@ -627,7 +650,10 @@ mod quote_tests {
         let ctx = quote_context(&target(false, None), own());
 
         assert_eq!(ctx.stanza_id.as_deref(), Some("3EB0ABCDEF"));
-        assert_eq!(ctx.participant.as_deref(), Some("15550001111@s.whatsapp.net"));
+        assert_eq!(
+            ctx.participant.as_deref(),
+            Some("15550001111@s.whatsapp.net")
+        );
     }
 }
 
@@ -653,7 +679,7 @@ mod tests {
                     '\u{2588}' => (false, false), // full block: both halves light
                     '\u{2580}' => (false, true),  // upper half block: bottom is dark
                     '\u{2584}' => (true, false),  // lower half block: top is dark
-                    ' ' => (true, true),           // blank: both halves dark
+                    ' ' => (true, true),          // blank: both halves dark
                     other => panic!("unexpected glyph {other:?} in the QR"),
                 };
                 top.push(t);
@@ -695,7 +721,11 @@ mod tests {
         assert!(widest <= 80, "QR is {widest} columns wide and will wrap");
 
         const QUIET: usize = 4;
-        assert_eq!(widest, width + 2 * QUIET, "quiet zone is missing or the wrong size");
+        assert_eq!(
+            widest,
+            width + 2 * QUIET,
+            "quiet zone is missing or the wrong size"
+        );
 
         let rows = modules_from_art(&art);
         assert!(rows.len() >= width + 2 * QUIET);
@@ -725,7 +755,12 @@ mod tests {
     /// that the operator gets an unscannable smear with nothing saying why.
     #[test]
     fn test_a_long_payload_still_fits_the_terminal() {
-        let payload = format!("2@{},{},{},1", "A".repeat(120), "B".repeat(90), "C".repeat(90));
+        let payload = format!(
+            "2@{},{},{},1",
+            "A".repeat(120),
+            "B".repeat(90),
+            "C".repeat(90)
+        );
         let code = QrCode::new(payload.as_bytes()).unwrap();
         let art = code
             .render::<unicode::Dense1x2>()
@@ -735,7 +770,11 @@ mod tests {
             .build();
 
         let widest = art.lines().map(|l| l.chars().count()).max().unwrap();
-        assert!(widest <= 80, "a {}-byte payload renders {widest} columns wide", payload.len());
+        assert!(
+            widest <= 80,
+            "a {}-byte payload renders {widest} columns wide",
+            payload.len()
+        );
     }
 
     #[test]

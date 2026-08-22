@@ -111,7 +111,10 @@ mod tests {
 
         // The two schema references legitimately never mention the user; the files
         // that speak about them must.
-        assert!(named >= 4, "only {named} rendered files addressed the owner");
+        assert!(
+            named >= 4,
+            "only {named} rendered files addressed the owner"
+        );
         assert!(render(data::WORKSPACE_AGENTS, &config).contains("Ada Lovelace"));
         assert!(render(data::PERSONA, &config).contains("Ada Lovelace"));
     }
@@ -194,7 +197,10 @@ mod tests {
     fn test_generated_files_are_marked_and_the_owned_ones_are_not() {
         let config = config("/ws");
         for generated in all_generated(&config) {
-            assert!(generated.starts_with(GENERATED_MARKER_PREFIX), "{generated:.60}");
+            assert!(
+                generated.starts_with(GENERATED_MARKER_PREFIX),
+                "{generated:.60}"
+            );
         }
         // Neither of these is ours to rewrite, so neither may look like it is.
         assert!(!render(data::PERSONA, &config).starts_with(GENERATED_MARKER_PREFIX));

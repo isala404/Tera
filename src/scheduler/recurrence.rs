@@ -74,7 +74,11 @@ impl ScheduleTiming {
                 // nothing can do five hours later inside the scheduler loop.
                 Recurrence::parse(rule)?;
             }
-            other => return Err(anyhow!("unknown schedule type {other:?}; use \"once\" or \"recurring\"")),
+            other => {
+                return Err(anyhow!(
+                    "unknown schedule type {other:?}; use \"once\" or \"recurring\""
+                ))
+            }
         }
 
         // A recurring schedule has no `at`, so its first run must be derived from
@@ -287,7 +291,8 @@ mod tests {
     #[test]
     fn test_recurrence_interval() {
         let now = 1000000;
-        let next = RecurrenceEngine::compute_next_run("recurring", None, Some("EVERY_10M"), now).unwrap();
+        let next =
+            RecurrenceEngine::compute_next_run("recurring", None, Some("EVERY_10M"), now).unwrap();
         assert_eq!(next, Some(now + 600000));
     }
 
@@ -373,7 +378,14 @@ mod tests {
     #[test]
     fn test_an_unparseable_rule_is_rejected_not_turned_into_an_hourly_task() {
         let now = 1_700_000_000_000;
-        for bad in ["every morning", "0 7 * *", "EVERY_10X", "EVERY_0M", "EVERY_", "EVERY_-5M"] {
+        for bad in [
+            "every morning",
+            "0 7 * *",
+            "EVERY_10X",
+            "EVERY_0M",
+            "EVERY_",
+            "EVERY_-5M",
+        ] {
             let timing = json!({"type": "recurring", "rrule": bad});
             let err = ScheduleTiming::parse(&timing, now)
                 .map(|t| t.first_run_ms)
@@ -454,4 +466,3 @@ mod tests {
         assert_eq!(shift_day_of_week("1-5/2"), "2-6/2");
     }
 }
-

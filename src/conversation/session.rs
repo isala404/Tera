@@ -90,6 +90,9 @@ mod tests {
         assert_eq!(session.chat(), None);
 
         session.set_chat("254910671147212:26@lid");
-        assert_eq!(session.clone().chat().as_deref(), Some("254910671147212:26@lid"));
+        assert_eq!(
+            session.clone().chat().as_deref(),
+            Some("254910671147212:26@lid")
+        );
     }
 }

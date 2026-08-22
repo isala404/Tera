@@ -114,7 +114,10 @@ mod tests {
     fn test_an_armed_mark_is_reported_to_the_next_start_and_a_disarmed_one_is_not() {
         let dir = tempfile::tempdir().unwrap();
 
-        assert!(arm(dir.path()).unwrap().is_none(), "a first start is not a crash");
+        assert!(
+            arm(dir.path()).unwrap().is_none(),
+            "a first start is not a crash"
+        );
 
         // Simulating a crash means simply not disarming.
         let prior = arm(dir.path()).unwrap().expect("an armed mark survives");
@@ -126,7 +129,10 @@ mod tests {
         assert_eq!(arm(dir.path()).unwrap().unwrap().consecutive, 1);
 
         disarm(dir.path());
-        assert!(arm(dir.path()).unwrap().is_none(), "a clean exit leaves nothing");
+        assert!(
+            arm(dir.path()).unwrap().is_none(),
+            "a clean exit leaves nothing"
+        );
     }
 
     #[test]

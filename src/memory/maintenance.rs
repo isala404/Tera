@@ -122,13 +122,20 @@ impl MaintenanceRunner {
             // whole tree from history, which is strictly more than the nightly
             // pass does, so running one straight after would be busywork.
             Outcome::Promoted(generation) => {
-                self.runtime_db.set_state_value(LAST_OPTIMIZED_KEY, &today())?;
-                info!("Memory {} pass promoted generation {generation}", pass.label);
+                self.runtime_db
+                    .set_state_value(LAST_OPTIMIZED_KEY, &today())?;
+                info!(
+                    "Memory {} pass promoted generation {generation}",
+                    pass.label
+                );
             }
             // Deliberately does not stamp the date: an abandoned pass should be
             // retried in the next idle window, not written off for the day.
             Outcome::Interrupted => {
-                info!("Memory {} pass deferred; it will retry when idle", pass.label)
+                info!(
+                    "Memory {} pass deferred; it will retry when idle",
+                    pass.label
+                )
             }
             Outcome::Rejected(reason) => {
                 warn!(

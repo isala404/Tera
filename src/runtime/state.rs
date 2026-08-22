@@ -294,8 +294,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = RuntimeDb::open(&dir.path().join("state.sqlite3")).unwrap();
 
-        db.start_turn("turn_1", "947@s.whatsapp.net", "wamid.1").unwrap();
-        db.start_turn("turn_2", "947@s.whatsapp.net", "wamid.2").unwrap();
+        db.start_turn("turn_1", "947@s.whatsapp.net", "wamid.1")
+            .unwrap();
+        db.start_turn("turn_2", "947@s.whatsapp.net", "wamid.2")
+            .unwrap();
         db.finish_turn("turn_2", "completed").unwrap();
 
         let open = db.unfinished_turns().unwrap();
@@ -304,11 +306,15 @@ mod tests {
         assert_eq!(open[0].attempts, 0);
 
         // A steering message answers to the newest message, not the first.
-        db.start_turn("turn_1", "947@s.whatsapp.net", "wamid.3").unwrap();
+        db.start_turn("turn_1", "947@s.whatsapp.net", "wamid.3")
+            .unwrap();
         let open = db.unfinished_turns().unwrap();
         assert_eq!(open.len(), 1, "steering must not open a second turn");
         assert_eq!(open[0].last_provider_msg_id, "wamid.3");
-        assert_eq!(open[0].started_at_ms, db.unfinished_turns().unwrap()[0].started_at_ms);
+        assert_eq!(
+            open[0].started_at_ms,
+            db.unfinished_turns().unwrap()[0].started_at_ms
+        );
     }
 
     /// A request that keeps killing the process has to stop being retried, so
@@ -318,7 +324,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = RuntimeDb::open(&dir.path().join("state.sqlite3")).unwrap();
 
-        db.start_turn("turn_1", "947@s.whatsapp.net", "wamid.1").unwrap();
+        db.start_turn("turn_1", "947@s.whatsapp.net", "wamid.1")
+            .unwrap();
         assert_eq!(db.record_turn_attempt("turn_1").unwrap(), 1);
         assert_eq!(db.record_turn_attempt("turn_1").unwrap(), 2);
 

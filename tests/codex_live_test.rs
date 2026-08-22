@@ -6,6 +6,7 @@
 //!
 //!     cargo test --test codex_live_test -- --ignored --nocapture
 
+use std::sync::Arc;
 use tera::codex::process::ThreadOptions;
 use tera::codex::tier;
 use tera::codex::CodexProcessManager;
@@ -16,7 +17,6 @@ use tera::mcp::DaemonRpcServer;
 use tera::runtime::RuntimeDb;
 use tera::transport::{MockTransport, Transport};
 use tera::workspace::WorkspaceInit;
-use std::sync::Arc;
 
 /// Point the generated Codex config at the real daemon binary. Under `cargo
 /// test` the current executable is the test harness, which would make Codex
@@ -87,7 +87,10 @@ async fn live_codex_starts_in_workspace_and_calls_mcp_tool() {
         let _ = rpc.run().await;
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert!(config.socket_path().exists(), "daemon socket should be bound");
+    assert!(
+        config.socket_path().exists(),
+        "daemon socket should be bound"
+    );
 
     let mgr = CodexProcessManager::spawn(Some(&config.codex_home_dir()))
         .await
@@ -129,7 +132,10 @@ async fn live_thread_resume_preserves_context() {
         .unwrap();
     let info = first.start_thread(&opts).await.unwrap();
     first
-        .run_turn("Remember this codeword: BANYAN. Reply with just: ok", tier::CONVERSATION)
+        .run_turn(
+            "Remember this codeword: BANYAN. Reply with just: ok",
+            tier::CONVERSATION,
+        )
         .await
         .unwrap();
     drop(first);
@@ -145,7 +151,10 @@ async fn live_thread_resume_preserves_context() {
     assert_eq!(resumed.id, info.id, "resume should rejoin the same thread");
 
     let reply = second
-        .run_turn("What was the codeword I gave you? Reply with just the word.", tier::CONVERSATION)
+        .run_turn(
+            "What was the codeword I gave you? Reply with just the word.",
+            tier::CONVERSATION,
+        )
         .await
         .unwrap();
 

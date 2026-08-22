@@ -104,13 +104,17 @@ impl Phoenix {
             &recoverable,
             &abandoned,
         )
-            .await?;
+        .await?;
 
         for turn in recoverable.iter().chain(&abandoned) {
             self.runtime_db.record_turn_attempt(&turn.turn_id)?;
         }
         for turn in &abandoned {
-            warn!("Phoenix abandoned turn {} after {} attempts", turn.turn_id, turn.attempts + 1);
+            warn!(
+                "Phoenix abandoned turn {} after {} attempts",
+                turn.turn_id,
+                turn.attempts + 1
+            );
             self.runtime_db.finish_turn(&turn.turn_id, "abandoned")?;
         }
 

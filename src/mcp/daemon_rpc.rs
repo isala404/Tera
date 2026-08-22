@@ -81,7 +81,10 @@ impl DaemonRpcServer {
 
         let listener = UnixListener::bind(&sock_path)
             .with_context(|| format!("Failed to bind Unix domain socket at {:?}", sock_path))?;
-        info!("Daemon MCP RPC server listening on Unix socket {:?}", sock_path);
+        info!(
+            "Daemon MCP RPC server listening on Unix socket {:?}",
+            sock_path
+        );
 
         loop {
             match listener.accept().await {
@@ -281,13 +284,12 @@ impl DaemonRpcServer {
                 };
 
                 let saved_ev = self.history_db.insert_event(event)?;
-                self.history_db
-                    .record_provider_ref(&ProviderRef::whatsapp(
-                        &saved_ev.id,
-                        &provider_msg_id,
-                        &recipient,
-                        true,
-                    ))?;
+                self.history_db.record_provider_ref(&ProviderRef::whatsapp(
+                    &saved_ev.id,
+                    &provider_msg_id,
+                    &recipient,
+                    true,
+                ))?;
                 self.history_db
                     .record_delivery_event(&saved_ev.id, "sent", None)?;
 
@@ -308,7 +310,9 @@ impl DaemonRpcServer {
                 let emoji = require_str(args, "emoji")?;
 
                 let target = self.message_ref(msg_id, &recipient)?.ok_or_else(|| {
-                    anyhow!("no WhatsApp message is recorded for event {msg_id}; cannot react to it")
+                    anyhow!(
+                        "no WhatsApp message is recorded for event {msg_id}; cannot react to it"
+                    )
                 })?;
 
                 self.transport
@@ -404,8 +408,7 @@ impl DaemonRpcServer {
                 let reason = require_str(args, "reason")?;
                 let recipient = self.recipient()?;
 
-                self.secrets
-                    .request(name, Utc::now().timestamp_millis())?;
+                self.secrets.request(name, Utc::now().timestamp_millis())?;
 
                 // The tool asks rather than returning instructions for the agent
                 // to relay. The wording has to be exact, the owner's reply must be
@@ -440,7 +443,9 @@ impl DaemonRpcServer {
 /// absent. Only for arguments that hard-error on absence; genuinely optional
 /// ones stay as direct `.as_str()` reads.
 fn require_str<'a>(args: &'a Value, field: &str) -> Result<&'a str> {
-    args[field].as_str().ok_or_else(|| anyhow!("Missing {field}"))
+    args[field]
+        .as_str()
+        .ok_or_else(|| anyhow!("Missing {field}"))
 }
 
 fn attachment_argument(args: &Value) -> Result<Option<(&'static str, &str)>> {
@@ -456,7 +461,9 @@ fn attachment_argument(args: &Value) -> Result<Option<(&'static str, &str)>> {
         .collect();
 
     if supplied.len() > 1 {
-        return Err(anyhow!("send_message accepts only one attachment path per call"));
+        return Err(anyhow!(
+            "send_message accepts only one attachment path per call"
+        ));
     }
 
     Ok(supplied.into_iter().next())
@@ -511,7 +518,10 @@ mod tests {
         std::fs::write(&file, b"content").unwrap();
 
         assert_eq!(resolve_media_path(dir.path(), "notes.pdf").unwrap(), file);
-        assert_eq!(resolve_media_path(dir.path(), file.to_str().unwrap()).unwrap(), file);
+        assert_eq!(
+            resolve_media_path(dir.path(), file.to_str().unwrap()).unwrap(),
+            file
+        );
     }
 
     #[test]
@@ -525,7 +535,11 @@ mod tests {
     /// so `send_message` has somewhere to send.
     fn test_server(dir: &Path) -> (Arc<MockTransport>, DaemonRpcServer) {
         let config = Config::new(dir.to_path_buf(), true);
-        for path in [config.history_db_path(), config.runtime_db_path(), config.secrets_path()] {
+        for path in [
+            config.history_db_path(),
+            config.runtime_db_path(),
+            config.secrets_path(),
+        ] {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         }
         let history_db = HistoryDb::open_for(&config).unwrap();
@@ -534,7 +548,8 @@ mod tests {
         let session = ConversationSession::new();
         session.set_chat("owner@s.whatsapp.net");
 
-        let server = DaemonRpcServer::new(config, history_db, runtime_db, transport.clone(), session);
+        let server =
+            DaemonRpcServer::new(config, history_db, runtime_db, transport.clone(), session);
         (transport, server)
     }
 
@@ -544,7 +559,10 @@ mod tests {
     async fn a_secret_placeholder_is_filled_in_on_the_wire_but_not_in_history() {
         let dir = tempdir().unwrap();
         let (transport, server) = test_server(dir.path());
-        server.secrets.set("SPOTIFY_CLIENT_ID", "abc123def456", 0).unwrap();
+        server
+            .secrets
+            .set("SPOTIFY_CLIENT_ID", "abc123def456", 0)
+            .unwrap();
 
         server
             .execute_tool(
@@ -555,12 +573,22 @@ mod tests {
             .unwrap();
 
         let sent = transport.sent_messages.lock().unwrap();
-        assert!(sent[0].1.contains("client_id=abc123def456"), "{}", sent[0].1);
+        assert!(
+            sent[0].1.contains("client_id=abc123def456"),
+            "{}",
+            sent[0].1
+        );
 
         let events = server.history_db.list_events_all().unwrap();
         let recorded = events[0].text.clone().unwrap();
-        assert!(recorded.contains("client_id=${SPOTIFY_CLIENT_ID}"), "{recorded}");
-        assert!(!recorded.contains("abc123def456"), "history kept the value: {recorded}");
+        assert!(
+            recorded.contains("client_id=${SPOTIFY_CLIENT_ID}"),
+            "{recorded}"
+        );
+        assert!(
+            !recorded.contains("abc123def456"),
+            "history kept the value: {recorded}"
+        );
     }
 
     /// A value the agent pasted itself still gets rewritten out on both paths.
@@ -568,7 +596,10 @@ mod tests {
     async fn a_pasted_secret_never_reaches_the_wire() {
         let dir = tempdir().unwrap();
         let (transport, server) = test_server(dir.path());
-        server.secrets.set("SPOTIFY_CLIENT_ID", "abc123def456", 0).unwrap();
+        server
+            .secrets
+            .set("SPOTIFY_CLIENT_ID", "abc123def456", 0)
+            .unwrap();
 
         server
             .execute_tool("send_message", &json!({"text": "your id is abc123def456"}))
@@ -611,7 +642,10 @@ mod tests {
             .unwrap();
 
         server
-            .execute_tool("send_message", &json!({"text": "that one", "reply_to": incoming.id}))
+            .execute_tool(
+                "send_message",
+                &json!({"text": "that one", "reply_to": incoming.id}),
+            )
             .await
             .unwrap();
 

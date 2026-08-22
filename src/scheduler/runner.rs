@@ -2,8 +2,8 @@ use crate::codex::tier;
 use crate::codex::CodexSupervisor;
 use crate::config::Config;
 use crate::runtime::{ActivityTracker, RuntimeDb};
-use crate::scheduler::db::{ScheduleItem, ScheduleRun};
 use crate::scheduler::db::SchedulerDb;
+use crate::scheduler::db::{ScheduleItem, ScheduleRun};
 use crate::scheduler::recurrence::RecurrenceEngine;
 use crate::workspace::templates;
 use anyhow::Result;
@@ -240,12 +240,16 @@ impl SchedulerRunner {
         };
         SchedulerDb::update_next_run(&self.runtime_db, &item.id, next_run, status)?;
 
-        let prompt = Self::build_task_prompt(&self.config.owner_name, item, &task_dir, lateness.as_ref());
+        let prompt =
+            Self::build_task_prompt(&self.config.owner_name, item, &task_dir, lateness.as_ref());
 
         let tier = tier::by_name(&item.tier).unwrap_or_else(|e| {
             // A row with a tier this build does not know is a downgrade, not a
             // failure: the run still matters more than the model it runs on.
-            warn!("Schedule {} has an unusable tier ({e}); running it routine", item.id);
+            warn!(
+                "Schedule {} has an unusable tier ({e}); running it routine",
+                item.id
+            );
             tier::ROUTINE
         });
 
@@ -431,8 +435,8 @@ mod tests {
     #[test]
     fn test_an_outage_is_reported_with_the_occurrences_it_swallowed() {
         let five_hours_ago = NOW - 5 * 3600 * 1000;
-        let late = SchedulerRunner::lateness(&hourly(Some(five_hours_ago)), NOW)
-            .expect("five hours late");
+        let late =
+            SchedulerRunner::lateness(&hourly(Some(five_hours_ago)), NOW).expect("five hours late");
 
         assert_eq!(late.by_ms / 60_000, 300);
         assert_eq!(late.missed, 5);

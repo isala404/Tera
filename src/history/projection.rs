@@ -287,7 +287,10 @@ mod tests {
         // The agent reads these lines with jq; a `"reply_to": null` on every
         // record is noise it has to filter.
         let line = serde_json::to_string(&ProjectionEngine::event_to_record(&message(
-            "m_1", "user", 1_786_962_664_000, "hi",
+            "m_1",
+            "user",
+            1_786_962_664_000,
+            "hi",
         )))
         .unwrap();
         assert!(!line.contains("reply_to"));

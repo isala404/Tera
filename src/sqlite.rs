@@ -40,11 +40,14 @@ mod tests {
         conn.execute_batch("CREATE TABLE t (a TEXT);").unwrap();
 
         add_column_if_missing(&conn, "t", "b", "INTEGER NOT NULL DEFAULT 0").unwrap();
-        conn.execute("INSERT INTO t (a, b) VALUES ('x', 7)", []).unwrap();
+        conn.execute("INSERT INTO t (a, b) VALUES ('x', 7)", [])
+            .unwrap();
 
         // The second call must not clobber the value the first one made room for.
         add_column_if_missing(&conn, "t", "b", "INTEGER NOT NULL DEFAULT 0").unwrap();
-        let b: i64 = conn.query_row("SELECT b FROM t", [], |row| row.get(0)).unwrap();
+        let b: i64 = conn
+            .query_row("SELECT b FROM t", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(b, 7);
     }
 }

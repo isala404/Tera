@@ -44,7 +44,9 @@ pub fn backup_history(config: &Config, timestamp: &str) -> Result<PathBuf> {
     // mid-transaction; this cannot.
     src.execute(
         "VACUUM INTO ?1",
-        [dest_path.to_str().ok_or_else(|| anyhow!("non-UTF-8 backup path"))?],
+        [dest_path
+            .to_str()
+            .ok_or_else(|| anyhow!("non-UTF-8 backup path"))?],
     )
     .with_context(|| format!("Failed to write backup to {dest_path:?}"))?;
 
@@ -74,7 +76,10 @@ impl IntegrityReport {
     }
 }
 
-pub fn check_integrity(config: &Config, db: &crate::history::db::HistoryDb) -> Result<IntegrityReport> {
+pub fn check_integrity(
+    config: &Config,
+    db: &crate::history::db::HistoryDb,
+) -> Result<IntegrityReport> {
     let conn = Connection::open(config.history_db_path())?;
     let result: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
 
@@ -137,7 +142,8 @@ pub fn verify_memories_link(config: &Config) -> Result<bool> {
         return Ok(true);
     }
 
-    let generation = crate::memory::generations::GenerationManager::get_current_generation_num(config)?;
+    let generation =
+        crate::memory::generations::GenerationManager::get_current_generation_num(config)?;
     let target = config.generations_dir().join(format!("{generation:08}"));
     if !target.is_dir() {
         return Err(anyhow!(
@@ -267,7 +273,10 @@ mod tests {
         fs::remove_file(config.memories_link()).unwrap();
         std::os::unix::fs::symlink("nowhere", config.memories_link()).unwrap();
 
-        assert!(!verify_memories_link(&config).unwrap(), "should have repaired");
+        assert!(
+            !verify_memories_link(&config).unwrap(),
+            "should have repaired"
+        );
         assert!(config.memories_link().join("INDEX.md").is_file());
     }
 

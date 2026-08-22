@@ -1,22 +1,22 @@
-use tera::config::Config;
-use tera::history::db::{ConversationEvent, EventKind, HistoryDb};
-use tera::history::projection::ProjectionEngine;
-use tera::memory::generations::GenerationManager;
-use tera::memory::NIGHTLY;
-use tera::runtime::RuntimeDb;
-use tera::codex::tier;
-use tera::scheduler::db::SchedulerDb;
-use tera::scheduler::recurrence::ScheduleTiming;
-use tera::secrets::SecretStore;
-use tera::codex::CodexSupervisor;
-use tera::conversation::{ConversationSession, TurnEngine};
-use tera::runtime::ActivityTracker;
-use tera::transport::InboundMessage;
-use tera::workspace::init::WorkspaceInit;
 use chrono::Utc;
 use rusqlite::Connection;
 use std::fs;
 use tempfile::TempDir;
+use tera::codex::tier;
+use tera::codex::CodexSupervisor;
+use tera::config::Config;
+use tera::conversation::{ConversationSession, TurnEngine};
+use tera::history::db::{ConversationEvent, EventKind, HistoryDb};
+use tera::history::projection::ProjectionEngine;
+use tera::memory::generations::GenerationManager;
+use tera::memory::NIGHTLY;
+use tera::runtime::ActivityTracker;
+use tera::runtime::RuntimeDb;
+use tera::scheduler::db::SchedulerDb;
+use tera::scheduler::recurrence::ScheduleTiming;
+use tera::secrets::SecretStore;
+use tera::transport::InboundMessage;
+use tera::workspace::init::WorkspaceInit;
 
 #[tokio::test]
 async fn test_workspace_init() {
@@ -32,7 +32,11 @@ async fn test_workspace_init() {
     assert!(!tera::data::BUILTIN_SKILLS.is_empty());
     for skill in tera::data::BUILTIN_SKILLS {
         for file in skill.files {
-            assert!(config.skills_dir().join(skill.name).join(file.relative_path).exists());
+            assert!(config
+                .skills_dir()
+                .join(skill.name)
+                .join(file.relative_path)
+                .exists());
         }
     }
     assert!(config.memories_link().exists());
@@ -67,7 +71,10 @@ async fn test_fts_index_is_queryable_the_way_the_agent_queries_it() {
         .unwrap();
 
     let retrieved = history_db.get_event("m_test1").unwrap().unwrap();
-    assert_eq!(retrieved.text.unwrap(), "OpenChoreo deployment setup in progress");
+    assert_eq!(
+        retrieved.text.unwrap(),
+        "OpenChoreo deployment setup in progress"
+    );
 
     let conn = Connection::open(config.history_db_path()).unwrap();
     let found: String = conn
@@ -259,7 +266,11 @@ async fn test_memory_generation_promotion_is_atomic() {
     WorkspaceInit::init(&config).unwrap();
 
     let staging = NIGHTLY.prepare_staging(&config).unwrap();
-    fs::write(staging.join("people.md"), "# Amaya\n\nMoving in December.\n").unwrap();
+    fs::write(
+        staging.join("people.md"),
+        "# Amaya\n\nMoving in December.\n",
+    )
+    .unwrap();
 
     let generation = GenerationManager::atomic_swap_generation(&config, &staging).unwrap();
     assert!(generation >= 2);
@@ -354,7 +365,10 @@ async fn test_a_secret_sent_through_chat_never_lands_in_history() {
     let events = history_db.list_events_all().unwrap();
     assert_eq!(events.len(), 1, "the message should still be recorded");
     let recorded = events[0].text.as_deref().unwrap();
-    assert!(!recorded.contains(VALUE), "history holds the secret: {recorded}");
+    assert!(
+        !recorded.contains(VALUE),
+        "history holds the secret: {recorded}"
+    );
     assert!(
         recorded.contains("SPOTIFY_CLIENT_ID"),
         "the agent still has to learn which credential arrived: {recorded}"
@@ -362,5 +376,8 @@ async fn test_a_secret_sent_through_chat_never_lands_in_history() {
 
     // And the value went somewhere a skill can actually read it.
     let store = SecretStore::new(config.secrets_path());
-    assert_eq!(store.get("SPOTIFY_CLIENT_ID").unwrap().as_deref(), Some(VALUE));
+    assert_eq!(
+        store.get("SPOTIFY_CLIENT_ID").unwrap().as_deref(),
+        Some(VALUE)
+    );
 }

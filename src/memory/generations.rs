@@ -53,11 +53,7 @@ impl GenerationManager {
     /// as "active" would tell the operator the rollback did not take.
     pub fn active_generation(config: &Config) -> Option<u64> {
         let target = fs::read_link(config.memories_link()).ok()?;
-        target
-            .file_name()?
-            .to_str()?
-            .parse::<u64>()
-            .ok()
+        target.file_name()?.to_str()?.parse::<u64>().ok()
     }
 
     pub fn prepare_next_generation_dir(config: &Config) -> Result<(u64, PathBuf)> {
@@ -77,7 +73,9 @@ impl GenerationManager {
     /// dump.
     pub fn validate_generation_dir(dir: &Path) -> Result<()> {
         if !dir.is_dir() {
-            return Err(anyhow!("Memory validation failed: {dir:?} is not a directory"));
+            return Err(anyhow!(
+                "Memory validation failed: {dir:?} is not a directory"
+            ));
         }
 
         for required in ["INDEX.md", "HORIZON.md"] {
@@ -194,9 +192,8 @@ impl GenerationManager {
         symlink(&rel_target, &staging_link)
             .with_context(|| format!("Failed to create memories symlink to {rel_target:?}"))?;
 
-        fs::rename(&staging_link, &memories_link).with_context(|| {
-            format!("Failed to move {staging_link:?} over {memories_link:?}")
-        })?;
+        fs::rename(&staging_link, &memories_link)
+            .with_context(|| format!("Failed to move {staging_link:?} over {memories_link:?}"))?;
         Ok(())
     }
 

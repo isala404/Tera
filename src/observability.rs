@@ -22,15 +22,19 @@ const RETAIN_DAYS: i64 = 14;
 /// Start tracing. `log_dir` adds the file copy; one-shot commands with no
 /// workspace pass `None` and log to stderr only.
 pub fn init_tracing(log_dir: Option<&Path>) {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,tera=debug"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,tera=debug"));
 
     let file_layer = log_dir.and_then(|dir| match fs::create_dir_all(dir) {
         Ok(()) => {
             prune_old_logs(dir, RETAIN_DAYS);
             // No ANSI: the agent reads this with rg and jq, and escape codes
             // turn every colourised level into a needless match problem.
-            Some(fmt::layer().with_ansi(false).with_writer(DailyLog::new(dir)))
+            Some(
+                fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(DailyLog::new(dir)),
+            )
         }
         Err(e) => {
             eprintln!("Could not create log directory {dir:?}: {e}; logging to stderr only");

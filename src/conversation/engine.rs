@@ -2,11 +2,11 @@ use crate::codex::process::TurnInput;
 use crate::codex::CodexSupervisor;
 use crate::config::Config;
 use crate::conversation::buffer::MessageBurst;
+use crate::conversation::record_assistant_message;
 use crate::conversation::renderer::InputRenderer;
 use crate::conversation::session::ConversationSession;
 use crate::conversation::typing::TypingGuard;
 use crate::history::assets::AssetStorage;
-use crate::conversation::record_assistant_message;
 use crate::history::db::{Attachment, ConversationEvent, EventKind, HistoryDb, ProviderRef};
 use crate::runtime::{ActivityTracker, RuntimeDb};
 use crate::secrets::{Capture, SecretStore};
@@ -141,13 +141,12 @@ impl TurnEngine {
         };
 
         self.history_db.insert_event(conv_ev.clone())?;
-        self.history_db
-            .record_provider_ref(&ProviderRef::whatsapp(
-                &event_id,
-                &msg.provider_msg_id,
-                &msg.chat_jid,
-                msg.from_own_account,
-            ))?;
+        self.history_db.record_provider_ref(&ProviderRef::whatsapp(
+            &event_id,
+            &msg.provider_msg_id,
+            &msg.chat_jid,
+            msg.from_own_account,
+        ))?;
 
         info!("Recorded inbound message from {}: {:?}", sender, msg.text);
 
@@ -282,7 +281,10 @@ impl TurnEngine {
             if self.codex.main_turn_is_running().await {
                 return (Route::Steer, running);
             }
-            return (Route::StartBurst, format!("turn_{}", Uuid::new_v4().simple()));
+            return (
+                Route::StartBurst,
+                format!("turn_{}", Uuid::new_v4().simple()),
+            );
         }
 
         match state.bursts.get(sender) {
@@ -378,7 +380,10 @@ impl TurnEngine {
             &media.data,
         )?;
 
-        info!("Stored {} attachment at {}", media.media_type, relative_path);
+        info!(
+            "Stored {} attachment at {}",
+            media.media_type, relative_path
+        );
 
         Ok(vec![Attachment {
             id: None,
@@ -464,7 +469,11 @@ impl TurnEngine {
         // Closed either way. This process is still alive, so a failure here is a
         // logged failure, not something for Phoenix to resurrect at a restart
         // that might be days away.
-        let state = if outcome.is_ok() { "completed" } else { "failed" };
+        let state = if outcome.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        };
         if let Err(e) = self.runtime_db.finish_turn(&turn_id, state) {
             warn!("Could not close turn {turn_id}: {e:?}");
         }
@@ -481,7 +490,11 @@ impl TurnEngine {
         burst: MessageBurst,
         last_provider_msg_id: &str,
     ) -> Result<()> {
-        info!("Processing message burst for {} ({} events)", sender, burst.events.len());
+        info!(
+            "Processing message burst for {} ({} events)",
+            sender,
+            burst.events.len()
+        );
 
         // Snapshot before the turn so send_message calls made during it are visible.
         let sends_before = self.session.count();
