@@ -58,4 +58,8 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          # This job never checks the repository out, so gh has no git remote to
+          # infer the target from and fails before it uploads anything. Naming the
+          # repository is cheaper than cloning the tree to publish six files.
+          GH_REPO: ${{ github.repository }}
         run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag
