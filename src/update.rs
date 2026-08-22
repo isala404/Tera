@@ -528,6 +528,7 @@ fn binary_info(path: &Path) -> Result<BuildInfo> {
 fn release_asset() -> Result<String> {
     match (std::env::consts::ARCH, std::env::consts::OS) {
         ("x86_64", "linux") => Ok("tera-x86_64-unknown-linux-gnu".to_string()),
+        ("aarch64", "linux") => Ok("tera-aarch64-unknown-linux-gnu".to_string()),
         ("aarch64", "macos") => Ok("tera-aarch64-apple-darwin".to_string()),
         (arch, os) => bail!("automatic Tera updates are not published for {arch}-{os}"),
     }
@@ -732,6 +733,30 @@ mod tests {
         let mut permissions = fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions).unwrap();
+    }
+
+    /// The release workflow and `release_asset` encode the same fact twice, the
+    /// set of triples that actually get published. When they drift, a machine of
+    /// the missing kind installs from a tarball perfectly well and then can never
+    /// update itself, and nothing says so until someone tries.
+    #[test]
+    fn test_the_updater_and_the_release_workflow_agree_on_targets() {
+        let workflow = include_str!("../.github/workflows/release.yml");
+        let updater = include_str!("update.rs");
+        for triple in [
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "aarch64-apple-darwin",
+        ] {
+            assert!(
+                workflow.contains(&format!("target: {triple}")),
+                "{triple} is not built by the release workflow"
+            );
+            assert!(
+                updater.contains(&format!("tera-{triple}")),
+                "{triple} is published but the updater cannot ask for it"
+            );
+        }
     }
 
     #[test]

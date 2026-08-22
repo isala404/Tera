@@ -15,6 +15,12 @@ jobs:
         include:
           - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+          # 22.04 rather than 24.04. An artifact's glibc floor comes from the
+          # host that built it, and Raspberry Pi OS Bookworm ships 2.36. Built
+          # against 22.04 the binary needs at most 2.34, checked by running one
+          # on a bookworm base. A 24.04 host would lift that floor past the Pi.
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
           - runner: macos-14
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.runner }}
