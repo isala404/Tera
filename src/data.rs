@@ -350,7 +350,13 @@ mod tests {
     /// rewrite once; this is the tripwire.
     #[test]
     fn test_the_root_instructions_still_ban_markdown() {
-        assert!(WORKSPACE_AGENTS.contains("No markdown"));
+        // Stated as a hard rule with the notations spelled out, because a short
+        // ban gets read as a style preference and bullets come back.
+        assert!(WORKSPACE_AGENTS.contains("Hard rule. Messages are plain text."));
+        assert!(WORKSPACE_AGENTS.contains("No markdown of any kind"));
+        for notation in ["headings", "bold", "italics", "bullets", "tables", "backticks"] {
+            assert!(WORKSPACE_AGENTS.contains(notation), "{notation}");
+        }
     }
 
     #[test]
@@ -381,10 +387,11 @@ mod tests {
     #[test]
     fn test_the_root_instructions_stay_small_and_point_at_the_rest() {
         // Every session pays for this file. Keep the operational parts compact,
-        // but leave enough room for the voice rules that make the agent distinct.
+        // but leave enough room for the voice rules that make the agent distinct
+        // and for the pacing rules that decide when {{OWNER}} hears anything.
         let words = WORKSPACE_AGENTS.split_whitespace().count();
         assert!(
-            words < 750,
+            words < 800,
             "AGENTS.md is {words} words; move detail into WORKING.md or a SCHEMA reference"
         );
 
@@ -419,6 +426,11 @@ mod tests {
 
     #[test]
     fn test_the_root_instructions_pace_large_task_updates() {
+        // The acknowledgement is the beat that gets dropped first, because a
+        // model that already knows the answer to the next step reads "speak when
+        // you have an answer" as permission to stay silent until it does.
+        assert!(WORKSPACE_AGENTS.contains("before the first tool call"));
+        assert!(WORKSPACE_AGENTS.contains("a line or two"));
         assert!(WORKSPACE_AGENTS.contains("use `send_message` while working"));
         assert!(WORKSPACE_AGENTS.contains("meaningful boundary"));
         assert!(WORKSPACE_AGENTS.contains("Do not narrate commands"));
