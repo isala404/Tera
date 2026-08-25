@@ -25,12 +25,10 @@ impl MessageBurst {
         self.last_updated_at = Instant::now();
     }
 
-    /// Begin a fresh quiet window after the owner stops composing. Time spent
-    /// typing or recording must not consume the burst's normal wait ceiling.
-    pub fn restart_wait(&mut self) {
-        let now = Instant::now();
-        self.created_at = now;
-        self.last_updated_at = now;
+    /// Begin a fresh quiet window after the owner stops composing without
+    /// moving the burst's absolute deadline.
+    pub fn restart_quiet_period(&mut self) {
+        self.last_updated_at = Instant::now();
     }
 
     /// How long to keep waiting before starting the turn.
@@ -106,6 +104,18 @@ mod tests {
         // period says.
         let remaining = burst.remaining_wait(Duration::from_secs(3), Duration::ZERO);
         assert_eq!(remaining, Duration::ZERO);
+    }
+
+    #[test]
+    fn test_restarting_quiet_period_preserves_the_absolute_deadline() {
+        let mut burst = MessageBurst::new("turn_1".to_string(), event("m_1"));
+        let created_at = burst.created_at;
+        let previous_update = burst.last_updated_at;
+
+        burst.restart_quiet_period();
+
+        assert_eq!(burst.created_at, created_at);
+        assert!(burst.last_updated_at >= previous_update);
     }
 
     fn event(id: &str) -> ConversationEvent {

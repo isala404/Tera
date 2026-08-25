@@ -63,7 +63,7 @@ impl ConversationState {
                 self.composing_since.remove(&user);
                 for (burst_sender, burst) in &mut self.bursts {
                     if jid_user(burst_sender) == user {
-                        burst.restart_wait();
+                        burst.restart_quiet_period();
                     }
                 }
             }
@@ -72,19 +72,24 @@ impl ConversationState {
 
     fn remaining_wait(&mut self, sender: &str) -> Option<Duration> {
         let user = jid_user(sender);
-        if let Some(started) = self.composing_since.get(user).copied() {
-            if started.elapsed() < MAX_PRESENCE_HOLD {
-                return Some(PRESENCE_POLL_INTERVAL);
-            }
+        let composing = self
+            .composing_since
+            .get(user)
+            .is_some_and(|started| started.elapsed() < MAX_PRESENCE_HOLD);
+        if self.composing_since.contains_key(user) && !composing {
             self.composing_since.remove(user);
-            if let Some(burst) = self.bursts.get_mut(sender) {
-                burst.restart_wait();
-            }
         }
 
-        self.bursts
-            .get(sender)
-            .map(|burst| burst.remaining_wait(BURST_QUIET_PERIOD, MAX_BURST_WAIT))
+        let burst = self.bursts.get(sender)?;
+        if composing {
+            let deadline = MAX_BURST_WAIT.saturating_sub(burst.created_at.elapsed());
+            if deadline.is_zero() {
+                self.composing_since.remove(user);
+            }
+            return Some(PRESENCE_POLL_INTERVAL.min(deadline));
+        }
+
+        Some(burst.remaining_wait(BURST_QUIET_PERIOD, MAX_BURST_WAIT))
     }
 }
 
@@ -397,9 +402,15 @@ impl TurnEngine {
 
         let engine = self.clone();
         let sender = sender.to_string();
+        let typing_recipient = chat_jid.to_string();
         let last_provider_msg_id = last_provider_msg_id.to_string();
 
         tokio::spawn(async move {
+            // Acknowledge the accepted message immediately. The guard stays live
+            // through buffering and execution, and always addresses the chat
+            // rather than a device-suffixed sender JID.
+            let _typing = TypingGuard::start(engine.transport.clone(), typing_recipient);
+
             // Wait out the quiet period, restarting it whenever another message
             // lands, but never past the ceiling: someone typing continuously
             // still gets an answer.
@@ -569,8 +580,6 @@ impl TurnEngine {
         // Snapshot before the turn so send_message calls made during it are visible.
         let sends_before = self.session.count();
 
-        // Held for the whole turn; clears itself however this function exits.
-        let _typing = TypingGuard::start(self.transport.clone(), sender.to_string());
         let chat_jid = self.session.chat().unwrap_or_default();
         self.session.set_turn(Some(&burst.turn_id));
 
@@ -664,7 +673,7 @@ mod presence_tests {
     }
 
     #[test]
-    fn test_composing_holds_a_burst_past_its_normal_ceiling() {
+    fn test_composing_cannot_hold_a_burst_past_its_normal_ceiling() {
         let mut state = ConversationState::default();
         let mut burst = MessageBurst::new("turn1".into(), event());
         burst.created_at = Instant::now() - MAX_BURST_WAIT;
@@ -672,14 +681,11 @@ mod presence_tests {
         state.bursts.insert("owner:26@lid".into(), burst);
 
         state.update_presence("owner@s.whatsapp.net", InboundPresenceKind::RecordingAudio);
-        assert_eq!(
-            state.remaining_wait("owner:26@lid"),
-            Some(PRESENCE_POLL_INTERVAL)
-        );
+        assert_eq!(state.remaining_wait("owner:26@lid"), Some(Duration::ZERO));
     }
 
     #[test]
-    fn test_paused_starts_a_fresh_quiet_window() {
+    fn test_paused_does_not_move_the_burst_deadline() {
         let mut state = ConversationState::default();
         let mut burst = MessageBurst::new("turn1".into(), event());
         burst.created_at = Instant::now() - MAX_BURST_WAIT;
@@ -689,7 +695,6 @@ mod presence_tests {
 
         state.update_presence("owner", InboundPresenceKind::Paused);
         let remaining = state.remaining_wait("owner").unwrap();
-        assert!(remaining > Duration::from_secs(2));
-        assert!(remaining <= BURST_QUIET_PERIOD);
+        assert_eq!(remaining, Duration::ZERO);
     }
 }

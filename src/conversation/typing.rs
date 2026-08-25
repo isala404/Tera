@@ -2,6 +2,7 @@ use crate::transport::Transport;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
+use tracing::{debug, info, warn};
 
 /// WhatsApp clears the "typing…" state on its own after a few seconds, so a
 /// turn that runs for a minute needs the state refreshed to stay visible.
@@ -24,10 +25,26 @@ impl TypingGuard {
         let beat_recipient = recipient.clone();
 
         let heartbeat = tokio::spawn(async move {
+            let mut announced_success = false;
+            let mut announced_failure = false;
             loop {
-                let _ = beat_transport
+                match beat_transport
                     .set_typing_status(&beat_recipient, true)
-                    .await;
+                    .await
+                {
+                    Ok(()) if !announced_success => {
+                        info!("WhatsApp typing indicator active for {beat_recipient}");
+                        announced_success = true;
+                    }
+                    Ok(()) => {}
+                    Err(error) if !announced_failure => {
+                        warn!("Could not activate WhatsApp typing indicator for {beat_recipient}: {error:?}");
+                        announced_failure = true;
+                    }
+                    Err(error) => {
+                        debug!("Could not refresh WhatsApp typing indicator for {beat_recipient}: {error:?}");
+                    }
+                }
                 sleep(HEARTBEAT_INTERVAL).await;
             }
         });
@@ -49,7 +66,9 @@ impl Drop for TypingGuard {
         let transport = self.transport.clone();
         let recipient = std::mem::take(&mut self.recipient);
         tokio::spawn(async move {
-            let _ = transport.set_typing_status(&recipient, false).await;
+            if let Err(error) = transport.set_typing_status(&recipient, false).await {
+                warn!("Could not clear WhatsApp typing indicator for {recipient}: {error:?}");
+            }
         });
     }
 }
