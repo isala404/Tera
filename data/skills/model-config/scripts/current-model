@@ -1,0 +1,24 @@
+#!/bin/sh
+set -eu
+
+thread_id=${CODEX_THREAD_ID:-}
+if [ -z "$thread_id" ]; then
+    echo "CODEX_THREAD_ID is not set" >&2
+    exit 1
+fi
+
+codex_home=${CODEX_HOME:-"$PWD/.codex-home"}
+sessions="$codex_home/sessions"
+rollout=$(find "$sessions" -type f -name "*-$thread_id.jsonl" -print -quit 2>/dev/null)
+if [ -z "$rollout" ]; then
+    echo "No Codex rollout found for thread $thread_id" >&2
+    exit 1
+fi
+
+model=$(jq -r 'select(.type == "turn_context") | .payload.model // empty' "$rollout" | tail -n 1)
+if [ -z "$model" ]; then
+    echo "No model recorded for thread $thread_id" >&2
+    exit 1
+fi
+
+printf '%s\n' "$model"

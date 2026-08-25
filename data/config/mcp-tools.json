@@ -43,11 +43,6 @@
             "rrule": { "type": "string", "description": "Recurring only. Cron expression in local time, or EVERY_<n>M / EVERY_<n>H / EVERY_<n>D." }
           },
           "required": ["type"]
-        },
-        "tier": {
-          "type": "string",
-          "enum": ["routine", "default", "heavy"],
-          "description": "How much model to spend on each run. 'routine' (gpt-5.6-luna, low effort) for mechanical work of known shape. Checks, sweeps, assembling a brief from known sources. This is the right answer for most schedules. 'default' (gpt-5.6-luna, xhigh) when the run needs real judgement. 'heavy' (gpt-5.6-sol, high) only when the thinking is genuinely hard, or {{OWNER}} asked for sol. Defaults to 'routine'."
         }
       },
       "required": ["name", "prompt", "timing"]
@@ -55,7 +50,7 @@
   },
   {
     "name": "list_schedules",
-    "description": "List active schedules with their next run in local time and their tier. Use it before creating something that may already exist, and to check that a schedule you just made fires when you intended.",
+    "description": "List active schedules with their next run in local time. Use it before creating something that may already exist, and to check that a schedule you just made fires when you intended.",
     "inputSchema": { "type": "object" }
   },
   {

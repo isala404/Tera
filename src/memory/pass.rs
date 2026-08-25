@@ -9,7 +9,6 @@
 //! them. Everything around that, the staging directory, the isolated thread,
 //! validation and the atomic swap, is identical, so it is written once.
 
-use crate::codex::tier;
 use crate::codex::CodexSupervisor;
 use crate::config::Config;
 use crate::data;
@@ -126,9 +125,9 @@ impl Pass {
             self.label, staging
         );
 
-        let thread_id = codex.start_isolated_thread(&staging, tier::HEAVY).await?;
+        let thread_id = codex.start_isolated_thread(&staging).await?;
         let prompt = self.render_prompt(config, &staging, event_count);
-        let turn = codex.run_turn_on_thread(&thread_id, &prompt, tier::HEAVY);
+        let turn = codex.run_turn_on_thread(&thread_id, &prompt);
 
         let result = match activity {
             Some(activity) => tokio::select! {

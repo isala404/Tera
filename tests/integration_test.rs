@@ -2,7 +2,6 @@ use chrono::Utc;
 use rusqlite::Connection;
 use std::fs;
 use tempfile::TempDir;
-use tera::codex::tier;
 use tera::codex::CodexSupervisor;
 use tera::config::Config;
 use tera::conversation::{ConversationSession, TurnEngine};
@@ -225,6 +224,15 @@ async fn test_scheduler_persistence() {
 
     let runtime_db = RuntimeDb::open(&config.runtime_db_path()).unwrap();
 
+    // Databases created by the tier implementation keep this nullable column.
+    // New code must ignore it without requiring a destructive migration.
+    runtime_db
+        .conn
+        .lock()
+        .unwrap()
+        .execute("ALTER TABLE schedules ADD COLUMN tier TEXT", [])
+        .unwrap();
+
     // Asserted as a delta: the daemon seeds a machine-health schedule at startup,
     // and this test should keep passing if that ever moves into workspace init.
     let before = SchedulerDb::list_schedules(&runtime_db).unwrap().len();
@@ -241,7 +249,6 @@ async fn test_scheduler_persistence() {
         "Generate status summary",
         &timing,
         "tasks/schedule-test",
-        tier::ROUTINE,
     )
     .unwrap();
 

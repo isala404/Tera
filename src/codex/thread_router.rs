@@ -138,15 +138,14 @@ mod tests {
     #[test]
     fn test_first_ever_turn_starts_a_thread() {
         assert!(matches!(
-            ThreadRouter::decide_at(None, "gpt-5.6-sol", NOW),
+            ThreadRouter::decide_at(None, "model-a", NOW),
             ThreadDecision::Rotate { .. }
         ));
     }
 
     #[test]
     fn test_warm_persisted_thread_is_continued() {
-        let decision =
-            ThreadRouter::decide_at(persisted(NOW + TTL, "gpt-5.6-sol"), "gpt-5.6-sol", NOW);
+        let decision = ThreadRouter::decide_at(persisted(NOW + TTL, "model-a"), "model-a", NOW);
         assert_eq!(
             decision,
             ThreadDecision::Continue {
@@ -160,16 +159,15 @@ mod tests {
     /// conversation the user can still see.
     #[test]
     fn test_cold_thread_is_rotated() {
-        let decision =
-            ThreadRouter::decide_at(persisted(NOW - 1, "gpt-5.6-sol"), "gpt-5.6-sol", NOW);
+        let decision = ThreadRouter::decide_at(persisted(NOW - 1, "model-a"), "model-a", NOW);
         assert!(matches!(decision, ThreadDecision::Rotate { .. }));
     }
 
     #[test]
     fn test_model_change_rotates_even_when_warm() {
-        let decision = ThreadRouter::decide_at(persisted(NOW + TTL, "gpt-5.6-sol"), "gpt-6", NOW);
+        let decision = ThreadRouter::decide_at(persisted(NOW + TTL, "model-a"), "model-b", NOW);
         match decision {
-            ThreadDecision::Rotate { reason } => assert!(reason.contains("gpt-6"), "{reason}"),
+            ThreadDecision::Rotate { reason } => assert!(reason.contains("model-b"), "{reason}"),
             other => panic!("expected rotation, got {other:?}"),
         }
     }
@@ -177,7 +175,7 @@ mod tests {
     /// An unknown current model is not evidence of a change.
     #[test]
     fn test_unknown_model_does_not_force_rotation() {
-        let decision = ThreadRouter::decide_at(persisted(NOW + TTL, "gpt-5.6-sol"), "", NOW);
+        let decision = ThreadRouter::decide_at(persisted(NOW + TTL, "model-a"), "", NOW);
         assert!(matches!(decision, ThreadDecision::Continue { .. }));
     }
 }

@@ -14,7 +14,6 @@
 //!   crash came out of that thread's state, resuming it recreates the crash.
 //!   Phoenix reads what was asked and treats it as new work with context.
 
-use crate::codex::tier;
 use crate::codex::CodexSupervisor;
 use crate::config::Config;
 use crate::conversation::record_assistant_message;
@@ -244,7 +243,7 @@ impl Phoenix {
 
         let summary = self
             .codex
-            .run_task_turn(&self.config.workspace_dir, &prompt, tier::CONVERSATION)
+            .run_task_turn(&self.config.workspace_dir, &prompt)
             .await?;
         info!("Phoenix recovery finished: {summary}");
 

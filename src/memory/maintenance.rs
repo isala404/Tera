@@ -203,7 +203,10 @@ impl MaintenanceRunner {
             return Ok(());
         }
 
-        ModelDiscovery::process_models_response(&self.runtime_db, models)?;
+        let Some(thread) = self.runtime_db.get_main_thread()? else {
+            return Ok(());
+        };
+        ModelDiscovery::process_models_response(&self.runtime_db, &thread.model_id, models)?;
         Ok(())
     }
 
@@ -303,14 +306,14 @@ mod tests {
     fn test_model_list_is_parsed() {
         let response = json!({
             "models": [
-                {"id": "gpt-5.6-sol", "displayName": "GPT-5.6 Sol", "isDefault": true},
-                {"id": "gpt-5.6-mini", "displayName": "GPT-5.6 mini"}
+                {"id": "model-a", "displayName": "Model A", "isDefault": true},
+                {"id": "model-b", "displayName": "Model B"}
             ]
         });
 
         let models = MaintenanceRunner::parse_models(&response);
         assert_eq!(models.len(), 2);
-        assert_eq!(models[0].id, "gpt-5.6-sol");
+        assert_eq!(models[0].id, "model-a");
         assert!(models[0].is_default);
         assert!(!models[1].is_default);
     }
@@ -322,15 +325,15 @@ mod tests {
     fn test_the_real_model_list_shape_is_parsed() {
         let response = json!({
             "data": [
-                {"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "displayName": "GPT-5.6-Sol", "isDefault": true},
-                {"id": "gpt-5.6-terra", "model": "gpt-5.6-terra", "displayName": "GPT-5.6-Terra", "isDefault": false}
+                {"id": "model-a", "model": "model-a", "displayName": "Model A", "isDefault": true},
+                {"id": "model-b", "model": "model-b", "displayName": "Model B", "isDefault": false}
             ],
             "nextCursor": null
         });
 
         let models = MaintenanceRunner::parse_models(&response);
         assert_eq!(models.len(), 2);
-        assert_eq!(models[0].id, "gpt-5.6-sol");
+        assert_eq!(models[0].id, "model-a");
         assert!(models[0].is_default);
         assert!(!models[1].is_default);
     }

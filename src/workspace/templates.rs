@@ -21,7 +21,6 @@
 //! and not a person's name, because this is a general tool and instructions
 //! addressing somebody else's owner are worse still.
 
-use crate::codex::tier;
 use crate::config::Config;
 use crate::data;
 
@@ -33,21 +32,9 @@ pub fn render(template: &str, config: &Config) -> String {
     data::render(template, &refs)
 }
 
-/// `command` must be an absolute path: Codex spawns MCP servers itself and will
-/// not necessarily have the daemon's PATH.
-///
-/// The model comes from [`tier::CONVERSATION`] rather than being written in the
-/// template, so the pinned model and the tier the daemon actually asks for on
-/// every conversation turn cannot drift apart.
-pub fn generate_codex_config(config: &Config) -> String {
-    let mut vars = config.template_vars();
-    vars.push(("BIN", config.tera_bin.display().to_string()));
-    vars.push(("SOCKET", config.socket_path().display().to_string()));
-    vars.push(("MODEL", tier::CONVERSATION.model.to_string()));
-    vars.push(("EFFORT", tier::CONVERSATION.effort.to_string()));
-
-    let refs: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    data::render(data::CODEX_CONFIG_TOML, &refs)
+/// Seed the user-owned Codex model configuration.
+pub fn generate_codex_config() -> String {
+    data::CODEX_CONFIG_TOML.to_string()
 }
 
 #[cfg(test)]
@@ -121,8 +108,8 @@ mod tests {
 
     #[test]
     fn test_codex_config_uses_absolute_binary_path() {
-        let cfg = generate_codex_config(&config("/tmp/my_workspace"));
-        assert!(cfg.contains(r#"command = "/usr/local/bin/tera""#));
+        let cfg = config("/tmp/my_workspace").codex_overrides().join("\n");
+        assert!(cfg.contains(r#"command="/usr/local/bin/tera""#));
         assert!(cfg.contains("/tmp/my_workspace/.runtime/assistant.sock"));
     }
 
@@ -133,36 +120,33 @@ mod tests {
     fn test_mcp_server_name_matches_everywhere() {
         let name = crate::mcp::stdio::MCP_SERVER_NAME;
         let config = config("/ws");
-        let cfg = generate_codex_config(&config);
+        let cfg = config.codex_overrides().join("\n");
 
-        assert!(cfg.contains(&format!("[mcp_servers.{name}]")));
+        assert!(cfg.contains(&format!("mcp_servers.{name}.command")));
         assert!(render(data::WORKSPACE_AGENTS, &config).contains(&format!("`{name}` MCP server")));
         assert!(render(data::TASKS_AGENTS, &config).contains(&format!("`{name}` MCP server")));
     }
 
-    /// The pinned model must be the one the daemon asks for per turn. If they
-    /// drift, an interactive `codex` in this home and every turn tera starts run
-    /// on different models, and the memory-rebuild-on-model-change trigger fires
-    /// against a model nothing uses.
+    /// A new workspace inherits native Codex defaults. The file is user-owned,
+    /// so changing it through chat is configuration rather than a code change.
     #[test]
-    fn test_codex_config_pins_the_conversation_tier() {
-        let cfg = generate_codex_config(&config("/ws"));
-        assert!(cfg.contains(&format!(r#"model = "{}""#, tier::CONVERSATION.model)));
-        assert!(cfg.contains(&format!(
-            r#"model_reasoning_effort = "{}""#,
-            tier::CONVERSATION.effort
-        )));
+    fn test_codex_config_starts_with_native_defaults() {
+        let cfg = generate_codex_config();
+        assert!(cfg.contains("Leave it empty to use Codex's defaults"));
+        assert!(!cfg.contains("model ="));
+        assert!(!cfg.contains("model_provider ="));
+        assert!(!cfg.contains("model_providers."));
     }
 
     /// A fresh Codex thread must not have to ask for the workspace, the disk or
     /// the network. Nobody is there to answer.
     #[test]
     fn test_codex_config_grants_full_privilege() {
-        let cfg = generate_codex_config(&config("/ws"));
-        assert!(cfg.contains(r#"approval_policy = "never""#));
-        assert!(cfg.contains(r#"sandbox_mode = "danger-full-access""#));
-        assert!(cfg.contains(r#"[projects."/ws"]"#));
-        assert!(cfg.contains("network_access = true"));
+        let cfg = config("/ws").codex_overrides().join("\n");
+        assert!(cfg.contains(r#"approval_policy="never""#));
+        assert!(cfg.contains(r#"sandbox_mode="danger-full-access""#));
+        assert!(cfg.contains(r#"projects."/ws".trust_level="trusted""#));
+        assert!(cfg.contains("sandbox_workspace_write.network_access=true"));
     }
 
     /// The agent is told to read history itself. If the instructions do not carry
@@ -214,7 +198,7 @@ mod tests {
         for rendered in all_generated(&config).into_iter().chain([
             render(data::PERSONA, &config),
             render(data::SYSTEM_NOTES, &config),
-            generate_codex_config(&config),
+            generate_codex_config(),
         ]) {
             assert!(!rendered.contains("{{"), "{rendered:.200}");
         }

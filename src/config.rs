@@ -19,7 +19,7 @@ pub struct Config {
     pub owner_name: String,
     pub whatsapp_owner_number: Option<String>,
     pub mock_transport: bool,
-    /// Absolute path to this binary, written into the Codex `config.toml` so
+    /// Absolute path to this binary, passed to Codex as a config override so
     /// Codex can spawn the MCP proxy. Overridable via `TERA_BIN`. Under
     /// `cargo test` the current executable is the test harness, not the daemon.
     pub tera_bin: PathBuf,
@@ -84,6 +84,38 @@ impl Config {
 
     pub fn codex_home_dir(&self) -> PathBuf {
         self.workspace_dir.join(".codex-home")
+    }
+
+    pub fn codex_config_path(&self) -> PathBuf {
+        self.codex_home_dir().join("config.toml")
+    }
+
+    /// Tera-owned Codex settings passed as CLI config overrides. Model and
+    /// provider settings stay in the user-owned `config.toml`.
+    pub fn codex_overrides(&self) -> Vec<String> {
+        let string = |value: &str| serde_json::to_string(value).expect("strings serialize");
+        let workspace = string(&self.workspace_dir.display().to_string());
+        let command = string(&self.tera_bin.display().to_string());
+        let args = serde_json::to_string(&vec![
+            "mcp".to_string(),
+            "--socket".to_string(),
+            self.socket_path().display().to_string(),
+        ])
+        .expect("MCP args serialize");
+
+        vec![
+            "approval_policy=\"never\"".to_string(),
+            "sandbox_mode=\"danger-full-access\"".to_string(),
+            "features.memories=false".to_string(),
+            "features.multi_agent=true".to_string(),
+            format!("projects.{workspace}.trust_level=\"trusted\""),
+            "sandbox_workspace_write.network_access=true".to_string(),
+            format!("mcp_servers.tera.command={command}"),
+            format!("mcp_servers.tera.args={args}"),
+            "mcp_servers.tera.required=true".to_string(),
+            "mcp_servers.tera.startup_timeout_sec=10".to_string(),
+            "mcp_servers.tera.tool_timeout_sec=120".to_string(),
+        ]
     }
 
     /// Native Codex skills checked into this workspace. Codex discovers these
@@ -226,6 +258,17 @@ mod tests {
         assert_eq!(cfg.history_db_path(), root.join("history/history.sqlite3"));
         assert_eq!(cfg.runtime_db_path(), root.join(".runtime/state.sqlite3"));
         assert_eq!(cfg.codex_home_dir(), root.join(".codex-home"));
+        assert_eq!(
+            cfg.codex_config_path(),
+            root.join(".codex-home/config.toml")
+        );
+        let overrides = cfg.codex_overrides();
+        assert!(overrides
+            .iter()
+            .any(|item| item == "mcp_servers.tera.required=true"));
+        assert!(overrides
+            .iter()
+            .any(|item| item.contains("/tmp/test_workspace/.runtime/assistant.sock")));
         assert_eq!(cfg.skills_dir(), root.join(".agents/skills"));
         assert_eq!(
             cfg.builtin_skills_state_path(),

@@ -1,4 +1,3 @@
-use crate::codex::tier;
 use crate::runtime::{ModelObservation, RuntimeDb};
 use anyhow::Result;
 use chrono::Utc;
@@ -19,24 +18,25 @@ impl ModelDiscovery {
     /// Record which model this daemon runs on, and flag a memory rebuild when it
     /// changes.
     ///
-    /// The tracked model is *ours*, [`tier::CONVERSATION`], not the app-server's
-    /// advertised default. The rebuild exists because memory is one model's
-    /// interpretation of history and a different model may organise it differently,
-    /// so the model that matters is the one actually writing it. Watching the
-    /// vendor's default instead meant an expensive full rebuild every time OpenAI
-    /// promoted a new frontier model tera does not even use.
+    /// The tracked model is the one Codex resolved from Tera's user-owned config,
+    /// not the app-server's advertised default. The rebuild exists because memory
+    /// is one model's interpretation of history and a different model may organise
+    /// it differently, so the model that matters is the one actually writing it.
+    /// Watching the vendor's default instead meant an expensive full rebuild every
+    /// time OpenAI promoted a new frontier model tera does not even use.
     ///
     /// The model list is still worth fetching: it is how we learn our pinned model
     /// has been withdrawn, which is otherwise a turn failure with no explanation.
     pub fn process_models_response(
         runtime_db: &RuntimeDb,
+        configured_model: &str,
         models: Vec<ModelDescriptor>,
     ) -> Result<Option<ModelDescriptor>> {
-        let ours = tier::CONVERSATION.model;
+        let ours = configured_model;
 
         if !models.is_empty() && !models.iter().any(|m| m.id == ours) {
             warn!(
-                "Configured model {ours} is not in the app-server's list ({}).                  Turns will fail until codex::tier is updated.",
+                "Configured model {ours} is not in the app-server's list ({}). Check .codex-home/config.toml and the provider's model catalog.",
                 models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>().join(", ")
             );
         }
@@ -86,29 +86,32 @@ mod tests {
     fn listing() -> Vec<ModelDescriptor> {
         vec![
             ModelDescriptor {
-                id: "gpt-5.6-sol".into(),
-                name: Some("GPT-5.6-Sol".into()),
+                id: "vendor-default".into(),
+                name: Some("Vendor default".into()),
                 is_default: true,
             },
             ModelDescriptor {
-                id: tier::CONVERSATION.model.into(),
-                name: Some("GPT-5.6-Luna".into()),
+                id: "configured-model".into(),
+                name: Some("Configured conversation model".into()),
                 is_default: false,
             },
         ]
     }
 
-    /// The whole point of the change: the vendor's default is Sol and always has
-    /// been, and it changing must not trigger a full memory rebuild on a daemon
-    /// that pins Luna.
+    fn configured() -> &'static str {
+        "configured-model"
+    }
+
+    /// A vendor default changing must not trigger a full memory rebuild on a
+    /// daemon that pins another model.
     #[test]
     fn test_a_vendor_default_change_does_not_trigger_a_rebuild() {
         let runtime_db = db();
-        ModelDiscovery::process_models_response(&runtime_db, listing()).unwrap();
+        ModelDiscovery::process_models_response(&runtime_db, configured(), listing()).unwrap();
 
         let mut promoted = listing();
-        promoted[0].id = "gpt-5.7-sol".into();
-        ModelDiscovery::process_models_response(&runtime_db, promoted).unwrap();
+        promoted[0].id = "new-vendor-default".into();
+        ModelDiscovery::process_models_response(&runtime_db, configured(), promoted).unwrap();
 
         assert_eq!(runtime_db.get_state_value("rebuild_pending").unwrap(), None);
     }
@@ -116,27 +119,27 @@ mod tests {
     #[test]
     fn test_it_records_the_model_we_actually_run() {
         let runtime_db = db();
-        ModelDiscovery::process_models_response(&runtime_db, listing()).unwrap();
+        ModelDiscovery::process_models_response(&runtime_db, configured(), listing()).unwrap();
 
         let recorded = runtime_db.get_last_default_model().unwrap().unwrap();
-        assert_eq!(recorded.model_id, tier::CONVERSATION.model);
+        assert_eq!(recorded.model_id, configured());
     }
 
-    /// Changing `codex::tier` is the case the rebuild is for: memory was written by
-    /// the old model and the new one may want it organised differently.
+    /// Changing the configured model is the case the rebuild is for: memory was
+    /// written by the old model and the new one may organise it differently.
     #[test]
     fn test_changing_our_own_model_triggers_a_rebuild() {
         let runtime_db = db();
         runtime_db
             .record_model_observation(&ModelObservation {
-                model_id: "gpt-5.4-mini".into(),
+                model_id: "previous-model".into(),
                 display_name: None,
                 is_default: true,
                 observed_at_ms: 0,
             })
             .unwrap();
 
-        ModelDiscovery::process_models_response(&runtime_db, listing()).unwrap();
+        ModelDiscovery::process_models_response(&runtime_db, configured(), listing()).unwrap();
         assert_eq!(
             runtime_db
                 .get_state_value("rebuild_pending")
@@ -152,12 +155,14 @@ mod tests {
     fn test_a_missing_pinned_model_still_records_and_does_not_panic() {
         let runtime_db = db();
         let without_ours = vec![ModelDescriptor {
-            id: "gpt-5.6-sol".into(),
+            id: "vendor-default".into(),
             name: None,
             is_default: true,
         }];
 
-        let found = ModelDiscovery::process_models_response(&runtime_db, without_ours).unwrap();
+        let found =
+            ModelDiscovery::process_models_response(&runtime_db, configured(), without_ours)
+                .unwrap();
         assert!(found.is_none());
         assert_eq!(
             runtime_db
@@ -165,7 +170,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .model_id,
-            tier::CONVERSATION.model
+            configured()
         );
     }
 }

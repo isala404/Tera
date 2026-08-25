@@ -1,6 +1,6 @@
 use crate::codex::log::{is_stderr_problem, log_notification, strip_ansi, truncate};
 use crate::codex::rpc::{JsonRpcRequest, JsonRpcResponse};
-use crate::codex::tier::{self, ModelTier};
+use crate::config::Config;
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -33,23 +33,11 @@ struct TurnListener {
 #[derive(Debug, Clone)]
 pub struct ThreadOptions {
     pub cwd: std::path::PathBuf,
-    /// Model for the thread. Turns can still override it per turn; this is what
-    /// the thread reports as its model, which is what thread rotation compares.
-    pub tier: ModelTier,
 }
 
 impl ThreadOptions {
-    /// A conversation thread. Task threads pick their tier explicitly.
     pub fn new(cwd: impl Into<std::path::PathBuf>) -> Self {
-        Self {
-            cwd: cwd.into(),
-            tier: tier::CONVERSATION,
-        }
-    }
-
-    pub fn with_tier(mut self, tier: ModelTier) -> Self {
-        self.tier = tier;
-        self
+        Self { cwd: cwd.into() }
     }
 }
 
@@ -109,14 +97,17 @@ pub struct ThreadInfo {
 
 impl ThreadInfo {
     fn from_result(res: &Value, origin: ThreadOrigin) -> Result<Self> {
-        let id = res
+        let thread = res
             .get("thread")
-            .and_then(|t| t.get("id"))
+            .ok_or_else(|| anyhow!("app-server response missing thread: {res}"))?;
+        let id = thread
+            .get("id")
             .and_then(|i| i.as_str())
             .ok_or_else(|| anyhow!("app-server response missing thread.id: {res}"))?
             .to_string();
-        let model = res
+        let model = thread
             .get("model")
+            .or_else(|| res.get("model"))
             .and_then(|m| m.as_str())
             .unwrap_or("unknown")
             .to_string();
@@ -140,12 +131,26 @@ pub struct CodexProcessManager {
 
 impl CodexProcessManager {
     pub async fn spawn(codex_home: Option<&std::path::Path>) -> Result<Self> {
+        Self::spawn_with_overrides(codex_home, &[]).await
+    }
+
+    pub async fn spawn_for(config: &Config) -> Result<Self> {
+        Self::spawn_with_overrides(Some(&config.codex_home_dir()), &config.codex_overrides()).await
+    }
+
+    async fn spawn_with_overrides(
+        codex_home: Option<&std::path::Path>,
+        overrides: &[String],
+    ) -> Result<Self> {
         info!(
             "Spawning persistent 'codex app-server' process (codex_home={:?})",
             codex_home
         );
 
         let mut cmd = Command::new("codex");
+        for value in overrides {
+            cmd.arg("-c").arg(value);
+        }
         cmd.arg("app-server")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -336,7 +341,6 @@ impl CodexProcessManager {
             "cwd": opts.cwd.to_string_lossy(),
             "approvalPolicy": "never",
             "sandbox": "danger-full-access",
-            "model": opts.tier.model,
         })
     }
 
@@ -673,27 +677,22 @@ impl CodexProcessManager {
     }
 
     /// Convenience for text-only turns (tests, scheduled prompts).
-    pub async fn run_turn(&self, prompt: &str, tier: ModelTier) -> Result<String> {
-        self.run_turn_inputs(&[TurnInput::Text(prompt.to_string())], tier)
+    pub async fn run_turn(&self, prompt: &str) -> Result<String> {
+        self.run_turn_inputs(&[TurnInput::Text(prompt.to_string())])
             .await
     }
 
-    pub async fn run_turn_inputs(&self, inputs: &[TurnInput], tier: ModelTier) -> Result<String> {
+    pub async fn run_turn_inputs(&self, inputs: &[TurnInput]) -> Result<String> {
         let thread_id = {
             let lock = self.active_thread_id.lock().await;
             lock.clone()
                 .ok_or_else(|| anyhow!("No active Codex thread"))?
         };
-        self.run_turn_on(&thread_id, inputs, tier).await
+        self.run_turn_on(&thread_id, inputs).await
     }
 
     /// Run a turn on a specific thread, leaving the main conversation alone.
-    pub async fn run_turn_on(
-        &self,
-        thread_id: &str,
-        inputs: &[TurnInput],
-        tier: ModelTier,
-    ) -> Result<String> {
+    pub async fn run_turn_on(&self, thread_id: &str, inputs: &[TurnInput]) -> Result<String> {
         let thread_id = thread_id.to_string();
 
         // Register before turn/start so no event can be missed in the gap.
@@ -710,21 +709,12 @@ impl CodexProcessManager {
             );
         }
 
-        // Model and effort are set per turn, not just per thread: a scheduled
-        // sweep and a hard debugging session can share a thread and should not
-        // share a price.
         let turn_req = json!({
             "threadId": thread_id,
             "input": inputs.iter().map(TurnInput::to_json).collect::<Vec<_>>(),
-            "model": tier.model,
-            "effort": tier.effort,
         });
 
-        info!(
-            target: "codex::turn",
-            "Sending turn/start to Codex thread {} on {} ({} effort)",
-            thread_id, tier.model, tier.effort
-        );
+        info!(target: "codex::turn", "Sending turn/start to Codex thread {thread_id}");
         let start_result = self.send_request("turn/start", Some(turn_req)).await;
 
         let outcome = match start_result {
@@ -799,12 +789,15 @@ mod tests {
 
     #[test]
     fn test_thread_info_carries_its_origin() {
-        let res = json!({"thread": {"id": "t1"}, "model": "gpt-5.6-sol"});
+        let res = json!({"thread": {
+            "id": "t1",
+            "model": "custom-model"
+        }});
         let resumed = ThreadInfo::from_result(&res, ThreadOrigin::Resumed).unwrap();
         let created = ThreadInfo::from_result(&res, ThreadOrigin::Created).unwrap();
         assert_eq!(resumed.origin, ThreadOrigin::Resumed);
         assert_eq!(created.origin, ThreadOrigin::Created);
-        assert_eq!(created.model, "gpt-5.6-sol");
+        assert_eq!(created.model, "custom-model");
     }
 
     /// Nobody is at the other end of an approval prompt, and the whole posture is

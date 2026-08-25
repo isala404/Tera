@@ -5,3 +5,5 @@ tmp/
 *.sqlite3-wal
 *.sqlite3-shm
 .agents
+__pycache__/
+.env

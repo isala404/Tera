@@ -25,7 +25,7 @@ pub const WORKSPACE_AGENTS: &str = include_str!("../data/workspace/AGENTS.md");
 pub const PERSONA: &str = include_str!("../data/workspace/PERSONA.md");
 /// Seeded once, then owned by the agent. Not a generated file.
 pub const SYSTEM_NOTES: &str = include_str!("../data/workspace/SYSTEM.md");
-/// Craft: how to work, what to reach for, model tiers, the ways it has gone wrong
+/// Craft: how to work, what to reach for, model ownership, the ways it has gone wrong
 /// before. Split out of `AGENTS.md` so a session that only answers a question does
 /// not pay for it.
 pub const WORKING: &str = include_str!("../data/workspace/WORKING.md");
@@ -124,6 +124,14 @@ mod tests {
             "skills/audio/SKILL.md",
             include_str!("../data/skills/audio/SKILL.md"),
         ),
+        (
+            "skills/model-config/SKILL.md",
+            include_str!("../data/skills/model-config/SKILL.md"),
+        ),
+        (
+            "skills/model-config/scripts/current-model",
+            include_str!("../data/skills/model-config/scripts/current-model"),
+        ),
         ("config/codex-config.toml", CODEX_CONFIG_TOML),
         ("config/mcp-tools.json", MCP_TOOLS_JSON),
     ];
@@ -147,10 +155,6 @@ mod tests {
         "TASK_PROMPT",
         "LATE_MINUTES",
         "MISSED",
-        "BIN",
-        "SOCKET",
-        "MODEL",
-        "EFFORT",
         "OWNER",
         "WHAT_HAPPENED",
         "PENDING_REQUEST",
@@ -358,24 +362,6 @@ mod tests {
         assert!(send_message["inputSchema"]["properties"]["file_path"].is_object());
     }
 
-    /// The `tier` values the tool advertises are the ones `codex::tier` resolves.
-    /// A schema offering a name `by_name` rejects turns every schedule creation
-    /// into an error the agent cannot act on.
-    #[test]
-    fn test_schedule_tool_advertises_exactly_the_real_tiers() {
-        let tools: Vec<serde_json::Value> = serde_json::from_str(MCP_TOOLS_JSON).unwrap();
-        let schedule = tools.iter().find(|t| t["name"] == "schedule").unwrap();
-        let advertised: Vec<&str> = schedule["inputSchema"]["properties"]["tier"]["enum"]
-            .as_array()
-            .expect("tier should be an enum")
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-
-        let real: Vec<&str> = crate::codex::tier::ALL.iter().map(|t| t.name).collect();
-        assert_eq!(advertised, real);
-    }
-
     /// Voice rules the agent has to follow every turn. They have been lost to a
     /// rewrite once; this is the tripwire.
     #[test]
@@ -404,19 +390,35 @@ mod tests {
         assert!(WORKSPACE_AGENTS.contains("Never agree automatically"));
     }
 
-    /// The tiers moved to WORKING.md when AGENTS.md was cut down. They have to be
-    /// explained somewhere the agent will actually read before delegating.
     #[test]
-    fn test_working_instructions_explain_every_model_tier() {
-        assert!(WORKING.contains(crate::codex::tier::CONVERSATION.model));
-        assert!(WORKING.contains(crate::codex::tier::HEAVY.model));
-        for tier in crate::codex::tier::ALL {
-            assert!(
-                WORKING.contains(&format!("`{}`", tier.name)),
-                "WORKING.md never explains the {:?} tier",
-                tier.name
-            );
-        }
+    fn test_working_instructions_leave_model_routing_to_codex() {
+        assert!(WORKING.contains("Codex owns subagent delegation and model selection"));
+        assert!(!WORKING.contains("gpt-5.6-luna"));
+        assert!(!WORKING.contains("gpt-5.6-sol"));
+
+        let tools: Vec<serde_json::Value> = serde_json::from_str(MCP_TOOLS_JSON).unwrap();
+        let schedule = tools.iter().find(|t| t["name"] == "schedule").unwrap();
+        assert!(schedule["inputSchema"]["properties"].get("tier").is_none());
+    }
+
+    #[test]
+    fn test_model_config_skill_owns_the_safe_chat_workflow() {
+        let skill = include_str!("../data/skills/model-config/SKILL.md");
+        assert!(skill.contains("what model is running"));
+        assert!(skill.contains("scripts/current-model"));
+        assert!(skill.contains("this agent's own harness context"));
+        assert!(skill.contains("Never use that command to identify a subagent"));
+        assert!(skill.contains("tera status --workspace \"$PWD\""));
+        assert!(skill.contains("do not guess"));
+        assert!(skill.contains("use, switch, change or reset the conversation model"));
+        assert!(skill.contains(".codex-home/config.toml"));
+        assert!(skill.contains("codex --strict-config doctor --summary"));
+        assert!(skill.contains("systemctl --user restart tera"));
+        assert!(skill.contains("Never ask the owner to paste an API key"));
+        assert!(skill.contains("Provider API keys live in `.env`"));
+        assert!(skill.contains("rg -q '^PROVIDER_API_KEY=' .env"));
+        assert!(skill.contains("Never run the configured auth command yourself"));
+        assert!(skill.contains("[model_providers.example.auth]"));
     }
 
     /// The point of the split is that AGENTS.md is read every session and the rest
@@ -455,7 +457,7 @@ mod tests {
         assert!(WORKSPACE_AGENTS.contains("100 characters"));
         assert!(!WORKSPACE_AGENTS.contains("Should I create a skill for this?"));
         assert!(WORKSPACE_AGENTS.contains("$skill-creator"));
-        assert!(WORKING.contains("gpt-5.6-sol"));
+        assert!(WORKING.contains("let Codex choose the worker model"));
         assert!(WORKING.contains("Create or improve a skill"));
         assert!(WORKING.contains("compact executable scripts"));
         assert!(WORKING.contains("Do not create `agents/openai.yaml`"));

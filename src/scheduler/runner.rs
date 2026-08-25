@@ -1,4 +1,3 @@
-use crate::codex::tier;
 use crate::codex::CodexSupervisor;
 use crate::config::Config;
 use crate::runtime::{ActivityTracker, RuntimeDb};
@@ -243,17 +242,7 @@ impl SchedulerRunner {
         let prompt =
             Self::build_task_prompt(&self.config.owner_name, item, &task_dir, lateness.as_ref());
 
-        let tier = tier::by_name(&item.tier).unwrap_or_else(|e| {
-            // A row with a tier this build does not know is a downgrade, not a
-            // failure: the run still matters more than the model it runs on.
-            warn!(
-                "Schedule {} has an unusable tier ({e}); running it routine",
-                item.id
-            );
-            tier::ROUTINE
-        });
-
-        match self.codex.run_task_turn(&task_dir, &prompt, tier).await {
+        match self.codex.run_task_turn(&task_dir, &prompt).await {
             Ok(summary) => {
                 self.append_run_log(&task_dir, item, "completed", &summary);
                 let _ = SchedulerDb::finish_run(&self.runtime_db, &run_id, "completed", None);
@@ -419,7 +408,6 @@ mod tests {
             next_run_at_ms,
             created_at_ms: NOW,
             cancelled_at_ms: None,
-            tier: tier::ROUTINE.name.to_string(),
         }
     }
 

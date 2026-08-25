@@ -1,7 +1,5 @@
-use crate::codex::tier::{self, ModelTier};
 use crate::runtime::RuntimeDb;
 use crate::scheduler::recurrence::ScheduleTiming;
-use crate::sqlite::add_column_if_missing;
 use anyhow::Result;
 use chrono::{Local, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -25,8 +23,7 @@ CREATE TABLE IF NOT EXISTS schedules (
     status             TEXT NOT NULL,
     next_run_at_ms     INTEGER,
     created_at_ms      INTEGER NOT NULL,
-    cancelled_at_ms    INTEGER,
-    tier               TEXT
+    cancelled_at_ms    INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS schedule_runs (
@@ -43,7 +40,7 @@ CREATE TABLE IF NOT EXISTS schedule_runs (
 
 pub fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(INIT_SCHEDULER_SCHEMA_SQL)?;
-    add_column_if_missing(conn, "schedules", "tier", "TEXT")
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,10 +58,6 @@ pub struct ScheduleItem {
     pub next_run_at_ms: Option<i64>,
     pub created_at_ms: i64,
     pub cancelled_at_ms: Option<i64>,
-    /// Which model tier runs it: see [`crate::codex::tier`]. Nullable because
-    /// schedules created before tiers existed have none; those read back as the
-    /// routine tier.
-    pub tier: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,12 +102,6 @@ fn schedule_from_row(row: &Row) -> rusqlite::Result<ScheduleItem> {
         next_run_at_ms: row.get(10)?,
         created_at_ms: row.get(11)?,
         cancelled_at_ms: row.get(12)?,
-        // Rows written before tiers existed have NULL here. They were all created
-        // when everything ran on one model, and the cheap tier is the safe default
-        // for the recurring checks that make up most of them.
-        tier: row
-            .get::<_, Option<String>>(13)?
-            .unwrap_or_else(|| tier::ROUTINE.name.to_string()),
     })
 }
 
@@ -133,7 +120,6 @@ impl SchedulerDb {
         prompt: &str,
         timing: &ScheduleTiming,
         task_path: &str,
-        tier: ModelTier,
     ) -> Result<ScheduleItem> {
         let id = format!("sched_{}", Uuid::new_v4().simple());
         let now_ms = Utc::now().timestamp_millis();
@@ -155,15 +141,14 @@ impl SchedulerDb {
             next_run_at_ms: Some(timing.first_run_ms),
             created_at_ms: now_ms,
             cancelled_at_ms: None,
-            tier: tier.name.to_string(),
         };
 
         // Save into SQLite
         let conn = runtime_db.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO schedules (
-                id, name, prompt, schedule_type, one_shot_at_ms, dtstart_local, rrule, timezone, task_path, status, next_run_at_ms, created_at_ms, tier
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                id, name, prompt, schedule_type, one_shot_at_ms, dtstart_local, rrule, timezone, task_path, status, next_run_at_ms, created_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 item.id,
                 item.name,
@@ -177,7 +162,6 @@ impl SchedulerDb {
                 item.status,
                 item.next_run_at_ms,
                 item.created_at_ms,
-                item.tier,
             ],
         )?;
 
@@ -187,7 +171,7 @@ impl SchedulerDb {
     pub fn list_schedules(runtime_db: &RuntimeDb) -> Result<Vec<ScheduleItem>> {
         let conn = runtime_db.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, prompt, schedule_type, one_shot_at_ms, dtstart_local, rrule, timezone, task_path, status, next_run_at_ms, created_at_ms, cancelled_at_ms, tier
+            "SELECT id, name, prompt, schedule_type, one_shot_at_ms, dtstart_local, rrule, timezone, task_path, status, next_run_at_ms, created_at_ms, cancelled_at_ms
              FROM schedules WHERE status = 'active' ORDER BY created_at_ms ASC",
         )?;
 
@@ -203,7 +187,7 @@ impl SchedulerDb {
     pub fn get_schedule(runtime_db: &RuntimeDb, schedule_id: &str) -> Result<Option<ScheduleItem>> {
         let conn = runtime_db.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, prompt, schedule_type, one_shot_at_ms, dtstart_local, rrule, timezone, task_path, status, next_run_at_ms, created_at_ms, cancelled_at_ms, tier
+            "SELECT id, name, prompt, schedule_type, one_shot_at_ms, dtstart_local, rrule, timezone, task_path, status, next_run_at_ms, created_at_ms, cancelled_at_ms
              FROM schedules WHERE id = ?1",
         )?;
         Ok(stmt
@@ -238,7 +222,7 @@ impl SchedulerDb {
     pub fn get_due_schedules(runtime_db: &RuntimeDb, now_ms: i64) -> Result<Vec<ScheduleItem>> {
         let conn = runtime_db.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, prompt, schedule_type, one_shot_at_ms, dtstart_local, rrule, timezone, task_path, status, next_run_at_ms, created_at_ms, cancelled_at_ms, tier
+            "SELECT id, name, prompt, schedule_type, one_shot_at_ms, dtstart_local, rrule, timezone, task_path, status, next_run_at_ms, created_at_ms, cancelled_at_ms
              FROM schedules WHERE status = 'active' AND next_run_at_ms IS NOT NULL AND next_run_at_ms <= ?1",
         )?;
 

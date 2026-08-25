@@ -2,7 +2,6 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tera::codex::tier;
 use tera::codex::CodexSupervisor;
 use tera::config::Config;
 use tera::conversation::{ConversationSession, Phoenix, TurnEngine};
@@ -383,15 +382,7 @@ async fn main() -> Result<()> {
                 "Owner:       {} (set TERA_OWNER to change)",
                 config.owner_name
             );
-            println!(
-                "Models:      {} ({}) conversation / {} ({}) heavy / {} ({}) routine",
-                tier::CONVERSATION.model,
-                tier::CONVERSATION.effort,
-                tier::HEAVY.model,
-                tier::HEAVY.effort,
-                tier::ROUTINE.model,
-                tier::ROUTINE.effort,
-            );
+            println!("Model config: {}", config.codex_config_path().display());
 
             if config.runtime_db_path().exists() {
                 let rdb = RuntimeDb::open(&config.runtime_db_path())?;
@@ -414,10 +405,9 @@ async fn main() -> Result<()> {
                     // in, printing UTC here is how a schedule looks wrong when it
                     // is right, and vice versa.
                     println!(
-                        "  {} '{}' [{}] next {}",
+                        "  {} '{}' next {}",
                         item.id,
                         item.name,
-                        item.tier,
                         item.next_run_at_ms
                             .map(tera::scheduler::recurrence::local_time)
                             .unwrap_or_else(|| "never".to_string())

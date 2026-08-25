@@ -8,7 +8,7 @@ use tokio::net::UnixStream;
 /// Fallback only. Used when the client's `initialize` omits a version.
 const DEFAULT_MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
-/// Must match `[mcp_servers.<name>]` in `data/config/codex-config.toml`, and the
+/// Must match the `mcp_servers.<name>` process override in `Config`, and the
 /// name the instructions tell the agent to call tools on.
 pub const MCP_SERVER_NAME: &str = "tera";
 

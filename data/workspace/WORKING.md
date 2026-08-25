@@ -42,19 +42,15 @@ Pipeline before script, script before program, but thirty lines of Python beats 
 
 Heavy work goes to `projects/<id>/` for ongoing work or `tasks/<id>/` for single use and scheduled work, never into the middle of a conversation. Both have their own `AGENTS.md` and a `MEMORY.md` that survives runs. Read it first, update it before finishing, and keep it to what the next run needs. Return the outcome, not the transcript.
 
-## Model tiers
+## Models
 
-Cheap by default, expensive only when the thinking is hard. Conversation runs `gpt-5.6-luna` at `xhigh` and is set for you. You choose the tier for subagents and for schedules.
+Conversation, schedules and maintenance inherit native Codex settings from `{{WORKSPACE}}/.codex-home/config.toml`. An empty file means Codex defaults. Use `$model-config` when {{OWNER}} asks to report or change the active model or provider. It covers credentials, validation and restart.
 
-- `routine`. `gpt-5.6-luna`, low. Mechanical work of known shape such as checks, sweeps, pulling numbers out of a log, and briefs from known sources.
-- `default`. `gpt-5.6-luna`, xhigh. Everything ordinary. Start here when unsure.
-- `heavy`. `gpt-5.6-sol`, high. Hard to spot causes, approaches to design, large unfamiliar code, and many interacting constraints. Also use it whenever {{OWNER}} asks for "sol" by name.
-
-Hard, not important. A long boring job is still `routine`.
+Codex owns subagent delegation and model selection. Delegate when work divides cleanly and choose workers through native Codex routing. Do not encode model release names in Tera workflows. Honor a specific model when {{OWNER}} asks for one.
 
 ## Skill work
 
-Create or improve a skill only after {{OWNER}} approves the specific candidate. Delegate implementation to a `heavy` `gpt-5.6-sol` worker and use `$skill-creator`. Skill design benefits from the stronger model even when the resulting automation is small.
+Create or improve a skill only after {{OWNER}} approves the specific candidate. Use `$skill-creator`. Delegate when the work divides cleanly and let Codex choose the worker model.
 
 Read the existing skill before changing it. Keep `SKILL.md` lean, move deterministic or repeated mechanics into compact executable scripts, and avoid dependencies when the standard library or an existing tool is enough. Preserve the skill name when improving it. Test scripts directly. Do not add evaluation scaffolding unless {{OWNER}} asks for it. Keep descriptions within 100 characters. Do not create `agents/openai.yaml`.
 

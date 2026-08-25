@@ -36,7 +36,7 @@ Owner filtering is closed by default. With `WHATSAPP_OWNER_JID` unset, Tera answ
 | --- | --- | --- |
 | `TERA_OWNER` | what the assistant calls you in every prompt | `$USER`, then `$LOGNAME`, then "the owner" |
 | `WHATSAPP_OWNER_JID` | which sender is served | unset means only the paired account |
-| `TERA_BIN` | absolute path written into the Codex config so it can spawn `tera mcp` | the running executable |
+| `TERA_BIN` | absolute path passed to Codex so it can spawn `tera mcp` | the running executable |
 | `CODEX_LOG` | log level for the spawned application server | `error` |
 | `RUST_LOG` | Tera's own tracing filter, e.g. `info,tera=debug` | subscriber default |
 
@@ -73,7 +73,7 @@ Official release assets are `tera-x86_64-unknown-linux-gnu`, `tera-aarch64-unkno
   SYSTEM.md                 the agent's notebook on this machine
   MEMORIES -> .memory/generations/NNNNNNNN
   .agents/skills/           native Codex skills, seeded and versioned from data/skills
-  .codex-home/              private CODEX_HOME: config.toml, auth.json symlink
+  .codex-home/              private CODEX_HOME: user config and auth symlink
   .runtime/                 socket, state.sqlite3, whatsapp_session.db
   history/                  history.sqlite3, jsonl/, assets/, backups/
   logs/                     daily log, pruned after 14 days
@@ -82,11 +82,15 @@ Official release assets are `tera-x86_64-unknown-linux-gnu`, `tera-aarch64-unkno
 
 Generated files carry an HTML comment marker and are rewritten every start, so an improved template reaches an existing workspace. Edit one by hand and Tera backs your copy up to `<file>.md.user-backup` and installs its own, so put your instructions in `PERSONA.md`, which is written once and left alone.
 
-Bundled skills are stored under `.agents/skills/`, the native Codex repository location. Every package in `data/skills/` is discovered at build time, with no individual Rust registration. Tera installs each package once, updates an untouched managed package when its embedded files change, and remembers user edits, existing paths, symlinks, and deletions. The nightly memory pass also compacts repeated technical work into one candidate for a new or improved skill. It only suggests. Implementation waits for approval and runs on the heavy Sol tier.
+Bundled skills are stored under `.agents/skills/`, the native Codex repository location. Every package in `data/skills/` is discovered at build time, with no individual Rust registration. Tera installs each package once, updates an untouched managed package when its embedded files change, and remembers user edits, existing paths, symlinks, and deletions. The nightly memory pass also compacts repeated technical work into one candidate for a new or improved skill. It only suggests. Implementation waits for approval, and Codex delegates when useful.
 
 The audio skill transcribes voice notes, audio files and video soundtracks on this machine with [parakeet.cpp](https://github.com/mudler/parakeet.cpp). Its first run downloads a pinned release binary and the 0.9GB parakeet tdt 0.6b v3 weights into `<workspace>/.runtime/parakeet/`, checks both against pinned checksums, and installs nothing that does not match. That covers 25 European languages with automatic detection, and costs nothing per minute because no audio leaves the machine.
 
-Codex reaches the daemon through five tools. They are `send_message`, `react`, `schedule`, `list_schedules` and `cancel_schedule`. Schedules name a tier rather than a model id in `src/codex/tier.rs`. The `routine` tier is luna at low effort and the default, `default` is luna at xhigh for conversation, and `heavy` is sol at high.
+Codex reaches the daemon through six tools. They are `send_message`, `react`, `schedule`, `list_schedules`, `cancel_schedule` and `request_secret`. Scheduled and maintenance work starts on a fresh Codex thread. It inherits native Codex settings, and Codex owns any further delegation and worker model selection.
+
+The conversation model is native Codex configuration in `<workspace>/.codex-home/config.toml`. The file starts empty, so a fresh Tera uses Codex's current defaults. Tera creates it once and never rewrites it.
+
+Ask the assistant to change its model in chat. The bundled `model-config` skill handles native Codex settings, custom providers, safe API key lookup, validation and service restart. There is no model configuration MCP tool or separate Tera provider format.
 
 ## Privilege posture
 

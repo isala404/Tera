@@ -1,4 +1,3 @@
-use crate::codex::tier;
 use crate::config::Config;
 use crate::conversation::ConversationSession;
 use crate::history::db::{ConversationEvent, EventKind, HistoryDb, ProviderRef};
@@ -343,13 +342,6 @@ impl DaemonRpcServer {
 
                 let timing = ScheduleTiming::parse(&args["timing"], Utc::now().timestamp_millis())?;
 
-                // Most schedules are recurring checks, so the cheap tier is the
-                // default and spending more is an explicit choice.
-                let tier = match args["tier"].as_str() {
-                    Some(name) => tier::by_name(name)?,
-                    None => tier::ROUTINE,
-                };
-
                 let task_path = format!("tasks/schedule-{}", Uuid::new_v4().simple());
 
                 let item = SchedulerDb::create_schedule(
@@ -358,7 +350,6 @@ impl DaemonRpcServer {
                     prompt,
                     &timing,
                     &task_path,
-                    tier,
                 )?;
 
                 // Echo the resolved time back, in the local time the rule was
@@ -368,8 +359,6 @@ impl DaemonRpcServer {
                     "schedule_id": item.id,
                     "name": item.name,
                     "task_path": item.task_path,
-                    "tier": item.tier,
-                    "model": tier.model,
                     "first_run": recurrence::local_time(timing.first_run_ms),
                 }))
             }
@@ -388,7 +377,6 @@ impl DaemonRpcServer {
                             "name": item.name,
                             "type": item.schedule_type,
                             "rrule": item.rrule,
-                            "tier": item.tier,
                             "task_path": item.task_path,
                             "next_run": item.next_run_at_ms.map(recurrence::local_time),
                         })

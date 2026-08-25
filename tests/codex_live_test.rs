@@ -8,7 +8,6 @@
 
 use std::sync::Arc;
 use tera::codex::process::ThreadOptions;
-use tera::codex::tier;
 use tera::codex::CodexProcessManager;
 use tera::config::Config;
 use tera::conversation::ConversationSession;
@@ -36,6 +35,41 @@ fn workspace_config(dir: &std::path::Path) -> Config {
 }
 
 #[tokio::test]
+#[ignore = "spawns a real codex app-server"]
+async fn live_restart_reloads_native_model_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = workspace_config(tmp.path());
+    WorkspaceInit::init(&config).unwrap();
+
+    let first = CodexProcessManager::spawn(Some(&config.codex_home_dir()))
+        .await
+        .unwrap();
+    let first_thread = first
+        .start_thread(&ThreadOptions::new(tmp.path()))
+        .await
+        .unwrap();
+    assert!(!first_thread.model.is_empty());
+    drop(first);
+
+    std::fs::write(
+        config.codex_config_path(),
+        r#"model = "gpt-5.6-terra"
+model_reasoning_effort = "medium"
+"#,
+    )
+    .unwrap();
+
+    let restarted = CodexProcessManager::spawn(Some(&config.codex_home_dir()))
+        .await
+        .unwrap();
+    let restarted_thread = restarted
+        .ensure_thread(Some(&first_thread.id), &ThreadOptions::new(tmp.path()))
+        .await
+        .unwrap();
+    assert_eq!(restarted_thread.model, "gpt-5.6-terra");
+}
+
+#[tokio::test]
 #[ignore = "spawns a real codex app-server and consumes account tokens"]
 async fn live_handshake_and_turn_round_trip() {
     let tmp = tempfile::tempdir().unwrap();
@@ -47,7 +81,7 @@ async fn live_handshake_and_turn_round_trip() {
         .expect("thread should start");
 
     let reply = mgr
-        .run_turn("Reply with exactly the word: pong", tier::CONVERSATION)
+        .run_turn("Reply with exactly the word: pong")
         .await
         .expect("turn should produce text");
 
@@ -92,7 +126,7 @@ async fn live_codex_starts_in_workspace_and_calls_mcp_tool() {
         "daemon socket should be bound"
     );
 
-    let mgr = CodexProcessManager::spawn(Some(&config.codex_home_dir()))
+    let mgr = CodexProcessManager::spawn_for(&config)
         .await
         .expect("app-server should start against the workspace codex home");
 
@@ -104,7 +138,6 @@ async fn live_codex_starts_in_workspace_and_calls_mcp_tool() {
         .run_turn(
             "Call the tera MCP tool `list_schedules` with no arguments. \
              Then reply with exactly: TOOL_OK",
-            tier::CONVERSATION,
         )
         .await
         .expect("turn should complete");
@@ -127,23 +160,16 @@ async fn live_thread_resume_preserves_context() {
 
     let opts = ThreadOptions::new(&config.workspace_dir);
 
-    let first = CodexProcessManager::spawn(Some(&config.codex_home_dir()))
-        .await
-        .unwrap();
+    let first = CodexProcessManager::spawn_for(&config).await.unwrap();
     let info = first.start_thread(&opts).await.unwrap();
     first
-        .run_turn(
-            "Remember this codeword: BANYAN. Reply with just: ok",
-            tier::CONVERSATION,
-        )
+        .run_turn("Remember this codeword: BANYAN. Reply with just: ok")
         .await
         .unwrap();
     drop(first);
 
     // A second process resumes the same thread id, as the daemon does on boot.
-    let second = CodexProcessManager::spawn(Some(&config.codex_home_dir()))
-        .await
-        .unwrap();
+    let second = CodexProcessManager::spawn_for(&config).await.unwrap();
     let resumed = second
         .ensure_thread(Some(&info.id), &opts)
         .await
@@ -151,10 +177,7 @@ async fn live_thread_resume_preserves_context() {
     assert_eq!(resumed.id, info.id, "resume should rejoin the same thread");
 
     let reply = second
-        .run_turn(
-            "What was the codeword I gave you? Reply with just the word.",
-            tier::CONVERSATION,
-        )
+        .run_turn("What was the codeword I gave you? Reply with just the word.")
         .await
         .unwrap();
 

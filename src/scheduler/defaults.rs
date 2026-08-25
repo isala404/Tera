@@ -3,7 +3,6 @@
 //! A fresh workspace gets a daily health pass. Its durable marker means
 //! cancelling it is not undone on restart.
 
-use crate::codex::tier;
 use crate::runtime::RuntimeDb;
 use crate::scheduler::db::SchedulerDb;
 use crate::scheduler::recurrence::{self, ScheduleTiming};
@@ -47,7 +46,6 @@ fn try_seed(runtime_db: &RuntimeDb) -> Result<()> {
         crate::data::SELF_CARE_PROMPT,
         &timing,
         "tasks/machine-health",
-        tier::ROUTINE,
     )?;
     runtime_db.set_state_value(SEEDED_KEY, &item.id)?;
     info!(
@@ -71,7 +69,7 @@ mod tests {
     }
 
     #[test]
-    fn test_seeding_creates_builtin_routine() {
+    fn test_seeding_creates_builtin_schedule() {
         let runtime_db = db();
         seed(&runtime_db);
 
@@ -81,7 +79,6 @@ mod tests {
             .iter()
             .find(|item| item.name == SELF_CARE_NAME)
             .unwrap();
-        assert_eq!(health.tier, tier::ROUTINE.name);
         assert_eq!(health.rrule.as_deref(), Some(SELF_CARE_RRULE));
         assert!(health.next_run_at_ms.is_some(), "it would never fire");
         assert!(health.prompt.contains("SYSTEM.md"));

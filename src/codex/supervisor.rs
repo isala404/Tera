@@ -12,7 +12,6 @@
 
 use crate::codex::process::{ThreadOptions, ThreadOrigin, TurnInput};
 use crate::codex::thread_router::{ThreadDecision, ThreadRouter};
-use crate::codex::tier::{self, ModelTier};
 use crate::codex::CodexProcessManager;
 use crate::config::Config;
 use crate::conversation::renderer::InputRenderer;
@@ -59,7 +58,7 @@ impl CodexSupervisor {
     /// The live app-server, spawning and attaching the main thread if needed.
     ///
     /// CODEX_HOME points at the workspace so Codex loads the workspace
-    /// `config.toml` (which registers the tera MCP server) and the
+    /// `config.toml` plus Tera's process overrides (which register the MCP server) and the
     /// bootstrap `AGENTS.md`; cwd roots the thread in the workspace so
     /// `memories/`, `history/`, `projects/` and `tasks/` resolve.
     ///
@@ -76,7 +75,7 @@ impl CodexSupervisor {
             *lock = None;
         }
 
-        let mgr = Arc::new(CodexProcessManager::spawn(Some(&self.config.codex_home_dir())).await?);
+        let mgr = Arc::new(CodexProcessManager::spawn_for(&self.config).await?);
 
         let persisted = self.runtime_db.get_main_thread()?;
         let opts = ThreadOptions::new(&self.config.workspace_dir);
@@ -169,12 +168,10 @@ impl CodexSupervisor {
                 with_bootstrap.push(TurnInput::Text(InputRenderer::render_history(&recent)));
             }
             with_bootstrap.extend_from_slice(inputs);
-            return mgr
-                .run_turn_inputs(&with_bootstrap, tier::CONVERSATION)
-                .await;
+            return mgr.run_turn_inputs(&with_bootstrap).await;
         }
 
-        mgr.run_turn_inputs(inputs, tier::CONVERSATION).await
+        mgr.run_turn_inputs(inputs).await
     }
 
     /// Apply the thread-selection policy to the main conversation.
@@ -185,7 +182,7 @@ impl CodexSupervisor {
         let model_id = self
             .runtime_db
             .get_main_thread()?
-            .map(|s| s.model_id)
+            .map(|state| state.model_id)
             .unwrap_or_default();
 
         match ThreadRouter::decide(&self.runtime_db, &model_id)? {
@@ -234,27 +231,20 @@ impl CodexSupervisor {
     ///
     /// Returned as an id rather than run-and-forget so the caller can interrupt
     /// it. Memory maintenance has to be abandonable mid-turn.
-    pub async fn start_isolated_thread(&self, cwd: &Path, tier: ModelTier) -> Result<String> {
+    pub async fn start_isolated_thread(&self, cwd: &Path) -> Result<String> {
         let mgr = self.ensure().await?;
-        let info = mgr
-            .create_thread(&ThreadOptions::new(cwd).with_tier(tier))
-            .await?;
+        let info = mgr.create_thread(&ThreadOptions::new(cwd)).await?;
         info!(
-            "NEW isolated thread {} (model {}, {} tier) in {:?}. Separate from the conversation",
-            info.id, info.model, tier.name, cwd
+            "NEW isolated thread {} (model {}) in {:?}. Separate from the conversation",
+            info.id, info.model, cwd
         );
         Ok(info.id)
     }
 
-    pub async fn run_turn_on_thread(
-        &self,
-        thread_id: &str,
-        prompt: &str,
-        tier: ModelTier,
-    ) -> Result<String> {
+    pub async fn run_turn_on_thread(&self, thread_id: &str, prompt: &str) -> Result<String> {
         self.ensure()
             .await?
-            .run_turn_on(thread_id, &[TurnInput::Text(prompt.to_string())], tier)
+            .run_turn_on(thread_id, &[TurnInput::Text(prompt.to_string())])
             .await
     }
 
@@ -263,9 +253,9 @@ impl CodexSupervisor {
     /// Returns the agent's final text, which for a scheduled task is a summary
     /// for the log, anything the user should see is sent by the agent itself
     /// through the `send_message` tool.
-    pub async fn run_task_turn(&self, cwd: &Path, prompt: &str, tier: ModelTier) -> Result<String> {
-        let thread_id = self.start_isolated_thread(cwd, tier).await?;
-        self.run_turn_on_thread(&thread_id, prompt, tier).await
+    pub async fn run_task_turn(&self, cwd: &Path, prompt: &str) -> Result<String> {
+        let thread_id = self.start_isolated_thread(cwd).await?;
+        self.run_turn_on_thread(&thread_id, prompt).await
     }
 
     /// Ask the app-server which models it offers.
