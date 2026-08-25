@@ -23,6 +23,23 @@ pub struct InboundMessage {
     pub is_group: bool,
 }
 
+/// The owner's live chat state. It is deliberately smaller than WhatsApp's
+/// event: the turn engine only needs to know whether more input is still coming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundPresenceKind {
+    Typing,
+    RecordingAudio,
+    Paused,
+}
+
+#[derive(Debug, Clone)]
+pub struct InboundPresence {
+    pub sender: String,
+    pub kind: InboundPresenceKind,
+    pub from_own_account: bool,
+    pub is_group: bool,
+}
+
 /// Media that arrived with a message, already fetched and decrypted.
 ///
 /// The bytes are carried rather than a provider handle: WhatsApp media URLs are

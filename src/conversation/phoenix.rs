@@ -18,13 +18,14 @@ use crate::codex::CodexSupervisor;
 use crate::config::Config;
 use crate::conversation::record_assistant_message;
 use crate::conversation::renderer::InputRenderer;
+use crate::conversation::session::ConversationSession;
 use crate::data;
 use crate::history::db::HistoryDb;
 use crate::runtime::crash_mark::CrashMark;
 use crate::runtime::{ActivityTracker, ConversationTurn, RuntimeDb};
 use crate::transport::{MessageRef, Transport};
 use crate::update::UpdateNotice;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -47,6 +48,7 @@ pub struct Phoenix {
     transport: Arc<dyn Transport>,
     codex: CodexSupervisor,
     activity: ActivityTracker,
+    session: ConversationSession,
 }
 
 impl Phoenix {
@@ -57,6 +59,7 @@ impl Phoenix {
         transport: Arc<dyn Transport>,
         codex: CodexSupervisor,
         activity: ActivityTracker,
+        session: ConversationSession,
     ) -> Self {
         Self {
             config,
@@ -65,6 +68,7 @@ impl Phoenix {
             transport,
             codex,
             activity,
+            session,
         }
     }
 
@@ -96,14 +100,33 @@ impl Phoenix {
             .into_iter()
             .partition(|turn| !over_budget && turn.attempts < MAX_TURN_ATTEMPTS);
 
-        self.report(
-            &chat_jid,
-            crashed.as_ref(),
-            update.as_ref(),
-            &recoverable,
-            &abandoned,
-        )
-        .await?;
+        // A recovery that itself gets restarted must not send the same generic
+        // interruption message again. `attempts` is durable and increments only
+        // after the first report reached the owner.
+        let first_recoverable: Vec<_> = recoverable
+            .iter()
+            .filter(|turn| turn.attempts == 0)
+            .cloned()
+            .collect();
+        let first_abandoned: Vec<_> = abandoned
+            .iter()
+            .filter(|turn| turn.attempts == 0)
+            .cloned()
+            .collect();
+        if crashed.is_some()
+            || update.is_some()
+            || !first_recoverable.is_empty()
+            || !first_abandoned.is_empty()
+        {
+            self.report(
+                &chat_jid,
+                crashed.as_ref(),
+                update.as_ref(),
+                &first_recoverable,
+                &first_abandoned,
+            )
+            .await?;
+        }
 
         for turn in recoverable.iter().chain(&abandoned) {
             self.runtime_db.record_turn_attempt(&turn.turn_id)?;
@@ -223,7 +246,16 @@ impl Phoenix {
         let pending_request = if recoverable.is_empty() {
             "Nothing of theirs was in flight.".to_string()
         } else {
-            InputRenderer::render_history(&self.history_db.recent_messages(10)?)
+            let mut events = Vec::new();
+            for turn in &recoverable {
+                events.extend(
+                    self.history_db
+                        .messages_for_turn(&turn.turn_id)?
+                        .into_iter()
+                        .filter(|event| event.actor == "user"),
+                );
+            }
+            InputRenderer::render_history(&events)
         };
 
         let prompt = data::render(
@@ -241,22 +273,50 @@ impl Phoenix {
             ],
         );
 
-        let summary = self
+        let sends_before = self.session.count();
+        self.session.set_chat(chat_jid);
+        self.session
+            .set_turn(recoverable.first().map(|turn| turn.turn_id.as_str()));
+        let result = self
             .codex
             .run_task_turn(&self.config.workspace_dir, &prompt)
-            .await?;
+            .await;
+        self.session.set_turn(None);
+        let summary = result?;
         info!("Phoenix recovery finished: {summary}");
+
+        // The recovery agent normally replies through send_message. If it used
+        // final text instead, deliver that text here; a completed recovery is
+        // not allowed to disappear into the service log.
+        if !recoverable.is_empty() && self.session.sends_since(sends_before) == 0 {
+            if summary.trim().is_empty() {
+                bail!("Phoenix recovery produced no user-visible reply for {chat_jid}");
+            }
+
+            let reply_to = recoverable.last().map(|turn| MessageRef {
+                provider_msg_id: turn.last_provider_msg_id.clone(),
+                chat_jid: chat_jid.to_string(),
+                from_me: false,
+                text: self.quoted_text(&turn.last_provider_msg_id),
+            });
+            let provider_msg_id = self
+                .transport
+                .send_text(chat_jid, &summary, reply_to.as_ref())
+                .await?;
+            record_assistant_message(
+                &self.history_db,
+                chat_jid,
+                &provider_msg_id,
+                &summary,
+                recoverable.first().map(|turn| turn.turn_id.clone()),
+                None,
+            )?;
+        }
 
         // Only now are the turns answered. An error above leaves them open, so
         // the next start tries again, bounded by the attempt count already spent.
         for turn in &recoverable {
             self.runtime_db.finish_turn(&turn.turn_id, "completed")?;
-        }
-
-        // The agent replies through `send_message`; a run that produced nothing
-        // visible would otherwise end the recovery in silence.
-        if !recoverable.is_empty() && summary.trim().is_empty() {
-            warn!("Phoenix recovery produced no reply for {chat_jid}");
         }
         Ok(())
     }

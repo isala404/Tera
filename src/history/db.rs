@@ -402,6 +402,27 @@ impl HistoryDb {
         events.reverse();
         Ok(events)
     }
+
+    /// Return exactly the messages belonging to one logical conversation turn.
+    /// Recovery must not mistake nearby history for part of the interrupted job.
+    pub fn messages_for_turn(&self, turn_id: &str) -> Result<Vec<ConversationEvent>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT seq, id, occurred_at_ms, kind, actor, text, reply_to_id, turn_id, reaction_target_id, reaction_emoji
+             FROM conversation_events
+             WHERE kind = 'message' AND turn_id = ?1
+             ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map(params![turn_id], row_to_event)?;
+
+        let mut events = Vec::new();
+        for row in rows {
+            let mut event = row?;
+            event.attachments = load_attachments(&conn, &event.id)?;
+            events.push(event);
+        }
+        Ok(events)
+    }
 }
 
 #[cfg(test)]
@@ -553,5 +574,39 @@ mod migration_tests {
         assert_eq!(recent.first().unwrap().id, "m_2");
         assert_eq!(recent.last().unwrap().id, "m_11");
         assert_eq!(recent[1].actor, "assistant");
+    }
+
+    #[test]
+    fn test_messages_for_turn_excludes_nearby_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HistoryDb::open(
+            &dir.path().join("history.sqlite3"),
+            &dir.path().join("jsonl"),
+        )
+        .unwrap();
+
+        for (id, turn_id, text) in [
+            ("m_old", "turn_old", "deploy the old build"),
+            ("m_current", "turn_current", "switch to luna"),
+        ] {
+            db.insert_event(ConversationEvent {
+                seq: None,
+                id: id.into(),
+                occurred_at_ms: 1,
+                kind: EventKind::Message,
+                actor: "user".into(),
+                text: Some(text.into()),
+                reply_to_id: None,
+                turn_id: Some(turn_id.into()),
+                reaction_target_id: None,
+                reaction_emoji: None,
+                attachments: vec![],
+            })
+            .unwrap();
+        }
+
+        let messages = db.messages_for_turn("turn_current").unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text.as_deref(), Some("switch to luna"));
     }
 }

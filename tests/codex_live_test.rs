@@ -35,7 +35,7 @@ fn workspace_config(dir: &std::path::Path) -> Config {
 }
 
 #[tokio::test]
-#[ignore = "spawns a real codex app-server"]
+#[ignore = "spawns a real codex app-server and consumes account tokens"]
 async fn live_restart_reloads_native_model_config() {
     let tmp = tempfile::tempdir().unwrap();
     let config = workspace_config(tmp.path());
@@ -48,6 +48,10 @@ async fn live_restart_reloads_native_model_config() {
         .start_thread(&ThreadOptions::new(tmp.path()))
         .await
         .unwrap();
+    first
+        .run_turn("Reply with exactly: ok")
+        .await
+        .expect("the thread must have a persisted turn before it can be resumed");
     assert!(!first_thread.model.is_empty());
     drop(first);
 
@@ -63,9 +67,10 @@ model_reasoning_effort = "medium"
         .await
         .unwrap();
     let restarted_thread = restarted
-        .ensure_thread(Some(&first_thread.id), &ThreadOptions::new(tmp.path()))
+        .resume_thread(&first_thread.id, &ThreadOptions::new(tmp.path()))
         .await
         .unwrap();
+    assert_eq!(restarted_thread.id, first_thread.id);
     assert_eq!(restarted_thread.model, "gpt-5.6-terra");
 }
 

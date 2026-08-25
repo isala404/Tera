@@ -10,11 +10,15 @@ use crate::history::assets::AssetStorage;
 use crate::history::db::{Attachment, ConversationEvent, EventKind, HistoryDb, ProviderRef};
 use crate::runtime::{ActivityTracker, RuntimeDb};
 use crate::secrets::{Capture, SecretStore};
-use crate::transport::{InboundMessage, MessageRef, OwnerPolicy, Transport, Verdict};
+use crate::transport::owner::jid_user;
+use crate::transport::{
+    InboundMessage, InboundPresence, InboundPresenceKind, MessageRef, OwnerPolicy, Transport,
+    Verdict,
+};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -28,6 +32,11 @@ const BURST_QUIET_PERIOD: Duration = Duration::from_millis(2500);
 /// answered at all.
 const MAX_BURST_WAIT: Duration = Duration::from_secs(8);
 
+/// Presence events do not carry a duration. Poll while one is active, and stop
+/// trusting it eventually in case WhatsApp disconnects before sending Paused.
+const PRESENCE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const MAX_PRESENCE_HOLD: Duration = Duration::from_secs(5 * 60);
+
 /// Bursts waiting out their quiet period, and the logical turn currently being
 /// executed.
 ///
@@ -36,8 +45,47 @@ const MAX_BURST_WAIT: Duration = Duration::from_secs(8);
 #[derive(Default)]
 struct ConversationState {
     bursts: HashMap<String, MessageBurst>,
+    composing_since: HashMap<String, Instant>,
     /// Logical turn id of the turn being executed, if any.
     running_turn: Option<String>,
+}
+
+impl ConversationState {
+    fn update_presence(&mut self, sender: &str, kind: InboundPresenceKind) {
+        let user = jid_user(sender).to_string();
+        match kind {
+            InboundPresenceKind::Typing | InboundPresenceKind::RecordingAudio => {
+                self.composing_since
+                    .entry(user)
+                    .or_insert_with(Instant::now);
+            }
+            InboundPresenceKind::Paused => {
+                self.composing_since.remove(&user);
+                for (burst_sender, burst) in &mut self.bursts {
+                    if jid_user(burst_sender) == user {
+                        burst.restart_wait();
+                    }
+                }
+            }
+        }
+    }
+
+    fn remaining_wait(&mut self, sender: &str) -> Option<Duration> {
+        let user = jid_user(sender);
+        if let Some(started) = self.composing_since.get(user).copied() {
+            if started.elapsed() < MAX_PRESENCE_HOLD {
+                return Some(PRESENCE_POLL_INTERVAL);
+            }
+            self.composing_since.remove(user);
+            if let Some(burst) = self.bursts.get_mut(sender) {
+                burst.restart_wait();
+            }
+        }
+
+        self.bursts
+            .get(sender)
+            .map(|burst| burst.remaining_wait(BURST_QUIET_PERIOD, MAX_BURST_WAIT))
+    }
 }
 
 /// What to do with a message that just arrived.
@@ -180,6 +228,28 @@ impl TurnEngine {
         }
 
         Ok(())
+    }
+
+    /// Keep a buffered turn open while the owner is still typing or recording.
+    /// Presence is advisory and never enters history or reaches Codex.
+    pub async fn handle_presence(&self, presence: InboundPresence) {
+        if let Verdict::Reject(_) = self.owner_policy.evaluate_sender(
+            &presence.sender,
+            presence.from_own_account,
+            presence.is_group,
+        ) {
+            return;
+        }
+
+        match presence.kind {
+            InboundPresenceKind::Typing => info!("Owner is typing"),
+            InboundPresenceKind::RecordingAudio => info!("Owner is recording audio"),
+            InboundPresenceKind::Paused => info!("Owner stopped composing"),
+        }
+        self.state
+            .lock()
+            .await
+            .update_presence(&presence.sender, presence.kind);
     }
 
     /// Swap a credential out of an inbound message for a note about it.
@@ -335,9 +405,9 @@ impl TurnEngine {
             // still gets an answer.
             loop {
                 let remaining = {
-                    let state = engine.state.lock().await;
-                    match state.bursts.get(&sender) {
-                        Some(burst) => burst.remaining_wait(BURST_QUIET_PERIOD, MAX_BURST_WAIT),
+                    let mut state = engine.state.lock().await;
+                    match state.remaining_wait(&sender) {
+                        Some(remaining) => remaining,
                         // Something else already took it.
                         None => return,
                     }
@@ -570,5 +640,56 @@ impl TurnEngine {
 
         self.session.set_turn(None);
         result
+    }
+}
+
+#[cfg(test)]
+mod presence_tests {
+    use super::*;
+
+    fn event() -> ConversationEvent {
+        ConversationEvent {
+            seq: None,
+            id: "m1".into(),
+            occurred_at_ms: 1,
+            kind: EventKind::Message,
+            actor: "user".into(),
+            text: Some("one more thing".into()),
+            reply_to_id: None,
+            turn_id: Some("turn1".into()),
+            reaction_target_id: None,
+            reaction_emoji: None,
+            attachments: vec![],
+        }
+    }
+
+    #[test]
+    fn test_composing_holds_a_burst_past_its_normal_ceiling() {
+        let mut state = ConversationState::default();
+        let mut burst = MessageBurst::new("turn1".into(), event());
+        burst.created_at = Instant::now() - MAX_BURST_WAIT;
+        burst.last_updated_at = burst.created_at;
+        state.bursts.insert("owner:26@lid".into(), burst);
+
+        state.update_presence("owner@s.whatsapp.net", InboundPresenceKind::RecordingAudio);
+        assert_eq!(
+            state.remaining_wait("owner:26@lid"),
+            Some(PRESENCE_POLL_INTERVAL)
+        );
+    }
+
+    #[test]
+    fn test_paused_starts_a_fresh_quiet_window() {
+        let mut state = ConversationState::default();
+        let mut burst = MessageBurst::new("turn1".into(), event());
+        burst.created_at = Instant::now() - MAX_BURST_WAIT;
+        burst.last_updated_at = burst.created_at;
+        state.bursts.insert("owner".into(), burst);
+        state.update_presence("owner", InboundPresenceKind::Typing);
+
+        state.update_presence("owner", InboundPresenceKind::Paused);
+        let remaining = state.remaining_wait("owner").unwrap();
+        assert!(remaining > Duration::from_secs(2));
+        assert!(remaining <= BURST_QUIET_PERIOD);
     }
 }

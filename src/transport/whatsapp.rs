@@ -1,5 +1,7 @@
 use crate::transport::owner::jid_user;
-use crate::transport::{InboundMedia, InboundMessage, MessageRef, Transport};
+use crate::transport::{
+    InboundMedia, InboundMessage, InboundPresence, InboundPresenceKind, MessageRef, Transport,
+};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use qrcode::render::unicode;
@@ -14,6 +16,9 @@ use whatsapp_rust::prelude::*;
 use whatsapp_rust::upload::{UploadOptions, UploadResponse};
 use whatsapp_rust::wacore::download::MediaType;
 use whatsapp_rust::wacore::proto_helpers::build_quote_context;
+use whatsapp_rust::wacore::types::events::{Event, EventKind};
+use whatsapp_rust::wacore::types::message::MessageSource;
+use whatsapp_rust::wacore::types::presence::{ChatPresence, ChatPresenceMedia};
 use whatsapp_rust_sqlite_storage::SqliteStore;
 
 /// Render the pairing payload as a scannable QR block on the terminal.
@@ -195,14 +200,18 @@ impl WhatsAppWebTransport {
     /// Comparing the sender's user part against our own LID and phone-number
     /// JIDs recognises the owner from any of their devices.
     fn is_own_account(ctx: &MessageContext) -> bool {
-        if ctx.info.source.is_from_me {
+        Self::is_own_source(&ctx.client, &ctx.info.source)
+    }
+
+    fn is_own_source(client: &Client, source: &MessageSource) -> bool {
+        if source.is_from_me {
             return true;
         }
 
-        let sender = ctx.info.source.sender.to_string();
+        let sender = source.sender.to_string();
         let sender_user = jid_user(&sender);
 
-        [ctx.client.lid(), ctx.client.pn()]
+        [client.lid(), client.pn()]
             .iter()
             .flatten()
             .any(|own| jid_user(&own.to_string()) == sender_user)
@@ -277,9 +286,10 @@ impl WhatsAppWebTransport {
         Ok((client, jid))
     }
 
-    pub async fn start_bot<F>(&self, inbound_callback: F) -> Result<()>
+    pub async fn start_bot<F, P>(&self, inbound_callback: F, presence_callback: P) -> Result<()>
     where
         F: Fn(InboundMessage) + Send + Sync + 'static,
+        P: Fn(InboundPresence) + Send + Sync + 'static,
     {
         let db_str = self.session_db_path.to_string_lossy().to_string();
         info!("Starting whatsapp-rust session at {}", db_str);
@@ -289,6 +299,7 @@ impl WhatsAppWebTransport {
             .map_err(|e| anyhow!("Failed to initialize whatsapp-rust SqliteStore: {:?}", e))?;
 
         let callback_arc = Arc::new(inbound_callback);
+        let presence_callback = Arc::new(presence_callback);
 
         let bot = Bot::builder()
             .with_backend(store)
@@ -306,6 +317,27 @@ impl WhatsAppWebTransport {
                 );
                 if let Err(e) = client.presence().set_available().await {
                     warn!("Could not set WhatsApp presence to available: {:?}", e);
+                }
+            })
+            .on_event_for(&[EventKind::ChatPresence], move |event, client| {
+                let callback = presence_callback.clone();
+                async move {
+                    let Event::ChatPresence(update) = &*event else {
+                        return;
+                    };
+                    let kind = match (update.state, update.media) {
+                        (ChatPresence::Composing, ChatPresenceMedia::Audio) => {
+                            InboundPresenceKind::RecordingAudio
+                        }
+                        (ChatPresence::Composing, _) => InboundPresenceKind::Typing,
+                        (ChatPresence::Paused, _) => InboundPresenceKind::Paused,
+                    };
+                    callback(InboundPresence {
+                        sender: update.source.sender.to_string(),
+                        kind,
+                        from_own_account: Self::is_own_source(&client, &update.source),
+                        is_group: update.source.is_group,
+                    });
                 }
             })
             .on_message(move |ctx| {

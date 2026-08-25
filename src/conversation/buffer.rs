@@ -25,6 +25,14 @@ impl MessageBurst {
         self.last_updated_at = Instant::now();
     }
 
+    /// Begin a fresh quiet window after the owner stops composing. Time spent
+    /// typing or recording must not consume the burst's normal wait ceiling.
+    pub fn restart_wait(&mut self) {
+        let now = Instant::now();
+        self.created_at = now;
+        self.last_updated_at = now;
+    }
+
     /// How long to keep waiting before starting the turn.
     ///
     /// The quiet period restarts on every message, so a user who keeps typing

@@ -724,6 +724,7 @@ async fn main() -> Result<()> {
                     wa_transport.clone(),
                     codex.clone(),
                     activity.clone(),
+                    session.clone(),
                 );
                 tokio::spawn(async move {
                     for attempt in 1..=PHOENIX_REPORT_ATTEMPTS {
@@ -745,15 +746,26 @@ async fn main() -> Result<()> {
                     let mut backoff = std::time::Duration::from_secs(2);
                     loop {
                         let engine_for_run = turn_engine.clone();
+                        let engine_for_presence = turn_engine.clone();
                         let result = wa_clone
-                            .start_bot(move |message| {
-                                let engine = engine_for_run.clone();
-                                tokio::spawn(async move {
-                                    if let Err(err) = engine.handle_inbound_message(message).await {
-                                        tracing::error!("TurnEngine error: {:?}", err);
-                                    }
-                                });
-                            })
+                            .start_bot(
+                                move |message| {
+                                    let engine = engine_for_run.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(err) =
+                                            engine.handle_inbound_message(message).await
+                                        {
+                                            tracing::error!("TurnEngine error: {:?}", err);
+                                        }
+                                    });
+                                },
+                                move |presence| {
+                                    let engine = engine_for_presence.clone();
+                                    tokio::spawn(async move {
+                                        engine.handle_presence(presence).await;
+                                    });
+                                },
+                            )
                             .await;
 
                         match result {

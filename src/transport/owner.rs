@@ -46,7 +46,11 @@ impl OwnerPolicy {
     }
 
     pub fn evaluate(&self, msg: &InboundMessage) -> Verdict {
-        if msg.is_group {
+        self.evaluate_sender(&msg.sender, msg.from_own_account, msg.is_group)
+    }
+
+    pub fn evaluate_sender(&self, sender: &str, from_own_account: bool, is_group: bool) -> Verdict {
+        if is_group {
             return Verdict::Reject(RejectReason::GroupChat);
         }
 
@@ -55,14 +59,14 @@ impl OwnerPolicy {
         // default closed rather than open, and matches the normal setup: pair a
         // linked device, then talk to it from your phone.
         let Some(owner) = &self.owner_jid else {
-            return if msg.from_own_account {
+            return if from_own_account {
                 Verdict::Accept
             } else {
                 Verdict::Reject(RejectReason::NotOwner)
             };
         };
 
-        if msg.from_own_account || jid_user(&msg.sender) == jid_user(owner) {
+        if from_own_account || jid_user(sender) == jid_user(owner) {
             Verdict::Accept
         } else {
             Verdict::Reject(RejectReason::NotOwner)

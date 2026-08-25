@@ -13,21 +13,21 @@ Ask the Codex harness instead of relying on model self identification. Run the b
 .agents/skills/model-config/scripts/current-model
 ```
 
-Report the exact model id it prints. The helper uses `CODEX_THREAD_ID` to read this agent's own harness context, so a subagent reports its model rather than the main Tera conversation model.
+Report the exact model id it prints. It uses `CODEX_THREAD_ID`, so a subagent reports its own model rather than the main conversation model.
 
-Do not infer the model from `config.toml`, because an empty config uses a Codex default that can change. Do not infer it from documentation or from what the model says about itself. If the helper fails, report the failure and do not guess.
+Do not infer the model from config, documentation or self identification. An empty config uses a Codex default that can change. If the helper fails, report that and do not guess.
 
-If the owner explicitly asks for the main Tera conversation model instead of this agent's model, run `tera status --workspace "$PWD"` and report the model from its `Thread` line. Never use that command to identify a subagent because Tera status tracks only the main conversation.
+If the owner asks for the main conversation model instead of this agent's model, run `tera status --workspace "$PWD"` and report its `Thread` line. Never use it to identify a subagent.
 
 When a configuration change is waiting for restart, distinguish the currently running model from the model selected for the next start.
 
-The source of truth is `.codex-home/config.toml` in the workspace. Read the whole file first. Tera leaves it alone and Codex loads it as its user config on startup. An empty file means native Codex defaults.
+The source of truth is `.codex-home/config.toml`. Read it fully first. Tera preserves it and an empty file means native Codex defaults.
 
-Use normal Codex keys such as `model`, `model_provider` and `model_reasoning_effort`. For a custom provider, add a custom `[model_providers.<id>]` table with the provider's exact documented `base_url` and `wire_api = "responses"`. Verify current model ids and endpoints against the provider's official documentation. Do not invent ids, copy an example for a different API, or add a private Tera format.
+Use native keys such as `model`, `model_provider` and `model_reasoning_effort`. For a custom provider, use its documented `[model_providers.<id>]`, `base_url` and `wire_api = "responses"`. Verify model ids and endpoints against official docs. Never add a Tera specific format.
 
-Keep credentials out of chat and Codex config. Provider API keys live in `.env` at the workspace root. Confirm Git ignores the file and its mode is `0600` before using it. Never ask the owner to paste an API key into an ordinary message. Never print, inspect or log a secret value.
+Keep credentials out of chat and Codex config. API keys live in the workspace `.env`. Confirm Git ignores it and its mode is `0600`. Never ask the owner to paste one into chat or print its value.
 
-Get the environment variable name from the provider's official documentation. It must use uppercase letters, digits and underscores. Check only whether that name exists in `.env`. Never display the matching line or source the file in an agent shell.
+Get the variable name from provider docs. Check only whether it exists. Never display its line or source `.env` in an agent shell.
 
 ```bash
 rg -q '^PROVIDER_API_KEY=' .env
@@ -41,9 +41,9 @@ command = "/bin/sh"
 args = ["-c", "set -a; . '/absolute/workspace/.env'; printf %s \"$PROVIDER_API_KEY\""]
 ```
 
-Codex is the verified consumer of stdout. Never run the configured auth command yourself. Do not combine command auth with `env_key`, a direct bearer token or OpenAI login auth.
+Codex is the only consumer of stdout. Never run this auth command yourself or combine it with another auth method.
 
-If the name is missing from `.env`, stop before changing the active provider. Ask the owner to add it from a private terminal, then continue after they confirm. Never create or populate `.env` from chat.
+If it is missing, ask the owner to add it from a private terminal. Never populate `.env` from chat.
 
 Make a targeted edit that preserves unrelated settings and provider tables. To return to native Codex defaults, remove only `model`, `model_provider` and `model_reasoning_effort`. Keep unrelated user configuration.
 
@@ -53,10 +53,12 @@ Validate before restarting.
 CODEX_HOME="$PWD/.codex-home" codex --strict-config doctor --summary
 ```
 
-If validation fails, restore only your edit and report the error. If it passes, send the owner a short confirmation naming the model and provider before restarting, because the restart ends the current turn. Then run the restart command.
+The command's exit code is the validation result. An explanation for a nonzero exit does not make the configuration valid. If validation fails for a transient reason, fix that reason and retry and require exit zero. If it still fails, restore only your edit and report the error.
+
+After validation passes, send the owner one short confirmation through `send_message`, naming the model and provider and saying the restart is scheduled. Then run the bundled helper and finish the turn immediately. The helper delays the service restart long enough for the reply and turn state to be committed, preventing Phoenix from treating the planned restart as interrupted work.
 
 ```bash
-systemctl --user restart tera
+.agents/skills/model-config/scripts/restart-after-turn
 ```
 
-Do not add or call a model configuration MCP tool. Do not change Tera source, runtime database state, schedules or memory to switch the conversation model.
+Do not restart the service directly from the active turn. Do not add or call a model configuration MCP tool. Do not change Tera source, build or deploy a binary, update Codex, or touch runtime database state, schedules or memory to switch the conversation model.

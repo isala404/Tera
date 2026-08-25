@@ -29,6 +29,16 @@ struct TurnListener {
     tx: mpsc::Sender<TurnEvent>,
 }
 
+/// Session-static native Codex settings that must be stated again when an
+/// existing thread is resumed. Codex otherwise keeps the values persisted with
+/// that thread, even though the app-server itself loaded a newer config.toml.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ResumeConfig {
+    model: Option<String>,
+    model_provider: Option<String>,
+    thread_config: serde_json::Map<String, Value>,
+}
+
 /// Where a Codex thread runs, under what permissions, and on which model.
 #[derive(Debug, Clone)]
 pub struct ThreadOptions {
@@ -344,6 +354,72 @@ impl CodexProcessManager {
         })
     }
 
+    /// Read the effective native Codex configuration for this workspace.
+    ///
+    /// Reading it through app-server matters: it has already merged user,
+    /// project and CLI layers, so Tera does not need its own TOML parser or a
+    /// second interpretation of Codex configuration.
+    async fn resume_config(&self, opts: &ThreadOptions) -> Result<ResumeConfig> {
+        let response = self
+            .send_request(
+                "config/read",
+                Some(json!({
+                    "cwd": opts.cwd.to_string_lossy(),
+                    "includeLayers": false,
+                })),
+            )
+            .await?;
+        let config = response
+            .get("config")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow!("config/read response has no config object: {response}"))?;
+
+        let mut resolved = ResumeConfig {
+            model: config
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            model_provider: config
+                .get("model_provider")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            ..ResumeConfig::default()
+        };
+
+        // These are session-static too, but thread/resume exposes them through
+        // its generic config override rather than as top-level parameters.
+        for key in [
+            "model_reasoning_effort",
+            "model_reasoning_summary",
+            "model_verbosity",
+        ] {
+            if let Some(value) = config.get(key).filter(|value| !value.is_null()) {
+                resolved
+                    .thread_config
+                    .insert(key.to_string(), value.clone());
+            }
+        }
+
+        if resolved.model.is_none() {
+            let models = self.list_models().await?;
+            resolved.model = default_model_id(&models).map(str::to_string);
+        }
+
+        Ok(resolved)
+    }
+
+    fn apply_resume_config(params: &mut Value, config: ResumeConfig) {
+        if let Some(model) = config.model {
+            params["model"] = json!(model);
+        }
+        if let Some(provider) = config.model_provider {
+            params["modelProvider"] = json!(provider);
+        }
+        if !config.thread_config.is_empty() {
+            params["config"] = Value::Object(config.thread_config);
+        }
+    }
+
     /// Answer a request the app-server made of us.
     ///
     /// tera runs unattended: there is nobody to ask, and the thread is already
@@ -428,6 +504,7 @@ impl CodexProcessManager {
     pub async fn resume_thread(&self, thread_id: &str, opts: &ThreadOptions) -> Result<ThreadInfo> {
         let mut params = self.thread_params(opts);
         params["threadId"] = json!(thread_id);
+        Self::apply_resume_config(&mut params, self.resume_config(opts).await?);
         let res = self.send_request("thread/resume", Some(params)).await?;
         let info = ThreadInfo::from_result(&res, ThreadOrigin::Resumed)?;
         debug!("thread/resume -> {} (model {})", info.id, info.model);
@@ -775,6 +852,27 @@ impl CodexProcessManager {
     }
 }
 
+/// Resolve Codex's native default when config.toml deliberately leaves `model`
+/// empty. Tolerate the response shapes used by current and older app-servers.
+fn default_model_id(response: &Value) -> Option<&str> {
+    response
+        .get("data")
+        .or_else(|| response.get("models"))
+        .or_else(|| response.get("items"))
+        .unwrap_or(response)
+        .as_array()?
+        .iter()
+        .find(|model| {
+            model
+                .get("isDefault")
+                .or_else(|| model.get("is_default"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .and_then(|model| model.get("id").or_else(|| model.get("model")))
+        .and_then(Value::as_str)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -798,6 +896,35 @@ mod tests {
         assert_eq!(resumed.origin, ThreadOrigin::Resumed);
         assert_eq!(created.origin, ThreadOrigin::Created);
         assert_eq!(created.model, "custom-model");
+    }
+
+    #[test]
+    fn test_resume_reapplies_session_static_native_config() {
+        let mut params = json!({"threadId": "t1"});
+        let mut thread_config = serde_json::Map::new();
+        thread_config.insert("model_reasoning_effort".into(), json!("medium"));
+
+        CodexProcessManager::apply_resume_config(
+            &mut params,
+            ResumeConfig {
+                model: Some("configured-model".into()),
+                model_provider: Some("configured-provider".into()),
+                thread_config,
+            },
+        );
+
+        assert_eq!(params["model"], "configured-model");
+        assert_eq!(params["modelProvider"], "configured-provider");
+        assert_eq!(params["config"]["model_reasoning_effort"], "medium");
+    }
+
+    #[test]
+    fn test_native_default_is_resolved_without_a_model_setting() {
+        let response = json!({"data": [
+            {"id": "other", "isDefault": false},
+            {"id": "native-default", "isDefault": true}
+        ]});
+        assert_eq!(default_model_id(&response), Some("native-default"));
     }
 
     /// Nobody is at the other end of an approval prompt, and the whole posture is
