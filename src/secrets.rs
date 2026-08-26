@@ -3,17 +3,15 @@
 //!
 //! Skills need API keys, and the only channel the owner has is a chat that feeds
 //! straight into a model's context. Anything typed there is recorded in history,
-//! projected to JSONL, replayed into later threads and folded into memory
-//! generations: five places a key would sit in plain text forever. So the daemon
+//! projected to JSONL, replayed into later threads and folded into memory: four
+//! places a key would sit in plain text forever. So the daemon
 //! takes the value out of the message before any of that happens, stores it here,
 //! and hands the model a note saying only that a secret arrived.
 //!
-//! The store lives under `.runtime/`, never inside `.agents/skills/`. Two reasons,
-//! and both matter. A release updates the files of a built-in skill it still owns,
-//! so a key written into a skill directory would eventually be overwritten. And
-//! [`crate::workspace::init`] treats *any* edit to a built-in skill as the user
-//! adopting it, which would freeze that skill at its current version and quietly
-//! stop it ever being updated again.
+//! The store lives under `.runtime/`, never inside a skill directory.
+//! [`crate::workspace::init`] deletes and rewrites the skills tera ships on every
+//! start, so a key written next to the skill that reads it would not survive an
+//! update.
 //!
 //! What this is not: a sandbox. Codex runs with `danger-full-access`, so an agent
 //! that decides to read `secrets.json` can. The property held here is narrower and

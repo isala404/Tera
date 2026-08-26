@@ -118,49 +118,35 @@ impl Config {
         ]
     }
 
-    /// Native Codex skills checked into this workspace. Codex discovers these
-    /// from the thread's working directory, independently of CODEX_HOME.
+    /// Skills the owner and the agent write. Codex discovers these from the
+    /// thread's working directory. Tera never writes here.
     pub fn skills_dir(&self) -> PathBuf {
         self.workspace_dir.join(".agents").join("skills")
     }
 
+    /// The skills tera ships. Codex discovers these from CODEX_HOME, which tera
+    /// owns, so the directory can be deleted and rewritten on every start.
+    pub fn builtin_skills_dir(&self) -> PathBuf {
+        self.codex_home_dir().join("skills").join("tera")
+    }
+
     /// Credentials the owner sent through chat, for skills to read.
     ///
-    /// Under `.runtime/` rather than beside the skill that wants it: a release
-    /// updates the files of a built-in skill it still owns, and `WorkspaceInit`
-    /// treats any edit inside one as the user adopting it, which would freeze
-    /// that skill at its current version. See [`crate::secrets`].
+    /// Under `.runtime/` rather than beside the skill that wants it: tera
+    /// rewrites its own skill directory on every start, so anything stored there
+    /// is lost on the next update. See [`crate::secrets`].
     pub fn secrets_path(&self) -> PathBuf {
         self.runtime_dir().join("secrets.json")
     }
 
-    /// Machine-owned state for built-in skills. It records deliberate deletion
-    /// and the last embedded file set, so a release can update an untouched
-    /// installed skill without resurrecting one the user removed.
-    pub fn builtin_skills_state_path(&self) -> PathBuf {
-        self.runtime_dir().join("builtin-skills.json")
-    }
-
-    /// The active memory generation, reached through a symlink.
+    /// The memory tree: a real directory, and a git repository tera owns.
     ///
-    /// Uppercase like every other knowledge file in the workspace. macOS is
-    /// case-insensitive so a workspace created under the old lowercase name needs
-    /// no migration there; `WorkspaceInit` removes the stale link on Linux.
-    pub fn memories_link(&self) -> PathBuf {
+    /// Git is the whole versioning story. It was numbered generation directories
+    /// behind a symlink, with staging, validation, an atomic swap and a prune,
+    /// which is a worse `git commit` that only tera could read. Rollback is now
+    /// `git revert`, and the agent can see what it changed and why.
+    pub fn memories_dir(&self) -> PathBuf {
         self.workspace_dir.join("MEMORIES")
-    }
-
-    /// The pre-1.2 lowercase name, kept only so init can clean it up.
-    pub fn legacy_memories_link(&self) -> PathBuf {
-        self.workspace_dir.join("memories")
-    }
-
-    pub fn generations_dir(&self) -> PathBuf {
-        self.workspace_dir.join(".memory").join("generations")
-    }
-
-    pub fn staging_dir(&self) -> PathBuf {
-        self.workspace_dir.join(".memory").join("staging")
     }
 
     pub fn projects_dir(&self) -> PathBuf {
@@ -271,12 +257,11 @@ mod tests {
             .any(|item| item.contains("/tmp/test_workspace/.runtime/assistant.sock")));
         assert_eq!(cfg.skills_dir(), root.join(".agents/skills"));
         assert_eq!(
-            cfg.builtin_skills_state_path(),
-            root.join(".runtime/builtin-skills.json")
+            cfg.builtin_skills_dir(),
+            root.join(".codex-home/skills/tera")
         );
         assert_eq!(cfg.secrets_path(), root.join(".runtime/secrets.json"));
-        assert_eq!(cfg.memories_link(), root.join("MEMORIES"));
+        assert_eq!(cfg.memories_dir(), root.join("MEMORIES"));
         assert_eq!(cfg.system_notes_path(), root.join("SYSTEM.md"));
-        assert_eq!(cfg.generations_dir(), root.join(".memory/generations"));
     }
 }

@@ -15,15 +15,17 @@ pub struct ModelDescriptor {
 pub struct ModelDiscovery;
 
 impl ModelDiscovery {
-    /// Record which model this daemon runs on, and flag a memory rebuild when it
-    /// changes.
+    /// Record which model this daemon runs on, and say so when it changes.
     ///
     /// The tracked model is the one Codex resolved from Tera's user-owned config,
-    /// not the app-server's advertised default. The rebuild exists because memory
-    /// is one model's interpretation of history and a different model may organise
-    /// it differently, so the model that matters is the one actually writing it.
-    /// Watching the vendor's default instead meant an expensive full rebuild every
-    /// time OpenAI promoted a new frontier model tera does not even use.
+    /// not the app-server's advertised default.
+    ///
+    /// A change is worth noticing but not worth acting on. Memory is one model's
+    /// interpretation of history, so a new model may well organise it better, but
+    /// re-deriving the whole tree costs millions of tokens and switching models is
+    /// a thing an owner does casually, several times an evening. Rebuilding on
+    /// that signal made a config edit cost more than a month of conversation. The
+    /// owner decides, by asking for a rebuild.
     ///
     /// The model list is still worth fetching: it is how we learn our pinned model
     /// has been withdrawn, which is otherwise a turn failure with no explanation.
@@ -49,13 +51,12 @@ impl ModelDiscovery {
         }
 
         let last = runtime_db.get_last_default_model()?;
-        let changed = matches!(&last, Some(prev) if prev.model_id != ours);
-        if changed {
+        if let Some(prev) = last.as_ref().filter(|prev| prev.model_id != ours) {
             info!(
-                "Model tera runs on changed from {:?} to {ours}. Flagging rebuild_pending!",
-                last.as_ref().map(|m| &m.model_id)
+                "Model tera runs on changed from {} to {ours}. Memory still reflects \
+                 the old model; ask for a memory rebuild if you want it re-derived",
+                prev.model_id
             );
-            runtime_db.set_state_value("rebuild_pending", "true")?;
         }
 
         runtime_db.record_model_observation(&ModelObservation {
@@ -102,10 +103,10 @@ mod tests {
         "configured-model"
     }
 
-    /// A vendor default changing must not trigger a full memory rebuild on a
-    /// daemon that pins another model.
+    /// A vendor default changing must not disturb a daemon that pins another
+    /// model: the model we run is the one we record.
     #[test]
-    fn test_a_vendor_default_change_does_not_trigger_a_rebuild() {
+    fn test_a_vendor_default_change_does_not_change_what_we_record() {
         let runtime_db = db();
         ModelDiscovery::process_models_response(&runtime_db, configured(), listing()).unwrap();
 
@@ -113,7 +114,8 @@ mod tests {
         promoted[0].id = "new-vendor-default".into();
         ModelDiscovery::process_models_response(&runtime_db, configured(), promoted).unwrap();
 
-        assert_eq!(runtime_db.get_state_value("rebuild_pending").unwrap(), None);
+        let recorded = runtime_db.get_last_default_model().unwrap().unwrap();
+        assert_eq!(recorded.model_id, configured());
     }
 
     #[test]
@@ -125,10 +127,11 @@ mod tests {
         assert_eq!(recorded.model_id, configured());
     }
 
-    /// Changing the configured model is the case the rebuild is for: memory was
-    /// written by the old model and the new one may organise it differently.
+    /// Switching the configured model records the new one and nothing else. A
+    /// rebuild costs millions of tokens, and an owner trying providers out
+    /// switches models several times an evening.
     #[test]
-    fn test_changing_our_own_model_triggers_a_rebuild() {
+    fn test_changing_our_own_model_only_records_it() {
         let runtime_db = db();
         runtime_db
             .record_model_observation(&ModelObservation {
@@ -140,12 +143,14 @@ mod tests {
             .unwrap();
 
         ModelDiscovery::process_models_response(&runtime_db, configured(), listing()).unwrap();
+
         assert_eq!(
             runtime_db
-                .get_state_value("rebuild_pending")
+                .get_last_default_model()
                 .unwrap()
-                .as_deref(),
-            Some("true")
+                .unwrap()
+                .model_id,
+            configured()
         );
     }
 

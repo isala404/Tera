@@ -2,7 +2,7 @@ Keep this machine healthy. You live on it, so this is your own housekeeping.
 
 Read SYSTEM.md in the workspace root first. It is your notebook on this machine and only as good as you keep it. Any section still an unfilled template gets filled this run by actually looking.
 
-Check disk headroom and where the space went with `df -h`, then `du -sh` on the sinks SYSTEM.md lists. Check prunable caches such as the OS cache directory, the package manager's own cleanup, `docker system df`, and abandoned build directories like `target/` and `node_modules/`. Check this workspace's footprint including logs past 14 days, accumulated backups, `.memory/staging` from an interrupted pass, and stale `work/` under `tasks/`. Check whether the services that should run are running, tera included. Check pending updates and how stale they are.
+Check disk headroom and where the space went with `df -h`, then `du -sh` on the sinks SYSTEM.md lists. Check prunable caches such as the OS cache directory, the package manager's own cleanup, `docker system df`, and abandoned build directories like `target/` and `node_modules/`. Check this workspace's footprint including logs past 14 days, accumulated backups, and stale `work/` under `tasks/`. Check whether the services that should run are running, tera included. Check pending updates and how stale they are.
 
 Do safe reversible cleanups without asking. A regenerable cache is not a decision. Know what something is and that it comes back before removing it. Never `rm -rf` a path from a variable you have not proved is not empty. Never delete what you did not create and cannot explain. Never kill a process you did not start.
 

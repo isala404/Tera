@@ -1,10 +1,9 @@
 use crate::codex::CodexSupervisor;
 use crate::config::Config;
-use crate::runtime::{ActivityTracker, RuntimeDb};
+use crate::runtime::RuntimeDb;
 use crate::scheduler::db::SchedulerDb;
 use crate::scheduler::db::{ScheduleItem, ScheduleRun};
 use crate::scheduler::recurrence::RecurrenceEngine;
-use crate::workspace::templates;
 use anyhow::Result;
 use chrono::{Local, Utc};
 use std::collections::HashSet;
@@ -37,24 +36,17 @@ pub struct SchedulerRunner {
     config: Config,
     runtime_db: RuntimeDb,
     codex: CodexSupervisor,
-    activity: ActivityTracker,
     /// Schedules with a run in flight. A slow task must not be started again on
     /// the next tick five seconds later.
     running: Arc<Mutex<HashSet<String>>>,
 }
 
 impl SchedulerRunner {
-    pub fn new(
-        config: Config,
-        runtime_db: RuntimeDb,
-        codex: CodexSupervisor,
-        activity: ActivityTracker,
-    ) -> Self {
+    pub fn new(config: Config, runtime_db: RuntimeDb, codex: CodexSupervisor) -> Self {
         Self {
             config,
             runtime_db,
             codex,
-            activity,
             running: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -157,7 +149,6 @@ impl SchedulerRunner {
         info!("Executing schedule {}: '{}'", item.id, item.name);
 
         // A scheduled run outranks memory maintenance, same as a conversation.
-        let _active = self.activity.begin();
 
         let now_ms = Utc::now().timestamp_millis();
 
@@ -171,7 +162,6 @@ impl SchedulerRunner {
         fs::create_dir_all(&artifacts_dir)?;
 
         // 2. Ensure per-schedule MEMORY.md exists
-        Self::migrate_legacy_task_files(&task_dir);
         let memory_md_path = task_dir.join("MEMORY.md");
         if !memory_md_path.exists() {
             fs::write(
@@ -188,13 +178,6 @@ impl SchedulerRunner {
         fs::write(
             &task_md_path,
             format!("# Task Specification\n\nPrompt: {}\n", item.prompt),
-        )?;
-
-        // Codex reads AGENTS.md from the thread's cwd, so the bootstrap has to
-        // live in the task directory itself.
-        fs::write(
-            task_dir.join("AGENTS.md"),
-            templates::render(crate::data::SCHEDULE_AGENTS, &self.config),
         )?;
 
         // 3. Claim the run durably before advancing the schedule. A task that
@@ -239,8 +222,7 @@ impl SchedulerRunner {
         };
         SchedulerDb::update_next_run(&self.runtime_db, &item.id, next_run, status)?;
 
-        let prompt =
-            Self::build_task_prompt(&self.config.owner_name, item, &task_dir, lateness.as_ref());
+        let prompt = Self::build_task_prompt(&self.config, item, &task_dir, lateness.as_ref());
 
         match self.codex.run_task_turn(&task_dir, &prompt).await {
             Ok(summary) => {
@@ -311,57 +293,33 @@ impl SchedulerRunner {
     /// and that reaching the user requires the `send_message` tool, returning
     /// text to nobody is the default failure mode otherwise.
     fn build_task_prompt(
-        owner: &str,
+        config: &Config,
         item: &ScheduleItem,
         task_dir: &Path,
         lateness: Option<&Lateness>,
     ) -> String {
-        let late_note = match lateness {
-            Some(late) => crate::data::render(
-                crate::data::SCHEDULED_TASK_LATE_NOTE,
-                &[
-                    ("LATE_MINUTES", &(late.by_ms / 60_000).to_string()),
-                    ("MISSED", &late.missed.to_string()),
-                ],
-            )
-            .trim_end()
-            .to_string(),
-            None => String::new(),
+        let timing = match lateness {
+            Some(late) => format!(
+                "late by about {} minutes, {} occurrence(s) missed and coalesced into this run",
+                late.by_ms / 60_000,
+                late.missed
+            ),
+            None => "on time".to_string(),
         };
 
         crate::data::render(
             crate::data::SCHEDULED_TASK_PROMPT,
             &[
-                ("OWNER", owner),
+                ("OWNER", &config.owner_name),
+                ("WORKSPACE", &config.workspace_dir.display().to_string()),
                 ("TASK_NAME", &item.name),
                 ("SCHEDULE_ID", &item.id),
                 ("NOW", &Local::now().to_rfc3339()),
                 ("TASK_DIR", &task_dir.display().to_string()),
-                ("LATE_NOTE", &late_note),
+                ("LATE", &timing),
                 ("TASK_PROMPT", &item.prompt),
             ],
         )
-    }
-
-    /// Rename the pre-1.2 lowercase task files.
-    ///
-    /// Every knowledge file in the workspace is uppercase now, and a schedule that
-    /// has been running for weeks has state in the old names. Renaming beats
-    /// writing a fresh `MEMORY.md` beside a `memory.md` the worker will never read
-    /// again, that silently loses everything previous runs recorded.
-    ///
-    /// macOS is case-insensitive, so `rename` there is a case correction and this
-    /// is a no-op after the first pass. On Linux it is a real move.
-    fn migrate_legacy_task_files(task_dir: &Path) {
-        for (old, new) in [("memory.md", "MEMORY.md"), ("runs.jsonl", "RUNS.jsonl")] {
-            let from = task_dir.join(old);
-            let to = task_dir.join(new);
-            if from.exists() && !to.exists() {
-                if let Err(e) = fs::rename(&from, &to) {
-                    warn!("Could not rename {:?} to {:?}: {e}", from, to);
-                }
-            }
-        }
     }
 
     /// Append one line per run to the task's own `RUNS.jsonl`.
@@ -392,6 +350,12 @@ mod tests {
     use super::*;
 
     const NOW: i64 = 1_786_962_664_000;
+
+    fn owner_config() -> Config {
+        let mut config = Config::new(std::path::PathBuf::from("/ws"), true);
+        config.owner_name = "Ada Lovelace".to_string();
+        config
+    }
 
     fn hourly(next_run_at_ms: Option<i64>) -> ScheduleItem {
         ScheduleItem {
@@ -449,7 +413,7 @@ mod tests {
     fn test_task_prompt_is_fully_rendered() {
         let item = hourly(Some(NOW));
         let prompt = SchedulerRunner::build_task_prompt(
-            "Ada Lovelace",
+            &owner_config(),
             &item,
             Path::new("/ws/tasks/schedule-1"),
             None,
@@ -459,7 +423,7 @@ mod tests {
         assert!(prompt.contains("sched_1"));
         assert!(prompt.contains("/ws/tasks/schedule-1"));
         assert!(prompt.contains("send_message"));
-        assert!(!prompt.contains("LATE"));
+        assert!(prompt.contains("Timing on time"));
         assert!(!prompt.contains("{{"), "unfilled placeholder: {prompt}");
     }
 
@@ -473,14 +437,14 @@ mod tests {
             missed: 5,
         };
         let prompt = SchedulerRunner::build_task_prompt(
-            "Ada Lovelace",
+            &owner_config(),
             &item,
             Path::new("/ws/tasks/schedule-1"),
             Some(&late),
         );
 
-        assert!(prompt.contains("LATE by about 300 minutes"));
-        assert!(prompt.contains("5 scheduled occurrence(s)"));
+        assert!(prompt.contains("late by about 300 minutes"));
+        assert!(prompt.contains("5 occurrence(s) missed"));
         assert!(!prompt.contains("{{"), "unfilled placeholder: {prompt}");
     }
 }

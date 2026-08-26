@@ -346,11 +346,19 @@ impl CodexProcessManager {
 
     /// Thread creation settings. The assistant runs unattended over WhatsApp, so
     /// it cannot answer approval prompts. Hence `never` and full access.
-    fn thread_params(&self, opts: &ThreadOptions) -> Value {
+    ///
+    /// `project_root_markers` names the workspace root, the only directory that
+    /// holds a `.codex-home`. Codex looks for the owner's `.agents/skills` only
+    /// between the project root and the thread's working directory, and its
+    /// default marker is `.git`, which the workspace does not have. Without this
+    /// a task thread rooted in `tasks/memory-compaction` searches that directory
+    /// and stops, so the owner's own skills go missing from every scheduled run.
+    fn thread_params(opts: &ThreadOptions) -> Value {
         json!({
             "cwd": opts.cwd.to_string_lossy(),
             "approvalPolicy": "never",
             "sandbox": "danger-full-access",
+            "config": { "project_root_markers": [".codex-home"] },
         })
     }
 
@@ -415,8 +423,10 @@ impl CodexProcessManager {
         if let Some(provider) = config.model_provider {
             params["modelProvider"] = json!(provider);
         }
-        if !config.thread_config.is_empty() {
-            params["config"] = Value::Object(config.thread_config);
+        // Merged, not replaced: `thread_params` already put the project root
+        // marker here and resuming a thread must not drop it.
+        for (key, value) in config.thread_config {
+            params["config"][key.as_str()] = value;
         }
     }
 
@@ -482,7 +492,7 @@ impl CodexProcessManager {
     /// directory, and must not disturb the thread the user is talking to.
     pub async fn create_thread(&self, opts: &ThreadOptions) -> Result<ThreadInfo> {
         let res = self
-            .send_request("thread/start", Some(self.thread_params(opts)))
+            .send_request("thread/start", Some(Self::thread_params(opts)))
             .await?;
         let info = ThreadInfo::from_result(&res, ThreadOrigin::Created)?;
         debug!(
@@ -502,7 +512,7 @@ impl CodexProcessManager {
     /// Rejoin a previously persisted thread so conversation context survives a
     /// daemon restart.
     pub async fn resume_thread(&self, thread_id: &str, opts: &ThreadOptions) -> Result<ThreadInfo> {
-        let mut params = self.thread_params(opts);
+        let mut params = Self::thread_params(opts);
         params["threadId"] = json!(thread_id);
         Self::apply_resume_config(&mut params, self.resume_config(opts).await?);
         let res = self.send_request("thread/resume", Some(params)).await?;
@@ -510,6 +520,15 @@ impl CodexProcessManager {
         debug!("thread/resume -> {} (model {})", info.id, info.model);
         self.set_active_thread(&info.id).await;
         Ok(info)
+    }
+
+    /// Archive a completed isolated thread so Codex tears down its per-thread
+    /// resources, including the MCP proxy process.
+    pub async fn archive_thread(&self, thread_id: &str) -> Result<()> {
+        self.send_request("thread/archive", Some(json!({"threadId": thread_id})))
+            .await?;
+        info!("Archived isolated thread {thread_id}");
+        Ok(())
     }
 
     /// Resume `persisted` if it is still loadable, otherwise start fresh.
@@ -919,7 +938,7 @@ mod tests {
 
     #[test]
     fn test_resume_reapplies_session_static_native_config() {
-        let mut params = json!({"threadId": "t1"});
+        let mut params = json!({"threadId": "t1", "config": {}});
         let mut thread_config = serde_json::Map::new();
         thread_config.insert("model_reasoning_effort".into(), json!("medium"));
 
@@ -935,6 +954,30 @@ mod tests {
         assert_eq!(params["model"], "configured-model");
         assert_eq!(params["modelProvider"], "configured-provider");
         assert_eq!(params["config"]["model_reasoning_effort"], "medium");
+    }
+
+    /// Codex finds the owner's `.agents/skills` only between the project root
+    /// and the thread's working directory. A scheduled task runs deep inside the
+    /// workspace, so the marker has to travel on every thread, resumed included.
+    #[test]
+    fn test_every_thread_roots_itself_at_the_workspace() {
+        let mut resumed = CodexProcessManager::thread_params(&ThreadOptions::new(
+            "/workspace/tasks/memory-compaction",
+        ));
+        assert_eq!(resumed["config"]["project_root_markers"][0], ".codex-home");
+
+        let mut thread_config = serde_json::Map::new();
+        thread_config.insert("model_reasoning_effort".into(), json!("medium"));
+        CodexProcessManager::apply_resume_config(
+            &mut resumed,
+            ResumeConfig {
+                thread_config,
+                ..ResumeConfig::default()
+            },
+        );
+
+        assert_eq!(resumed["config"]["project_root_markers"][0], ".codex-home");
+        assert_eq!(resumed["config"]["model_reasoning_effort"], "medium");
     }
 
     #[test]

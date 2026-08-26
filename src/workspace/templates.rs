@@ -59,7 +59,6 @@ mod tests {
             render(data::TASKS_AGENTS, config),
             render(data::HISTORY_SCHEMA, config),
             render(data::LOGS_SCHEMA, config),
-            render(data::SCHEDULE_AGENTS, config),
             render(data::WORKING, config),
         ]
     }
@@ -70,8 +69,7 @@ mod tests {
         let root = render(data::WORKSPACE_AGENTS, &config);
         let bootstrap = render(data::CODEX_HOME_AGENTS, &config);
 
-        assert!(root.contains("/tmp/my_workspace/history/history.sqlite3"));
-        assert!(root.contains("/tmp/my_workspace/WORKING.md"));
+        assert!(root.contains("You start in `/tmp/my_workspace`"));
         assert!(bootstrap.contains("/tmp/my_workspace/AGENTS.md"));
         // The old templates hardcoded /workspace, which pointed Codex at a
         // directory that does not exist under any other workspace root.
@@ -156,13 +154,14 @@ mod tests {
         let config = config("/ws");
         let root = render(data::WORKSPACE_AGENTS, &config);
 
-        assert!(root.contains("/ws/history/jsonl/"));
-        assert!(root.contains("jq"));
-        assert!(root.contains("sqlite3 /ws/history/history.sqlite3"));
-        assert!(root.contains("/ws/history/SCHEMA.md"));
-        // The log reference lives in its own file now; AGENTS.md must point at it
-        // rather than silently dropping the only way the agent diagnoses itself.
-        assert!(root.contains("/ws/logs/SCHEMA.md"));
+        // AGENTS.md points; the schema files carry the commands, so the agent
+        // pays for them only when it actually reads history or its own logs.
+        assert!(root.contains("history/SCHEMA.md"));
+        assert!(root.contains("logs/SCHEMA.md"));
+        let history = render(data::HISTORY_SCHEMA, &config);
+        assert!(history.contains("/ws/history/jsonl/"));
+        assert!(history.contains("jq"));
+        assert!(history.contains("sqlite3 /ws/history/history.sqlite3"));
         assert!(render(data::LOGS_SCHEMA, &config).contains("tera::scheduler"));
         // There is no history tool any more; nothing may imply otherwise.
         assert!(!root.contains("history_search"));

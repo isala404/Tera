@@ -8,7 +8,7 @@ use crate::conversation::session::ConversationSession;
 use crate::conversation::typing::TypingGuard;
 use crate::history::assets::AssetStorage;
 use crate::history::db::{Attachment, ConversationEvent, EventKind, HistoryDb, ProviderRef};
-use crate::runtime::{ActivityTracker, RuntimeDb};
+use crate::runtime::RuntimeDb;
 use crate::secrets::{Capture, SecretStore};
 use crate::transport::owner::jid_user;
 use crate::transport::{
@@ -36,6 +36,9 @@ const MAX_BURST_WAIT: Duration = Duration::from_secs(8);
 /// trusting it eventually in case WhatsApp disconnects before sending Paused.
 const PRESENCE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_PRESENCE_HOLD: Duration = Duration::from_secs(5 * 60);
+
+const MODEL_FAILURE_REPLY: &str =
+    "I couldn't complete that because the model provider is unavailable. Check Tera's service log for the cause, then try again.";
 
 /// Bursts waiting out their quiet period, and the logical turn currently being
 /// executed.
@@ -114,7 +117,6 @@ pub struct TurnEngine {
     codex: CodexSupervisor,
     owner_policy: OwnerPolicy,
     session: ConversationSession,
-    activity: ActivityTracker,
     secrets: SecretStore,
 }
 
@@ -126,7 +128,6 @@ impl TurnEngine {
         transport: Arc<dyn Transport>,
         session: ConversationSession,
         codex: CodexSupervisor,
-        activity: ActivityTracker,
     ) -> Self {
         Self {
             owner_policy: OwnerPolicy::new(config.whatsapp_owner_number.clone()),
@@ -138,7 +139,6 @@ impl TurnEngine {
             state: Arc::new(Mutex::new(ConversationState::default())),
             codex,
             session,
-            activity,
         }
     }
 
@@ -540,7 +540,6 @@ impl TurnEngine {
     ) -> Result<()> {
         // Registers the conversation as busy for the duration, which is what
         // defers memory maintenance and interrupts it if it is already running.
-        let _active = self.activity.begin();
 
         let turn_id = burst.turn_id.clone();
         self.set_running(Some(turn_id.clone())).await;
@@ -588,10 +587,43 @@ impl TurnEngine {
             // notes to Codex as real media rather than a text description of media.
             let inputs = self.turn_inputs(&burst.events);
 
-            let reply_text = self.codex.run_main_turn(&inputs).await.map_err(|error| {
-                error!("Codex turn failed: {error:?}");
-                error
-            })?;
+            let reply_target = burst.events.last().map(|last| MessageRef {
+                provider_msg_id: last_provider_msg_id.to_string(),
+                chat_jid: chat_jid.clone(),
+                from_me: false,
+                text: last.text.clone(),
+            });
+
+            let reply_text = match self.codex.run_main_turn(&inputs).await {
+                Ok(reply) => reply,
+                Err(error) => {
+                    error!("Codex turn failed: {error:?}");
+                    if self.session.sends_since(sends_before) == 0 {
+                        match self
+                            .transport
+                            .send_text(sender, MODEL_FAILURE_REPLY, reply_target.as_ref())
+                            .await
+                        {
+                            Ok(outbound_msg_id) => {
+                                if let Err(record_error) = record_assistant_message(
+                                    &self.history_db,
+                                    &chat_jid,
+                                    &outbound_msg_id,
+                                    MODEL_FAILURE_REPLY,
+                                    Some(burst.turn_id.clone()),
+                                    burst.events.last().map(|event| event.id.clone()),
+                                ) {
+                                    warn!("Could not record model failure reply: {record_error:?}");
+                                }
+                            }
+                            Err(send_error) => {
+                                error!("Could not send model failure reply: {send_error:?}");
+                            }
+                        }
+                    }
+                    return Err(error);
+                }
+            };
 
             self.codex.note_main_activity();
 
@@ -611,13 +643,6 @@ impl TurnEngine {
 
             // The fallback answers the burst, so it quotes the message that
             // closed it, which is the one the owner is still looking at.
-            let reply_target = burst.events.last().map(|last| MessageRef {
-                provider_msg_id: last_provider_msg_id.to_string(),
-                chat_jid: chat_jid.clone(),
-                from_me: false,
-                text: last.text.clone(),
-            });
-
             let outbound_msg_id = self
                 .transport
                 .send_text(sender, &reply_text, reply_target.as_ref())

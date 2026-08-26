@@ -14,9 +14,8 @@ use std::sync::Mutex;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-/// Log files older than this are deleted at startup. Matches memory generation
-/// retention: long enough to explain a problem noticed days later, short enough
-/// that nothing has to prune it by hand.
+/// Log files older than this are deleted at startup. Long enough to explain a
+/// problem noticed days later, short enough that nothing has to prune it by hand.
 const RETAIN_DAYS: i64 = 14;
 
 /// Start tracing. `log_dir` adds the file copy; one-shot commands with no

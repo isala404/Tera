@@ -37,8 +37,10 @@ class SpotifyError(Exception):
 
 
 def workspace_root():
-    # .../<workspace>/.agents/skills/spotify/scripts/spotify
-    return Path(__file__).resolve().parents[4]
+    codex_home = os.environ.get("CODEX_HOME")
+    if codex_home:
+        return Path(codex_home).resolve().parent
+    return Path.cwd().resolve()
 
 
 def runtime_root():

@@ -7,9 +7,7 @@ use tera::config::Config;
 use tera::conversation::{ConversationSession, Phoenix, TurnEngine};
 use tera::history::{backup, HistoryDb, ProjectionEngine};
 use tera::mcp::{DaemonRpcServer, StdioMcpProxy};
-use tera::memory::generations::GenerationManager;
-use tera::memory::{self, MaintenanceRunner, Outcome};
-use tera::runtime::{self, ActivityTracker, DaemonLock, RuntimeDb};
+use tera::runtime::{self, DaemonLock, RuntimeDb};
 use tera::scheduler::db::SchedulerDb;
 use tera::scheduler::recurrence;
 use tera::scheduler::SchedulerRunner;
@@ -85,11 +83,6 @@ enum Commands {
         #[command(subcommand)]
         sub: HistorySubcommands,
     },
-    /// Memory tools
-    Memory {
-        #[command(subcommand)]
-        sub: MemorySubcommands,
-    },
     /// Credentials skills read. Normally set from chat, not here.
     Secret {
         #[command(subcommand)]
@@ -141,31 +134,6 @@ enum HistorySubcommands {
 }
 
 #[derive(Subcommand)]
-enum MemorySubcommands {
-    /// Trigger full memory regeneration from SQLite history
-    Rebuild {
-        #[command(flatten)]
-        workspace: WorkspaceArg,
-    },
-    /// Trigger nightly memory optimization pass
-    Optimize {
-        #[command(flatten)]
-        workspace: WorkspaceArg,
-    },
-    /// List memory generations and which one is active
-    Status {
-        #[command(flatten)]
-        workspace: WorkspaceArg,
-    },
-    /// Point active memory back at an earlier generation
-    Rollback {
-        #[command(flatten)]
-        workspace: WorkspaceArg,
-        generation: u64,
-    },
-}
-
-#[derive(Subcommand)]
 enum SecretSubcommands {
     /// List stored names and when each was set. Never prints a value.
     List {
@@ -210,7 +178,6 @@ impl Commands {
             | Commands::Status { workspace }
             | Commands::Update { workspace, .. } => Some(&workspace.workspace),
             Commands::History { sub } => Some(sub.workspace()),
-            Commands::Memory { sub } => Some(sub.workspace()),
             Commands::Secret { sub } => Some(sub.workspace()),
             Commands::Mcp { .. }
             | Commands::Version { .. }
@@ -229,24 +196,30 @@ impl HistorySubcommands {
     }
 }
 
-impl MemorySubcommands {
-    fn workspace(&self) -> &PathBuf {
-        match self {
-            MemorySubcommands::Rebuild { workspace }
-            | MemorySubcommands::Optimize { workspace }
-            | MemorySubcommands::Status { workspace }
-            | MemorySubcommands::Rollback { workspace, .. } => &workspace.workspace,
-        }
+/// One line describing the memory repository for `tera status`.
+///
+/// Git is the whole story here, so the useful facts are how many commits deep
+/// it is and what the last one said. A directory that is not a repository is
+/// worth reporting loudly, because nothing will be versioned until it is.
+fn memory_status(config: &Config) -> String {
+    let dir = config.memories_dir();
+    if !dir.join(".git").exists() {
+        return format!("{} is not a git repository", dir.display());
     }
-}
-
-/// Print what a one-shot `memory` command did. Both passes end the same three
-/// ways, so both report the same three ways.
-fn report(outcome: Outcome) {
-    match outcome {
-        Outcome::Promoted(generation) => println!("Generation {generation} is active"),
-        Outcome::Interrupted => println!("The pass was interrupted; memory is unchanged"),
-        Outcome::Rejected(reason) => println!("Rejected, memory is unchanged: {reason}"),
+    match std::process::Command::new("git")
+        .current_dir(&dir)
+        .args(["log", "-1", "--format=%h %s (%ar)"])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            let last = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if last.is_empty() {
+                "git repository, no commits yet".to_string()
+            } else {
+                last
+            }
+        }
+        _ => "git repository, no commits yet".to_string(),
     }
 }
 
@@ -371,12 +344,7 @@ async fn main() -> Result<()> {
                 println!("History:     not initialized");
             }
 
-            match GenerationManager::active_generation(&config) {
-                Some(generation) if config.memories_link().join("INDEX.md").is_file() => {
-                    println!("Memory:      generation {generation:08}")
-                }
-                _ => println!("Memory:      MEMORIES link is BROKEN"),
-            }
+            println!("Memory:      {}", memory_status(&config));
 
             println!(
                 "Owner:       {} (set TERA_OWNER to change)",
@@ -424,15 +392,6 @@ async fn main() -> Result<()> {
                             run.schedule_id,
                             run.error.as_deref().unwrap_or("")
                         );
-                    }
-                }
-
-                for (label, key) in [
-                    ("Rebuild pending", memory::REBUILD.pending_key),
-                    ("Optimizer retry", memory::NIGHTLY.pending_key),
-                ] {
-                    if rdb.get_state_value(key)?.as_deref() == Some("true") {
-                        println!("{label}: yes");
                     }
                 }
             }
@@ -491,88 +450,6 @@ async fn main() -> Result<()> {
                     // Exit non-zero so this is usable from a script or a cron job.
                     std::process::exit(1);
                 }
-            }
-        },
-
-        // Both of these drive a real Codex turn, so they need a workspace that is
-        // set up and a live app-server, the same path the daemon uses.
-        Commands::Memory { sub } => match sub {
-            MemorySubcommands::Rebuild {
-                workspace: WorkspaceArg { workspace },
-            } => {
-                let config = Config::new(workspace, false);
-                WorkspaceInit::init(&config)?;
-                let history_db = HistoryDb::open_for(&config)?;
-                let runtime_db = RuntimeDb::open(&config.runtime_db_path())?;
-                let codex =
-                    CodexSupervisor::new(config.clone(), runtime_db.clone(), history_db.clone());
-                report(
-                    memory::REBUILD
-                        .run(&config, &history_db, &runtime_db, &codex, None)
-                        .await?,
-                );
-            }
-
-            MemorySubcommands::Optimize {
-                workspace: WorkspaceArg { workspace },
-            } => {
-                let config = Config::new(workspace, false);
-                WorkspaceInit::init(&config)?;
-                let runtime_db = RuntimeDb::open(&config.runtime_db_path())?;
-                let history_db = HistoryDb::open_for(&config)?;
-                let codex =
-                    CodexSupervisor::new(config.clone(), runtime_db.clone(), history_db.clone());
-                report(
-                    memory::NIGHTLY
-                        .run(&config, &history_db, &runtime_db, &codex, None)
-                        .await?,
-                );
-            }
-
-            MemorySubcommands::Status {
-                workspace: WorkspaceArg { workspace },
-            } => {
-                let config = Config::new(workspace, false);
-                let active = GenerationManager::active_generation(&config);
-                let latest = GenerationManager::get_current_generation_num(&config)?;
-                match active {
-                    Some(generation) => println!("Active:  {generation:08}"),
-                    None => println!("Active:  none, the MEMORIES link is broken"),
-                }
-                if active != Some(latest) {
-                    // Normal after a rollback; alarming if it is a surprise.
-                    println!("Latest:  {latest:08} (not active)");
-                }
-                println!("\nGenerations:");
-                let mut generations = std::fs::read_dir(config.generations_dir())?
-                    .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
-                    .collect::<Vec<_>>();
-                generations.sort();
-                let active_name = active.map(|g| format!("{g:08}"));
-                for name in generations {
-                    let marker = if Some(&name) == active_name.as_ref() {
-                        " (active)"
-                    } else {
-                        ""
-                    };
-                    println!("  {name}{marker}");
-                }
-            }
-
-            MemorySubcommands::Rollback {
-                workspace: WorkspaceArg { workspace },
-                generation,
-            } => {
-                let config = Config::new(workspace, false);
-                let target = config.generations_dir().join(format!("{generation:08}"));
-                if !target.is_dir() {
-                    return Err(anyhow::anyhow!(
-                        "No memory generation {generation:08} at {target:?}"
-                    ));
-                }
-                GenerationManager::validate_generation_dir(&target)?;
-                GenerationManager::point_memories_at(&config, generation)?;
-                println!("Active memory rolled back to generation {generation:08}");
             }
         },
 
@@ -642,18 +519,13 @@ async fn main() -> Result<()> {
             let history_db = HistoryDb::open_for(&config)?;
             let runtime_db = RuntimeDb::open(&config.runtime_db_path())?;
 
-            // 2a. Repair what a crash or an older build may have left behind,
-            //     before anything is served.
-            match backup::clear_stale_staging(&config) {
+            // 2a. Repair what a crash may have left behind, before anything is served.
+            match backup::clear_stale_scratch(&config) {
                 Ok(removed) if !removed.is_empty() => {
                     info!("Cleared {} stale staging director(ies)", removed.len())
                 }
                 Err(e) => warn!("Could not clear stale staging: {:?}", e),
                 _ => {}
-            }
-
-            if let Err(e) = backup::verify_memories_link(&config) {
-                warn!("Active memory is not usable: {:?}", e);
             }
 
             // The assistant only wakes on a message, so its instruction to look
@@ -681,10 +553,6 @@ async fn main() -> Result<()> {
             // tell whether a turn already replied through the send_message tool.
             let session = ConversationSession::new();
 
-            // Conversation turns and scheduled runs both register here, so memory
-            // maintenance can tell when it is safe to run, and get out of the way.
-            let activity = ActivityTracker::new();
-
             // One app-server process, shared by the conversation and the scheduler.
             let codex =
                 CodexSupervisor::new(config.clone(), runtime_db.clone(), history_db.clone());
@@ -711,7 +579,6 @@ async fn main() -> Result<()> {
                     wa_transport.clone(),
                     session.clone(),
                     codex.clone(),
-                    activity.clone(),
                 ));
 
                 // The startup assistant writes the restart message after the
@@ -723,7 +590,6 @@ async fn main() -> Result<()> {
                     runtime_db.clone(),
                     wa_transport.clone(),
                     codex.clone(),
-                    activity.clone(),
                     session.clone(),
                 );
                 tokio::spawn(async move {
@@ -802,21 +668,8 @@ async fn main() -> Result<()> {
                 config.clone(),
                 runtime_db.clone(),
                 codex.clone(),
-                activity.clone(),
             ));
             scheduler_runner.start_loop();
-
-            // Nightly optimization, and rebuilds after a model change. Lowest
-            // priority in the system; it only runs in an idle window and
-            // abandons its work when anything else starts.
-            let maintenance = Arc::new(MaintenanceRunner::new(
-                config.clone(),
-                history_db.clone(),
-                runtime_db.clone(),
-                codex.clone(),
-                activity.clone(),
-            ));
-            maintenance.start_loop();
 
             // Everything required to serve a turn is now running, including a
             // post-update Codex handshake. The rollback copy is no longer needed.

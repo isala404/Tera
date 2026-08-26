@@ -11,7 +11,7 @@ use crate::conversation::session::ConversationSession;
 use crate::data;
 use crate::history::db::HistoryDb;
 use crate::runtime::crash_mark::CrashMark;
-use crate::runtime::{ActivityTracker, ConversationTurn, RuntimeDb};
+use crate::runtime::{ConversationTurn, RuntimeDb};
 use crate::transport::{MessageRef, Transport};
 use crate::update::UpdateNotice;
 use crate::version::BuildInfo;
@@ -29,7 +29,6 @@ pub struct Phoenix {
     runtime_db: RuntimeDb,
     transport: Arc<dyn Transport>,
     codex: CodexSupervisor,
-    activity: ActivityTracker,
     session: ConversationSession,
 }
 
@@ -40,7 +39,6 @@ impl Phoenix {
         runtime_db: RuntimeDb,
         transport: Arc<dyn Transport>,
         codex: CodexSupervisor,
-        activity: ActivityTracker,
         session: ConversationSession,
     ) -> Self {
         Self {
@@ -49,7 +47,6 @@ impl Phoenix {
             runtime_db,
             transport,
             codex,
-            activity,
             session,
         }
     }
@@ -119,7 +116,6 @@ impl Phoenix {
         abandoned: &[ConversationTurn],
         over_budget: bool,
     ) -> Result<()> {
-        let _active = self.activity.begin();
         let pending_request = self.render_requests(recoverable)?;
         let abandoned_request = self.render_requests(abandoned)?;
         let restart_context =

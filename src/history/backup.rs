@@ -109,51 +109,25 @@ pub fn check_integrity(
     Ok(report)
 }
 
-/// Remove staging directories left behind by an interrupted run.
+/// Remove scratch directories left behind by an interrupted run.
 ///
-/// Staging is always rebuilt from scratch before use, so anything found here at
+/// Scratch is always rebuilt from nothing before use, so anything found here at
 /// boot is debris from a crash, and it is debris that takes disk.
-pub fn clear_stale_staging(config: &Config) -> Result<Vec<PathBuf>> {
+pub fn clear_stale_scratch(config: &Config) -> Result<Vec<PathBuf>> {
     let mut removed = Vec::new();
-    for root in [config.staging_dir(), config.runtime_dir().join("tmp")] {
-        if !root.is_dir() {
-            continue;
-        }
-        for entry in fs::read_dir(&root)? {
-            let path = entry?.path();
-            if path.is_dir() {
-                fs::remove_dir_all(&path)
-                    .with_context(|| format!("Failed to remove stale staging {path:?}"))?;
-                removed.push(path);
-            }
+    let root = config.runtime_dir().join("tmp");
+    if !root.is_dir() {
+        return Ok(removed);
+    }
+    for entry in fs::read_dir(&root)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            fs::remove_dir_all(&path)
+                .with_context(|| format!("Failed to remove stale scratch {path:?}"))?;
+            removed.push(path);
         }
     }
     Ok(removed)
-}
-
-/// Verify `memories` points at a real generation, and repair it if not.
-///
-/// Power loss during promotion, or a hand-edited workspace, can leave the symlink
-/// dangling, and a dangling `memories/` is an assistant with no memory that
-/// reports no error while reading it.
-pub fn verify_memories_link(config: &Config) -> Result<bool> {
-    let link = config.memories_link();
-    if link.join("INDEX.md").is_file() {
-        return Ok(true);
-    }
-
-    let generation =
-        crate::memory::generations::GenerationManager::get_current_generation_num(config)?;
-    let target = config.generations_dir().join(format!("{generation:08}"));
-    if !target.is_dir() {
-        return Err(anyhow!(
-            "memories link is broken and generation {generation} is missing at {target:?}"
-        ));
-    }
-
-    crate::memory::generations::GenerationManager::point_memories_at(config, generation)?;
-    info!("Repaired the memories symlink; it now points at generation {generation}");
-    Ok(false)
 }
 
 #[cfg(test)]
@@ -255,34 +229,15 @@ mod tests {
     }
 
     #[test]
-    fn test_stale_staging_is_cleared() {
+    fn test_stale_scratch_is_cleared() {
         let (_tmp, config) = workspace();
-        let debris = config.staging_dir().join("optimizer");
+        let debris = config.runtime_dir().join("tmp").join("half-a-download");
         fs::create_dir_all(debris.join("nested")).unwrap();
-        fs::write(debris.join("INDEX.md"), "half-written").unwrap();
+        fs::write(debris.join("part"), "half-written").unwrap();
 
-        let removed = clear_stale_staging(&config).unwrap();
+        let removed = clear_stale_scratch(&config).unwrap();
 
         assert!(!debris.exists());
-        assert!(removed.iter().any(|p| p.ends_with("optimizer")));
-    }
-
-    #[test]
-    fn test_dangling_memories_link_is_repaired() {
-        let (_tmp, config) = workspace();
-        fs::remove_file(config.memories_link()).unwrap();
-        std::os::unix::fs::symlink("nowhere", config.memories_link()).unwrap();
-
-        assert!(
-            !verify_memories_link(&config).unwrap(),
-            "should have repaired"
-        );
-        assert!(config.memories_link().join("INDEX.md").is_file());
-    }
-
-    #[test]
-    fn test_a_healthy_memories_link_is_left_alone() {
-        let (_tmp, config) = workspace();
-        assert!(verify_memories_link(&config).unwrap());
+        assert!(removed.iter().any(|p| p.ends_with("half-a-download")));
     }
 }

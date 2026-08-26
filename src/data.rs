@@ -32,8 +32,6 @@ pub const WORKING: &str = include_str!("../data/workspace/WORKING.md");
 pub const CODEX_HOME_AGENTS: &str = include_str!("../data/workspace/codex-home/AGENTS.md");
 pub const PROJECTS_AGENTS: &str = include_str!("../data/workspace/projects/AGENTS.md");
 pub const TASKS_AGENTS: &str = include_str!("../data/workspace/tasks/AGENTS.md");
-/// Bootstrap read by every run of a scheduled task.
-pub const SCHEDULE_AGENTS: &str = include_str!("../data/workspace/tasks/SCHEDULE_AGENTS.md");
 pub const HISTORY_SCHEMA: &str = include_str!("../data/workspace/history/SCHEMA.md");
 pub const LOGS_SCHEMA: &str = include_str!("../data/workspace/logs/SCHEMA.md");
 
@@ -60,10 +58,10 @@ pub struct BuiltinSkillFile {
 include!(concat!(env!("OUT_DIR"), "/builtin_skills.rs"));
 
 // Prompts sent to a model.
-pub const MEMORY_OPTIMIZER_PROMPT: &str = include_str!("../data/prompts/memory-optimizer.md");
-pub const MEMORY_REBUILD_PROMPT: &str = include_str!("../data/prompts/memory-rebuild.md");
 pub const SCHEDULED_TASK_PROMPT: &str = include_str!("../data/prompts/scheduled-task.md");
-pub const SCHEDULED_TASK_LATE_NOTE: &str = include_str!("../data/prompts/scheduled-task-late.md");
+/// The seeded nightly memory pass. The detail lives in the `memory` skill, so
+/// this only has to name the pass and say that lateness does not matter.
+pub const MEMORY_NIGHTLY_PROMPT: &str = include_str!("../data/prompts/memory-nightly.md");
 pub const PHOENIX_RECOVERY_PROMPT: &str = include_str!("../data/prompts/phoenix-recovery.md");
 /// The seeded machine-health schedule. Its own prompt rather than something the
 /// agent has to compose, so a fresh workspace looks after the host from day one.
@@ -100,18 +98,27 @@ mod tests {
         ("workspace/codex-home/AGENTS.md", CODEX_HOME_AGENTS),
         ("workspace/projects/AGENTS.md", PROJECTS_AGENTS),
         ("workspace/tasks/AGENTS.md", TASKS_AGENTS),
-        ("workspace/tasks/SCHEDULE_AGENTS.md", SCHEDULE_AGENTS),
         ("workspace/memory/INDEX.md", MEMORY_INDEX_SEED),
         ("workspace/memory/HORIZON.md", MEMORY_HORIZON_SEED),
         ("workspace/memory/USER.md", MEMORY_USER_SEED),
         ("workspace/history/SCHEMA.md", HISTORY_SCHEMA),
         ("workspace/logs/SCHEMA.md", LOGS_SCHEMA),
-        ("prompts/memory-optimizer.md", MEMORY_OPTIMIZER_PROMPT),
-        ("prompts/memory-rebuild.md", MEMORY_REBUILD_PROMPT),
         ("prompts/scheduled-task.md", SCHEDULED_TASK_PROMPT),
-        ("prompts/scheduled-task-late.md", SCHEDULED_TASK_LATE_NOTE),
+        ("prompts/memory-nightly.md", MEMORY_NIGHTLY_PROMPT),
         ("prompts/phoenix-recovery.md", PHOENIX_RECOVERY_PROMPT),
         ("prompts/self-care.md", SELF_CARE_PROMPT),
+        (
+            "skills/memory/SKILL.md",
+            include_str!("../data/skills/memory/SKILL.md"),
+        ),
+        (
+            "skills/memory/references/nightly.md",
+            include_str!("../data/skills/memory/references/nightly.md"),
+        ),
+        (
+            "skills/memory/references/rebuild.md",
+            include_str!("../data/skills/memory/references/rebuild.md"),
+        ),
         (
             "skills/self-update/SKILL.md",
             include_str!("../data/skills/self-update/SKILL.md"),
@@ -133,8 +140,12 @@ mod tests {
             include_str!("../data/skills/model-config/scripts/current-model"),
         ),
         (
-            "skills/model-config/scripts/preflight",
-            include_str!("../data/skills/model-config/scripts/preflight"),
+            "skills/model-config/scripts/verify",
+            include_str!("../data/skills/model-config/scripts/verify"),
+        ),
+        (
+            "skills/model-config/references/providers.md",
+            include_str!("../data/skills/model-config/references/providers.md"),
         ),
         (
             "skills/model-config/scripts/restart-after-turn",
@@ -159,10 +170,8 @@ mod tests {
         "SCHEDULE_ID",
         "NOW",
         "TASK_DIR",
-        "LATE_NOTE",
+        "LATE",
         "TASK_PROMPT",
-        "LATE_MINUTES",
-        "MISSED",
         "OWNER",
         "STARTUP_FACTS",
         "PENDING_REQUEST",
@@ -265,9 +274,6 @@ mod tests {
             "workspace/PERSONA.md",
             "workspace/SYSTEM.md",
             "workspace/tasks/AGENTS.md",
-            "workspace/tasks/SCHEDULE_AGENTS.md",
-            "prompts/memory-optimizer.md",
-            "prompts/memory-rebuild.md",
             "prompts/scheduled-task.md",
             "prompts/self-care.md",
             "config/mcp-tools.json",
@@ -336,7 +342,6 @@ mod tests {
             CODEX_HOME_AGENTS,
             PROJECTS_AGENTS,
             TASKS_AGENTS,
-            SCHEDULE_AGENTS,
             HISTORY_SCHEMA,
             LOGS_SCHEMA,
             WORKING,
@@ -420,13 +425,23 @@ mod tests {
         assert!(skill.contains("do not guess"));
         assert!(skill.contains("use, switch, change, update, or reset the conversation model"));
         assert!(skill.contains(".codex-home/config.toml"));
-        assert!(skill.contains("codex --strict-config doctor --summary"));
-        assert!(skill.contains("scripts/preflight"));
         assert!(skill.contains("Search the web every time"));
-        assert!(skill.contains("real isolated inference"));
+        assert!(skill.contains("references/providers.md"));
         assert!(skill.contains("scripts/restart-after-turn"));
         assert!(skill.contains("Do not restart the service directly"));
-        assert!(skill.contains("references/provider-auth.md"));
+
+        // One command, and it has to be the one that makes a real request. A
+        // config that only parses is what shipped the GLM 404.
+        assert!(skill.contains("scripts/verify"));
+        let verify = include_str!("../data/skills/model-config/scripts/verify");
+        assert!(verify.contains("doctor"));
+        assert!(verify.contains("codex exec"));
+        assert!(verify.contains("references/probe.md"));
+
+        let providers = include_str!("../data/skills/model-config/references/providers.md");
+        assert!(providers.contains("Codex integration guide"));
+        assert!(providers.contains("model_catalog_json"));
+        assert!(providers.contains("request_secret"));
     }
 
     #[test]
@@ -477,7 +492,7 @@ mod tests {
         assert!(WORKING.contains("let Codex choose the worker model"));
         assert!(WORKING.contains("Create or improve a skill"));
         assert!(WORKING.contains("compact executable scripts"));
-        assert!(WORKING.contains("Do not create `agents/openai.yaml`"));
+        assert!(WORKING.contains("do not create `agents/openai.yaml`"));
     }
 
     #[test]

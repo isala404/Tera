@@ -1,8 +1,7 @@
 #!/bin/sh
 set -eu
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-workspace=$(cd "$script_dir/../../../.." && pwd -P)
+workspace=$(CDPATH= cd -- "${CODEX_HOME:-$PWD/.codex-home}/.." && pwd -P)
 tera_bin=$(awk -F '"' '/^command = / { print $2; exit }' "$workspace/.codex-home/config.toml")
 
 if [ -z "$tera_bin" ] || [ ! -x "$tera_bin" ]; then

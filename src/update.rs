@@ -6,6 +6,7 @@
 //! point. Phoenix rolls the binary back after a failed first start.
 
 use crate::config::Config;
+use crate::runtime::executable_on_path;
 use crate::version::{codex_version, BuildInfo};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -439,18 +440,6 @@ fn restore_codex(backup: &Path, target: &Path, expected_version: &str) -> Result
         bail!("Codex rollback reports {version:?}, expected {expected_version:?}")
     }
     Ok(())
-}
-
-fn executable_on_path(name: &str) -> Result<PathBuf> {
-    let path = std::env::var_os("PATH")
-        .and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|directory| directory.join(name))
-                .find(|candidate| candidate.is_file())
-        })
-        .ok_or_else(|| anyhow!("{name} is not on PATH"))?;
-    path.canonicalize()
-        .with_context(|| format!("could not resolve {}", path.display()))
 }
 
 fn binary_info(path: &Path) -> Result<BuildInfo> {

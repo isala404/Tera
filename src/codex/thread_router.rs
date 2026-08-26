@@ -91,7 +91,7 @@ impl ThreadRouter {
             context.push_str(&format!("- {}\n", config.persona_path().display()));
         }
 
-        let memories = config.memories_link();
+        let memories = config.memories_dir();
         for file in ["HORIZON.md", "INDEX.md"] {
             if memories.join(file).exists() {
                 context.push_str(&format!("- {}\n", memories.join(file).display()));

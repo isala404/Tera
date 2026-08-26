@@ -195,20 +195,6 @@ impl SchedulerDb {
             .optional()?)
     }
 
-    /// Whether any schedule with this name has ever existed, in any state.
-    ///
-    /// Used to keep the seeded machine-health schedule from being recreated on
-    /// every start after the owner cancels it.
-    pub fn name_was_ever_used(runtime_db: &RuntimeDb, name: &str) -> Result<bool> {
-        let conn = runtime_db.conn.lock().unwrap();
-        let exists: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM schedules WHERE name = ?1",
-            params![name],
-            |row| row.get(0),
-        )?;
-        Ok(exists)
-    }
-
     pub fn cancel_schedule(runtime_db: &RuntimeDb, schedule_id: &str) -> Result<bool> {
         let conn = runtime_db.conn.lock().unwrap();
         let now_ms = Utc::now().timestamp_millis();

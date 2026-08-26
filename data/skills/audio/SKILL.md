@@ -10,31 +10,31 @@ Everything runs locally with [Aloud](https://github.com/isala404/aloud). The wra
 Start with this.
 
 ```bash
-.agents/skills/audio/scripts/transcribe status
+.codex-home/skills/tera/audio/scripts/transcribe status
 ```
 
 If `aloud` is missing, run setup. It installs the pinned Aloud ARM64 Linux, Apple Silicon, or x86 64 Linux release under `.runtime/aloud/` after checking the release archive's SHA 256. It does not install a system package. `ffmpeg` must already be on `PATH` because incoming media needs conversion and WhatsApp voice notes need Opus.
 
 ```bash
-.agents/skills/audio/scripts/transcribe setup
+.codex-home/skills/tera/audio/scripts/transcribe setup
 ```
 
 Transcribe any audio or video container that ffmpeg can read. Video is treated as its soundtrack. Attachment paths in the transcript resolve relative to `history/jsonl/`.
 
 ```bash
-.agents/skills/audio/scripts/transcribe path/to/note.ogg
+.codex-home/skills/tera/audio/scripts/transcribe path/to/note.ogg
 ```
 
 Synthesize a WAV with either embedded voice.
 
 ```bash
-.agents/skills/audio/scripts/transcribe tts "Text to speak" -o .runtime/reply.wav --voice sky
+.codex-home/skills/tera/audio/scripts/transcribe tts "Text to speak" -o .runtime/reply.wav --voice sky
 ```
 
 For a real WhatsApp voice note, ask the wrapper for Opus and send the resulting file through `voice_note_path`. This sets WhatsApp's push to talk flag. `audio_path` sends an ordinary audio attachment instead.
 
 ```bash
-.agents/skills/audio/scripts/transcribe tts "Text to speak" -o .runtime/reply.ogg --voice aiden --voice-note
+.codex-home/skills/tera/audio/scripts/transcribe tts "Text to speak" -o .runtime/reply.ogg --voice aiden --voice-note
 ```
 
 Then call `send_message` with `voice_note_path` set to `.runtime/reply.ogg`. Text is optional. Do not claim a WAV sent through `audio_path` is a voice note.

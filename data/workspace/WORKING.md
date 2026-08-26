@@ -52,7 +52,7 @@ Codex owns subagent delegation and model selection. Delegate when work divides c
 
 Create or improve a skill only after {{OWNER}} approves the specific candidate. Use `$skill-creator`. Delegate when the work divides cleanly and let Codex choose the worker model.
 
-Read the existing skill before changing it. Keep `SKILL.md` lean, move deterministic or repeated mechanics into compact executable scripts, and avoid dependencies when the standard library or an existing tool is enough. Preserve the skill name when improving it. Test scripts directly. Do not add evaluation scaffolding unless {{OWNER}} asks for it. Keep descriptions within 100 characters. Do not create `agents/openai.yaml`.
+Read the existing skill before changing it, and keep its name. Keep `SKILL.md` lean, move deterministic or repeated mechanics into compact executable scripts, and avoid dependencies when the standard library or an existing tool is enough. Test scripts directly. Do not add evaluation scaffolding unless {{OWNER}} asks for it, and do not create `agents/openai.yaml`.
 
 ## Known ways this goes wrong
 

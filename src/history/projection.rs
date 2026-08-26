@@ -4,10 +4,8 @@
 //! canonical, but it is the fast path for `jq`, `rg` and Python, so a missing
 //! record reads to the agent as a conversation that never happened.
 //!
-//! Appends are therefore driven from `HistoryDb::insert_event` rather than from
-//! each call site: the two call sites that wrote events through the MCP tools
-//! never appended, which silently dropped every assistant message and reaction
-//! from the projection.
+//! Appends are driven from `HistoryDb::insert_event` rather than from each call
+//! site, so there is no way to write an event and forget the projection.
 
 use crate::history::db::{ConversationEvent, EventKind, HistoryDb};
 use anyhow::{Context, Result};
@@ -164,11 +162,10 @@ impl ProjectionEngine {
     /// Check the projection against canonical history on daemon start, and
     /// rebuild it if they disagree.
     ///
-    /// The dirty marker only catches appends that failed loudly. A projection can
-    /// also drift because an older build never appended at all, which is exactly
-    /// what happened: 9 projected records against 23 canonical events, so the
-    /// agent read a conversation with no assistant in it. Counting is cheap and
-    /// self-correcting, so it runs every start rather than on suspicion.
+    /// The dirty marker only catches appends that failed loudly, and writing the
+    /// marker can itself fail. A projection short of canonical history reads to
+    /// the agent as a conversation that never happened, so counting is worth
+    /// doing on every start rather than on suspicion.
     pub fn verify_and_repair(
         jsonl_dir: &Path,
         staging_root: &Path,

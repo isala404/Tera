@@ -1,10 +1,32 @@
-//! Writing a file so a crash cannot leave half of it behind.
+//! Writing a file so a crash cannot leave half of it behind, and finding the
+//! programs tera shells out to.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+
+/// Resolve `name` the way a shell would.
+///
+/// The executable bit is part of the test. A directory entry that merely exists
+/// is not something we can run, and reporting "found" for one turns a clear
+/// startup error into a confusing failure later, at the point of use.
+pub fn executable_on_path(name: &str) -> Result<PathBuf> {
+    let path = std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join(name))
+                .find(|candidate| is_executable_file(candidate))
+        })
+        .ok_or_else(|| anyhow!("{name} is not on PATH"))?;
+    path.canonicalize()
+        .with_context(|| format!("could not resolve {}", path.display()))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
 
 /// Replace `path` with `contents`, so a reader ever sees the old file or the new
 /// one and never a mix of both.

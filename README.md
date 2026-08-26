@@ -14,7 +14,7 @@ Everything said in either direction lands in a SQLite event store with a JSONL p
 
 - **`codex` on PATH and logged in.** Tera has no API key of its own. It symlinks `<workspace>/.codex-home/auth.json` to `~/.codex/auth.json` and borrows your login. Run `codex login` once first or every turn fails to authenticate.
 - **A WhatsApp account to link a device to.** Your own number is the easy path.
-- Optionally `git`, `sqlite3`, `jq` and `ffmpeg`. `tera init` warns if they are missing but starts anyway. The bundled audio skill decodes everything through `ffmpeg`, so it needs that one present.
+- **`git`, `python3`, `sqlite3`, `jq` and `ffmpeg` on PATH.** `tera init` checks for all of them and refuses to start if one is missing, rather than building half a workspace and failing on the first turn that needs the program.
 
 The wire format was verified against **Codex CLI 0.147.0**. A materially different version may break parsing.
 
@@ -46,15 +46,13 @@ Every subcommand takes `--workspace <path>`, default `/workspace`. Point it some
 
 | command | what it does |
 | --- | --- |
-| `daemon` | the assistant itself with WhatsApp, MCP socket, scheduler and memory maintenance |
+| `daemon` | the assistant itself with WhatsApp, MCP socket and scheduler |
 | `init` | idempotent workspace setup, called automatically by `daemon` |
 | `version [--json]` | binary version, commit SHA, build time and installed Codex version |
 | `update [--component all\|tera\|codex]` | update Codex and Tera, then restart with Phoenix rollback protection |
 | `mcp --socket <path>` | stdio proxy Codex spawns to reach the daemon's tools, not for humans |
-| `status` | daemon state, history health, active memory generation, schedules |
+| `status` | daemon state, history health, the last memory commit, schedules |
 | `history rebuild-jsonl \| backup \| check` | projection, snapshot, integrity check (`check` exits 1 on failure) |
-| `memory rebuild \| optimize` | regenerate or tidy memory, each via its own Codex turn |
-| `memory status \| rollback <generation>` | list generations, or point active memory at an earlier one |
 
 ## Updates
 
@@ -71,9 +69,9 @@ Official release assets are `tera-x86_64-unknown-linux-gnu`, `tera-aarch64-unkno
   AGENTS.md WORKING.md      generated, rewritten every start
   PERSONA.md                yours, written once, never touched again
   SYSTEM.md                 the agent's notebook on this machine
-  MEMORIES -> .memory/generations/NNNNNNNN
-  .agents/skills/           native Codex skills, seeded and versioned from data/skills
-  .codex-home/              private CODEX_HOME: user config and auth symlink
+  MEMORIES/                 memory tree, a git repository tera commits to
+  .agents/skills/           skills you and the agent write, never touched by tera
+  .codex-home/              private CODEX_HOME: user config, auth symlink, tera's skills
   .runtime/                 socket, state.sqlite3, whatsapp_session.db
   history/                  history.sqlite3, jsonl/, assets/, backups/
   logs/                     daily log, pruned after 14 days
@@ -82,7 +80,7 @@ Official release assets are `tera-x86_64-unknown-linux-gnu`, `tera-aarch64-unkno
 
 Generated files carry an HTML comment marker and are rewritten every start, so an improved template reaches an existing workspace. Edit one by hand and Tera backs your copy up to `<file>.md.user-backup` and installs its own, so put your instructions in `PERSONA.md`, which is written once and left alone.
 
-Bundled skills are stored under `.agents/skills/`, the native Codex repository location. Every package in `data/skills/` is discovered at build time, with no individual Rust registration. Tera installs each package once, updates an untouched managed package when its embedded files change, and remembers user edits, existing paths, symlinks, and deletions. The nightly memory pass also compacts repeated technical work into one candidate for a new or improved skill. It only suggests. Implementation waits for approval, and Codex delegates when useful.
+Every package in `data/skills/` is discovered at build time, with no individual Rust registration, and installed under `<workspace>/.codex-home/skills/tera/`. Codex scans that tree because it scans CODEX_HOME, and Tera owns it outright, so the directory is deleted and rewritten on every start. That is the whole update story. Skills you write go in `.agents/skills/`, which Tera never touches, and copying one of Tera's out to that directory is how you keep a version of your own. The nightly memory pass also compacts repeated technical work into one candidate for a new or improved skill. It only suggests. Implementation waits for approval, and Codex delegates when useful.
 
 The audio skill uses [Aloud](https://github.com/isala404/aloud) locally for Q8 Audio8 speech recognition and synthesis. Setup verifies a pinned Aloud release under `<workspace>/.runtime/aloud/`. The exact Q8 GGUF models resolve through Aloud's Hugging Face support and remain cached for offline use. It transcribes audio or video soundtracks, creates WAV speech with the embedded voices, and can encode Ogg Opus replies that Tera sends as real WhatsApp voice notes. Nothing is billed per minute because inference stays on the machine.
 
@@ -112,8 +110,10 @@ Add `sudo loginctl enable-linger "$USER"` to keep it running while logged out. I
 
 ## Known rough edges
 
+- Codex calls `$CODEX_HOME/skills` a deprecated location and points new installs at `~/.agents/skills` instead. Tera's own skills live there anyway, because that keeps everything a workspace needs inside the workspace and leaves the home directory alone. Verified working on Codex CLI 0.149.0, and it needs rechecking whenever Codex moves.
+- Every thread is started with `project_root_markers = [".codex-home"]`, since Codex looks for the owner's `.agents/skills` only between the project root and the thread's working directory, and its default marker is `.git`, which the workspace does not have.
 - `rusqlite` is pinned at 0.39 on purpose. 0.40 needs `libsqlite3-sys` 0.38 while `whatsapp-rust-sqlite-storage` pins `^0.37`, and only one crate may link the native sqlite3 library. It moves when `whatsapp-rust` does.
-- The memory optimizer and rebuild prompts run as real Codex turns over your history and are the least tested part of this. Nobody has watched a nightly pass against a real model and confirmed the output is any good.
+- The nightly memory pass runs as a real Codex turn over your history and is the least tested part of this. Nobody has watched one against a real model and confirmed the output is any good.
 - Turns have no elapsed time cap, so a hung tool can hold a worker indefinitely. Process death and a closed event stream are the recovery boundaries.
 - Schedules use the host's local time, not a fixed timezone. Fly somewhere with the laptop and a `07:30` brief stays at `07:30` wherever it now thinks it is.
 - History backups accumulate forever, one per daemon start, with nothing pruning them.

@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+
+# One real inference against the selection, under `--strict-config`. That is
+# what the GLM switch needed and did not have: a plausible base URL passed every
+# static check and then returned 404 from `/responses`.
+#
+# `codex doctor` used to run first and was dropped. It also grades the terminal,
+# the desktop app and the update channel, so it fails on a headless machine for
+# reasons a model change cannot fix, and a green model then reads as broken.
+
+workspace=${1:-"$PWD"}
+skill_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+
+# Tera runs headless, and codex refuses to draw on a terminal it cannot size.
+case ${TERM:-} in
+    ""|dumb|unknown) TERM=xterm-256color ;;
+esac
+export TERM
+CODEX_HOME="$workspace/.codex-home"
+export CODEX_HOME
+
+codex exec --strict-config --ephemeral --skip-git-repo-check \
+    --sandbox read-only --color never --cd "$workspace" - \
+    < "$skill_dir/references/probe.md"

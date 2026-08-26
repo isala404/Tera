@@ -255,7 +255,11 @@ impl CodexSupervisor {
     /// through the `send_message` tool.
     pub async fn run_task_turn(&self, cwd: &Path, prompt: &str) -> Result<String> {
         let thread_id = self.start_isolated_thread(cwd).await?;
-        self.run_turn_on_thread(&thread_id, prompt).await
+        let result = self.run_turn_on_thread(&thread_id, prompt).await;
+        if let Err(error) = self.archive_thread(&thread_id).await {
+            warn!("Could not archive isolated thread {thread_id}: {error:?}");
+        }
+        result
     }
 
     /// Ask the app-server which models it offers.
@@ -269,6 +273,16 @@ impl CodexSupervisor {
         let lock = self.mgr.lock().await;
         match lock.as_ref() {
             Some(mgr) if !mgr.is_dead() => mgr.interrupt(thread_id).await,
+            _ => Ok(()),
+        }
+    }
+
+    /// Release a completed isolated thread without touching the main
+    /// conversation thread.
+    pub async fn archive_thread(&self, thread_id: &str) -> Result<()> {
+        let lock = self.mgr.lock().await;
+        match lock.as_ref() {
+            Some(mgr) if !mgr.is_dead() => mgr.archive_thread(thread_id).await,
             _ => Ok(()),
         }
     }

@@ -20,7 +20,6 @@ Lines use `TIMESTAMP LEVEL target: message` with no ANSI. The target narrows it 
 | `codex` | approvals granted, model reroutes, anything unhandled |
 | `mcp::tool` | your tool calls with arguments, result, timing and failures |
 | `tera::scheduler` | scheduled runs firing, skipped and failing, plus seeding |
-| `tera::memory` | nightly optimization, rebuilds, generation promotion |
 | `tera::transport` | WhatsApp connection, pairing, send failures |
 
 Start from the symptom's timestamp and read outwards, not from the top of the file.

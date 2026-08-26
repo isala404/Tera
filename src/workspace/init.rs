@@ -1,29 +1,16 @@
 use crate::config::Config;
 use crate::data;
-use crate::memory::generations::GenerationManager;
 use crate::workspace::templates::{self, GENERATED_MARKER_PREFIX};
-use anyhow::{anyhow, bail, Context, Result};
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::ffi::CString;
+use anyhow::{bail, Context, Result};
 use std::fs;
-use std::io::{self, ErrorKind};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::os::unix::ffi::OsStrExt;
+use std::io::ErrorKind;
 use std::os::unix::fs::{symlink, PermissionsExt};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 use std::process::Command;
 use tracing::{info, warn};
 
-#[cfg(target_os = "macos")]
-extern "C" {
-    fn renamex_np(
-        from: *const libc::c_char,
-        to: *const libc::c_char,
-        flags: libc::c_uint,
-    ) -> libc::c_int;
-}
+/// Programs tera or its instructions invoke by name. Checked once, at init.
+const REQUIRED_BINARIES: &[&str] = &["codex", "git", "python3", "sqlite3", "jq", "ffmpeg"];
 
 pub struct WorkspaceInit;
 
@@ -34,15 +21,17 @@ impl WorkspaceInit {
             config.workspace_dir, config.owner_name
         );
 
+        // Before anything is created. A workspace half-built by a run that then
+        // fails on a missing program is worse than one that was never started.
+        Self::require_binaries(REQUIRED_BINARIES)?;
+
         let dirs_to_create = vec![
             config.workspace_dir.clone(),
             config.runtime_dir(),
             config.runtime_dir().join("locks"),
             config.runtime_dir().join("tmp"),
             config.runtime_dir().join("media-cache"),
-            config.generations_dir(),
-            config.generations_dir().join("00000001"),
-            config.staging_dir(),
+            config.memories_dir(),
             config.logs_dir(),
             config.workspace_dir.join("history"),
             config.history_jsonl_dir(),
@@ -61,25 +50,19 @@ impl WorkspaceInit {
         // Seeded with the configured owner and nothing else. Anything more would
         // be this daemon inventing facts about someone it has not met; the agent
         // fills the rest in from conversation.
-        let gen1_dir = config.generations_dir().join("00000001");
         let memory_seeds = [
             ("INDEX.md", data::MEMORY_INDEX_SEED),
             ("HORIZON.md", data::MEMORY_HORIZON_SEED),
             ("USER.md", data::MEMORY_USER_SEED),
         ];
         for (filename, seed) in memory_seeds {
-            let path = gen1_dir.join(filename);
+            let path = config.memories_dir().join(filename);
             if !path.exists() {
                 fs::write(&path, templates::render(seed, config))?;
             }
         }
 
-        // Point `MEMORIES` at the newest generation. Not always at 00000001:
-        // re-init on an existing workspace must not roll memory back to the day
-        // it was created.
-        Self::remove_legacy_memories_link(config);
-        let active = GenerationManager::get_current_generation_num(config)?;
-        GenerationManager::point_memories_at(config, active)?;
+        Self::init_memory_repo(config)?;
 
         // Instruction files. Ours are refreshed every start so an improved
         // template actually reaches a live workspace; the user's persona file is
@@ -154,9 +137,6 @@ impl WorkspaceInit {
             }
         }
 
-        // Native skills are seeded once. Existing paths, edits, symlinks, and
-        // deliberate deletions remain user-owned; untouched managed packages can
-        // receive a later embedded update.
         Self::seed_builtin_skills(config)?;
 
         // Model and provider settings are user configuration. Tera passes its
@@ -165,324 +145,74 @@ impl WorkspaceInit {
 
         Self::link_codex_credentials(config);
 
-        Self::check_binary_dependencies();
-
         info!("Workspace initialization complete!");
         Ok(())
     }
 
-    /// Seed the user-owned Codex configuration, replacing only the generated
-    /// all-in-one file shipped by older Tera versions.
+    fn init_memory_repo(config: &Config) -> Result<()> {
+        let dir = config.memories_dir();
+
+        if !dir.join(".git").exists() {
+            git(&dir, &["init", "--quiet", "--initial-branch", "main"])?;
+            info!("Initialized the memory repository at {:?}", dir);
+        }
+
+        git(&dir, &["config", "user.name", MEMORY_AUTHOR_NAME])?;
+        git(&dir, &["config", "user.email", MEMORY_AUTHOR_EMAIL])?;
+        // Memory is prose the agent rewrites wholesale. Left to git's default
+        // this would be one merge conflict away from unreadable, and there is no
+        // second author to merge with anyway.
+        git(&dir, &["config", "merge.ours.driver", "true"])?;
+
+        let status = git_output(&dir, &["status", "--porcelain"])?;
+        if status.trim().is_empty() {
+            return Ok(());
+        }
+
+        git(&dir, &["add", "--all"])?;
+        git(&dir, &["commit", "--quiet", "-m", "Seed memory"])?;
+        info!("Committed the seeded memory tree");
+        Ok(())
+    }
+
+    /// Seed the Codex configuration file. Model and provider settings are the
+    /// owner's, so tera writes it once and never touches it again.
     fn seed_codex_config(config: &Config) -> Result<()> {
-        const LEGACY_GENERATED_PREFIX: &str = "# Auto-generated by tera init.";
-
-        let path = config.codex_config_path();
-        match fs::read_to_string(&path) {
-            Ok(existing) if !existing.starts_with(LEGACY_GENERATED_PREFIX) => Ok(()),
-            Ok(_) => {
-                fs::write(&path, templates::generate_codex_config())?;
-                info!("Migrated {path:?} to user-owned Codex configuration");
-                Ok(())
-            }
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                fs::write(&path, templates::generate_codex_config())?;
-                Ok(())
-            }
-            Err(error) => {
-                Err(error).with_context(|| format!("Failed to read Codex config at {:?}", path))
-            }
-        }
+        Self::write_file_if_missing(
+            &config.codex_config_path(),
+            &templates::generate_codex_config(),
+        )
     }
 
-    /// Delete the pre-1.2 lowercase `memories` symlink.
-    ///
-    /// The link is now `MEMORIES`, matching every other knowledge file here. On
-    /// macOS the two names are the same path, so this finds nothing; on Linux a
-    /// live workspace would otherwise keep both, and the stale one still resolves ,
-    /// which is worse than a broken link, because it silently keeps working while
-    /// nothing updates it.
-    ///
-    /// Only ever removes a symlink. A real directory under that name is somebody's
-    /// data and is left alone with a warning.
-    fn remove_legacy_memories_link(config: &Config) {
-        let legacy = config.legacy_memories_link();
-        if legacy == config.memories_link() {
-            return;
-        }
-        match fs::symlink_metadata(&legacy) {
-            Err(_) => {}
-            Ok(meta) if meta.file_type().is_symlink() => match fs::remove_file(&legacy) {
-                Ok(()) => info!("Removed the superseded {:?} symlink", legacy),
-                Err(e) => warn!("Could not remove {:?}: {e}", legacy),
-            },
-            Ok(_) => warn!(
-                "{:?} exists and is not a symlink; leaving it alone. Active memory is {:?}.",
-                legacy,
-                config.memories_link()
-            ),
-        }
-    }
-
-    /// Seed, update, or remember each bundled skill without taking ownership of
-    /// a path the user already has. The state file is outside .agents/skills so
-    /// deleting a built-in remains a durable choice.
     fn seed_builtin_skills(config: &Config) -> Result<()> {
-        let mut state = Self::load_builtin_skill_state(config)?;
-
+        // Before anything is removed, so an invalid package cannot leave the
+        // directory empty.
         for skill in crate::data::BUILTIN_SKILLS {
             validate_builtin_skill(skill)?;
-
-            let source_state = embedded_skill_state(skill);
-            let source_fingerprint = fingerprint_skill_state(&source_state);
-            let destination = config.skills_dir().join(skill.name);
-
-            match state.skills.get(skill.name).cloned() {
-                None => {
-                    if has_path(&destination) {
-                        // The first revision seeded packages before this state
-                        // file existed. An untouched package whose files are a
-                        // byte-for-byte subset of the new embedded package can
-                        // be migrated safely. Anything else is user-owned.
-                        if let Some(existing_state) = installed_skill_state(&destination)? {
-                            let legacy_managed = !existing_state.files.is_empty()
-                                && existing_state.files.iter().all(|(path, fingerprint)| {
-                                    source_state.files.get(path) == Some(fingerprint)
-                                })
-                                && existing_state.files.keys().all(|path| {
-                                    existing_state.executables.contains(path)
-                                        == source_state.executables.contains(path)
-                                });
-                            if legacy_managed
-                                && Self::update_managed_skill(
-                                    &config.skills_dir(),
-                                    skill,
-                                    &existing_state,
-                                )?
-                            {
-                                info!(
-                                    "Migrated untouched built-in skill {:?} at {:?}",
-                                    skill.name, destination
-                                );
-                                state.skills.insert(
-                                    skill.name.to_string(),
-                                    BuiltinSkillRecord::managed(source_fingerprint, source_state),
-                                );
-                                continue;
-                            }
-                        }
-                        warn!(
-                            "Built-in skill {:?} already exists at {:?}; treating it as user-owned",
-                            skill.name, destination
-                        );
-                        state
-                            .skills
-                            .insert(skill.name.to_string(), BuiltinSkillRecord::user_owned());
-                        continue;
-                    }
-
-                    if Self::install_new_skill(&config.skills_dir(), skill)? {
-                        info!(
-                            "Seeded built-in skill {:?} at {:?}",
-                            skill.name, destination
-                        );
-                        state.skills.insert(
-                            skill.name.to_string(),
-                            BuiltinSkillRecord::managed(source_fingerprint, source_state),
-                        );
-                    } else if has_path(&destination) {
-                        state
-                            .skills
-                            .insert(skill.name.to_string(), BuiltinSkillRecord::user_owned());
-                    }
-                }
-                Some(mut record) => match record.status {
-                    BuiltinSkillStatus::Deleted | BuiltinSkillStatus::UserOwned => {}
-                    BuiltinSkillStatus::Managed => {
-                        if !has_path(&destination) {
-                            info!(
-                                "Built-in skill {:?} was deleted; preserving that choice",
-                                skill.name
-                            );
-                            record.status = BuiltinSkillStatus::Deleted;
-                            state.skills.insert(skill.name.to_string(), record);
-                            continue;
-                        }
-
-                        let Some(installed_state) = installed_skill_state(&destination)? else {
-                            warn!(
-                                "Built-in skill {:?} changed at {:?}; preserving it as user-owned",
-                                skill.name, destination
-                            );
-                            record.status = BuiltinSkillStatus::UserOwned;
-                            state.skills.insert(skill.name.to_string(), record);
-                            continue;
-                        };
-
-                        // State written before executable modes were tracked can
-                        // be upgraded only when its installed modes match this
-                        // build. A mismatch may be a deliberate user edit.
-                        if record.executables.is_empty() {
-                            if installed_state.executables != source_state.executables {
-                                warn!(
-                                    "Built-in skill {:?} has untracked mode changes at {:?}; preserving it as user-owned",
-                                    skill.name, destination
-                                );
-                                record.status = BuiltinSkillStatus::UserOwned;
-                                state.skills.insert(skill.name.to_string(), record);
-                                continue;
-                            }
-                            record.executables = installed_state.executables.clone();
-                            record.fingerprint = fingerprint_skill_state(&installed_state);
-                        }
-
-                        let expected_state = record.package_state();
-                        if installed_state != expected_state {
-                            warn!(
-                                "Built-in skill {:?} changed at {:?}; preserving it as user-owned",
-                                skill.name, destination
-                            );
-                            record.status = BuiltinSkillStatus::UserOwned;
-                            state.skills.insert(skill.name.to_string(), record);
-                            continue;
-                        }
-
-                        if record.fingerprint != source_fingerprint {
-                            if Self::update_managed_skill(
-                                &config.skills_dir(),
-                                skill,
-                                &expected_state,
-                            )? {
-                                info!(
-                                    "Updated built-in skill {:?} at {:?}",
-                                    skill.name, destination
-                                );
-                                record =
-                                    BuiltinSkillRecord::managed(source_fingerprint, source_state);
-                            } else {
-                                warn!(
-                                    "Built-in skill {:?} changed while updating; preserving it as user-owned",
-                                    skill.name
-                                );
-                                record.status = BuiltinSkillStatus::UserOwned;
-                            }
-                        }
-                        state.skills.insert(skill.name.to_string(), record);
-                    }
-                },
-            }
         }
 
-        Self::write_builtin_skill_state(config, &state)
-    }
-
-    fn install_new_skill(skills_dir: &Path, skill: &crate::data::BuiltinSkill) -> Result<bool> {
-        let destination = skills_dir.join(skill.name);
-        let staging = Self::create_skill_staging(skills_dir, skill.name)?;
-        let install = (|| -> Result<bool> {
-            write_skill_files(&staging, skill)?;
-
-            // Check again after writing. This prevents a normal concurrent
-            // initializer from being replaced if it appeared during staging.
-            if has_path(&destination) {
-                return Ok(false);
-            }
-            rename_skill_without_replace(&staging, &destination)
-        })();
-
-        let installed = match install {
-            Ok(installed) => installed,
+        let root = config.builtin_skills_dir();
+        match fs::remove_dir_all(&root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => {
-                let _ = fs::remove_dir_all(&staging);
-                return Err(error);
-            }
-        };
-        if !installed {
-            let _ = fs::remove_dir_all(&staging);
-        }
-        Ok(installed)
-    }
-
-    /// Replace a package only after confirming that its files still match the
-    /// last embedded version. The old managed directory is kept as a temporary
-    /// backup until the new one is in place, so a failed rename can be restored.
-    fn update_managed_skill(
-        skills_dir: &Path,
-        skill: &crate::data::BuiltinSkill,
-        expected_state: &SkillPackageState,
-    ) -> Result<bool> {
-        let destination = skills_dir.join(skill.name);
-        let staging = Self::create_skill_staging(skills_dir, skill.name)?;
-        let install = (|| -> Result<bool> {
-            write_skill_files(&staging, skill)?;
-            if installed_skill_state(&destination)?.as_ref() != Some(expected_state) {
-                return Ok(false);
-            }
-
-            let backup = free_skill_aux_path(skills_dir, skill.name, "backup")?;
-            fs::rename(&destination, &backup)
-                .with_context(|| format!("failed to stage old built-in skill {destination:?}"))?;
-            match fs::rename(&staging, &destination) {
-                Ok(()) => {
-                    fs::remove_dir_all(&backup).with_context(|| {
-                        format!("failed to remove old built-in skill {backup:?}")
-                    })?;
-                    Ok(true)
-                }
-                Err(error) => {
-                    let _ = fs::rename(&backup, &destination);
-                    Err(error).with_context(|| {
-                        format!("failed to install updated built-in skill {destination:?}")
-                    })
-                }
-            }
-        })();
-
-        match install {
-            Ok(updated) => {
-                if !updated {
-                    let _ = fs::remove_dir_all(&staging);
-                }
-                Ok(updated)
-            }
-            Err(error) => {
-                let _ = fs::remove_dir_all(&staging);
-                Err(error)
+                return Err(error).with_context(|| format!("failed to clear {root:?}"));
             }
         }
-    }
 
-    fn load_builtin_skill_state(config: &Config) -> Result<BuiltinSkillState> {
-        match fs::read(config.builtin_skills_state_path()) {
-            Ok(bytes) => serde_json::from_slice(&bytes).context("invalid built-in skill state"),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(BuiltinSkillState::default()),
-            Err(error) => Err(error).context("failed to read built-in skill state"),
+        for skill in crate::data::BUILTIN_SKILLS {
+            let destination = root.join(skill.name);
+            fs::create_dir_all(&destination)
+                .with_context(|| format!("failed to create {destination:?}"))?;
+            write_skill_files(&destination, skill)?;
         }
-    }
 
-    fn write_builtin_skill_state(config: &Config, state: &BuiltinSkillState) -> Result<()> {
-        let contents =
-            serde_json::to_vec_pretty(state).context("failed to encode built-in skill state")?;
-        crate::runtime::write_atomic(&config.builtin_skills_state_path(), &contents, 0o644)
-    }
-
-    fn create_skill_staging(skills_dir: &Path, skill_name: &str) -> Result<PathBuf> {
-        for attempt in 0..1000 {
-            let suffix = format!(".{}-staging-{}-{}", skill_name, std::process::id(), attempt);
-            let path = skills_dir.join(suffix);
-            match fs::create_dir(&path) {
-                Ok(()) => return Ok(path),
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("Failed to create skill staging directory {:?}", path)
-                    });
-                }
-            }
-        }
-        Err(anyhow!(
-            "Could not find a free staging directory for skill {:?}",
-            skill_name
-        ))
+        info!(
+            "Wrote {} built-in skills to {:?}",
+            crate::data::BUILTIN_SKILLS.len(),
+            root
+        );
+        Ok(())
     }
 
     /// Point `<workspace>/.codex-home/auth.json` at the operator's real Codex
@@ -570,69 +300,56 @@ impl WorkspaceInit {
         first
     }
 
-    fn check_binary_dependencies() {
-        let tools = vec!["git", "sqlite3", "jq", "ffmpeg", "codex"];
-        for tool in tools {
-            if Command::new(tool).arg("--version").output().is_err() {
-                warn!("Optional/required system tool '{}' not found in PATH", tool);
-            }
+    /// Refuse to initialize without the programs the workspace is built on.
+    ///
+    /// These are not optional. `codex` runs every turn, `git` is the memory
+    /// store, and the instructions hand the agent `sqlite3`, `jq`, `python3` and
+    /// `ffmpeg` by name. A missing one used to be a startup warning nobody read,
+    /// and then a turn that failed hours later with an error about something
+    /// else. Failing here names the real problem once.
+    fn require_binaries(required: &[&str]) -> Result<()> {
+        let missing: Vec<&str> = required
+            .iter()
+            .copied()
+            .filter(|tool| crate::runtime::executable_on_path(tool).is_err())
+            .collect();
+
+        if missing.is_empty() {
+            return Ok(());
         }
+
+        bail!(
+            "tera needs these programs on PATH and cannot find them: {}. \
+             Install them and run tera again.",
+            missing.join(", ")
+        )
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct BuiltinSkillState {
-    skills: BTreeMap<String, BuiltinSkillRecord>,
+/// Who commits to the memory repository. Set per-repository, never globally.
+const MEMORY_AUTHOR_NAME: &str = "Tera";
+const MEMORY_AUTHOR_EMAIL: &str = "tera@localhost";
+
+fn git(dir: &Path, args: &[&str]) -> Result<()> {
+    git_output(dir, args).map(|_| ())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BuiltinSkillRecord {
-    status: BuiltinSkillStatus,
-    fingerprint: String,
-    files: BTreeMap<String, String>,
-    #[serde(default)]
-    executables: BTreeSet<String>,
-}
+fn git_output(dir: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .with_context(|| format!("could not run git {}", args.join(" ")))?;
 
-impl BuiltinSkillRecord {
-    fn managed(fingerprint: String, package: SkillPackageState) -> Self {
-        Self {
-            status: BuiltinSkillStatus::Managed,
-            fingerprint,
-            files: package.files,
-            executables: package.executables,
-        }
+    if !output.status.success() {
+        bail!(
+            "git {} failed in {}: {}",
+            args.join(" "),
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
-
-    fn user_owned() -> Self {
-        Self {
-            status: BuiltinSkillStatus::UserOwned,
-            fingerprint: String::new(),
-            files: BTreeMap::new(),
-            executables: BTreeSet::new(),
-        }
-    }
-
-    fn package_state(&self) -> SkillPackageState {
-        SkillPackageState {
-            files: self.files.clone(),
-            executables: self.executables.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SkillPackageState {
-    files: BTreeMap<String, String>,
-    executables: BTreeSet<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum BuiltinSkillStatus {
-    Managed,
-    UserOwned,
-    Deleted,
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn validate_builtin_skill(skill: &crate::data::BuiltinSkill) -> Result<()> {
@@ -670,120 +387,6 @@ fn write_skill_files(staging: &Path, skill: &crate::data::BuiltinSkill) -> Resul
     Ok(())
 }
 
-fn embedded_skill_state(skill: &crate::data::BuiltinSkill) -> SkillPackageState {
-    SkillPackageState {
-        files: skill
-            .files
-            .iter()
-            .map(|file| (file.relative_path.to_string(), fingerprint(file.contents)))
-            .collect(),
-        executables: skill
-            .files
-            .iter()
-            .filter(|file| file.executable)
-            .map(|file| file.relative_path.to_string())
-            .collect(),
-    }
-}
-
-fn fingerprint_skill_state(state: &SkillPackageState) -> String {
-    let mut bytes = Vec::new();
-    for (path, fingerprint) in &state.files {
-        bytes.extend_from_slice(path.as_bytes());
-        bytes.push(0);
-        bytes.extend_from_slice(fingerprint.as_bytes());
-        bytes.push(u8::from(state.executables.contains(path)));
-        bytes.push(0xff);
-    }
-    fingerprint(&bytes)
-}
-
-/// A stable, dependency-free content fingerprint. It detects accidental or
-/// user edits; it is not used as a security boundary.
-fn fingerprint(bytes: &[u8]) -> String {
-    let mut hash = 14_695_981_039_346_656_037u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(1_099_511_628_211);
-    }
-    format!("{hash:016x}")
-}
-
-fn installed_skill_state(path: &Path) -> Result<Option<SkillPackageState>> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("failed to inspect {path:?}")),
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Ok(None);
-    }
-
-    let mut state = SkillPackageState {
-        files: BTreeMap::new(),
-        executables: BTreeSet::new(),
-    };
-    if !collect_installed_state(path, path, &mut state)? {
-        return Ok(None);
-    }
-    Ok(Some(state))
-}
-
-fn collect_installed_state(
-    root: &Path,
-    current: &Path,
-    state: &mut SkillPackageState,
-) -> Result<bool> {
-    for entry in fs::read_dir(current).with_context(|| format!("failed to read {current:?}"))? {
-        let path = entry?.path();
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() {
-            return Ok(false);
-        }
-        if metadata.is_dir() {
-            if !collect_installed_state(root, &path, state)? {
-                return Ok(false);
-            }
-        } else if metadata.is_file() {
-            let relative = path
-                .strip_prefix(root)
-                .map_err(|_| anyhow!("skill path escaped its root: {path:?}"))?
-                .to_string_lossy()
-                .replace(std::path::MAIN_SEPARATOR, "/");
-            if !is_safe_skill_path(&relative) {
-                return Ok(false);
-            }
-            let contents = fs::read(&path)?;
-            state.files.insert(relative.clone(), fingerprint(&contents));
-            if metadata.permissions().mode() & 0o111 != 0 {
-                state.executables.insert(relative);
-            }
-        } else {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn has_path(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok()
-}
-
-fn free_skill_aux_path(skills_dir: &Path, skill_name: &str, kind: &str) -> Result<PathBuf> {
-    for attempt in 0..1000 {
-        let path = skills_dir.join(format!(
-            ".{skill_name}-{kind}-{}-{attempt}",
-            std::process::id()
-        ));
-        if !has_path(&path) {
-            return Ok(path);
-        }
-    }
-    Err(anyhow!(
-        "could not find a free {kind} path for skill {skill_name:?}"
-    ))
-}
-
 fn is_safe_skill_path(path: &str) -> bool {
     let path = Path::new(path);
     !path.as_os_str().is_empty()
@@ -796,71 +399,6 @@ fn is_safe_skill_path(path: &str) -> bool {
 /// Move a fully written package into place without replacing a user path.
 /// Linux has a native no-replace rename. Other supported Unix systems retain
 /// the final existence check and report an existing destination as a skip.
-fn rename_skill_without_replace(staging: &Path, destination: &Path) -> Result<bool> {
-    #[cfg(target_os = "linux")]
-    {
-        let source = CString::new(staging.as_os_str().as_bytes())
-            .context("skill staging path contains a NUL byte")?;
-        let target = CString::new(destination.as_os_str().as_bytes())
-            .context("skill destination path contains a NUL byte")?;
-        let result = unsafe {
-            libc::renameat2(
-                libc::AT_FDCWD,
-                source.as_ptr(),
-                libc::AT_FDCWD,
-                target.as_ptr(),
-                libc::RENAME_NOREPLACE,
-            )
-        };
-        if result == 0 {
-            return Ok(true);
-        }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::EEXIST) {
-            return Ok(false);
-        }
-        Err(error).with_context(|| {
-            format!(
-                "Failed to install built-in skill at {:?} without replacing an existing path",
-                destination
-            )
-        })
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        const RENAME_EXCL: libc::c_uint = 0x0000_0004;
-        let source = CString::new(staging.as_os_str().as_bytes())
-            .context("skill staging path contains a NUL byte")?;
-        let target = CString::new(destination.as_os_str().as_bytes())
-            .context("skill destination path contains a NUL byte")?;
-        let result = unsafe { renamex_np(source.as_ptr(), target.as_ptr(), RENAME_EXCL) };
-        if result == 0 {
-            return Ok(true);
-        }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::EEXIST) {
-            return Ok(false);
-        }
-        Err(error).with_context(|| {
-            format!(
-                "Failed to install built-in skill at {:?} without replacing an existing path",
-                destination
-            )
-        })
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        match fs::rename(staging, destination) {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(false),
-            Err(error) => Err(error)
-                .with_context(|| format!("Failed to install built-in skill at {:?}", destination)),
-        }
-    }
-}
-
 /// The operator's home directory. Kept local instead of pulling in a crate for
 /// one lookup; the daemon only targets Unix.
 fn dirs_home() -> Option<std::path::PathBuf> {
@@ -871,6 +409,23 @@ fn dirs_home() -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    #[test]
+    fn test_a_missing_program_stops_initialization_and_names_it() {
+        let error = WorkspaceInit::require_binaries(&["git", "tera-no-such-program"]).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("tera-no-such-program"), "{message}");
+        // Only the missing one. A list that also names what is installed sends
+        // the owner looking in the wrong place.
+        assert!(!message.contains("git"), "{message}");
+    }
+
+    /// Every program the daemon and the shipped instructions invoke by name. If
+    /// one of these is not really required, it does not belong in the list.
+    #[test]
+    fn test_the_required_programs_are_present_here() {
+        WorkspaceInit::require_binaries(REQUIRED_BINARIES).unwrap();
+    }
 
     #[test]
     fn test_init_is_idempotent() {
@@ -904,25 +459,6 @@ mod tests {
             fs::read_to_string(config.codex_config_path()).unwrap(),
             custom
         );
-    }
-
-    #[test]
-    fn test_legacy_generated_codex_config_is_migrated_once() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = Config::new(tmp.path().to_path_buf(), true);
-        fs::create_dir_all(config.codex_home_dir()).unwrap();
-        fs::write(
-            config.codex_config_path(),
-            "# Auto-generated by tera init. Regenerated on every start:\nold = true\n",
-        )
-        .unwrap();
-
-        WorkspaceInit::init(&config).unwrap();
-
-        let migrated = fs::read_to_string(config.codex_config_path()).unwrap();
-        assert!(migrated.contains("Leave it empty to use Codex's defaults"));
-        assert!(!migrated.contains("model ="));
-        assert!(!migrated.contains("old = true"));
     }
 
     /// The user's own file is his. Re-init must not touch it.
@@ -979,32 +515,6 @@ mod tests {
             .starts_with(GENERATED_MARKER_PREFIX));
     }
 
-    /// The marker names the product and says where user edits belong, so its
-    /// wording changes, at the rename to tera, it changed for every file. If
-    /// detection matched the whole marker, every workspace would have had its own
-    /// instructions filed away as hand-written on the next start.
-    #[test]
-    fn test_an_older_marker_wording_is_still_recognised_as_ours() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = Config::new(tmp.path().to_path_buf(), true);
-        WorkspaceInit::init(&config).unwrap();
-
-        fs::write(
-            config.root_agents_path(),
-            "<!-- generated: assistantd. Edits are overwritten; put yours in PERSONA.md -->\n# Old\n",
-        )
-        .unwrap();
-        WorkspaceInit::init(&config).unwrap();
-
-        assert!(
-            !config
-                .root_agents_path()
-                .with_extension("md.user-backup")
-                .exists(),
-            "our own file was mistaken for the user's"
-        );
-    }
-
     /// The second time a hand-written file turns up, the first backup must
     /// survive. It is the only copy of what the user actually wrote.
     #[test]
@@ -1040,26 +550,57 @@ mod tests {
     }
 
     #[test]
-    fn test_builtin_skill_is_seeded_atomically_and_preserved() {
+    fn test_builtin_skills_land_where_codex_finds_them() {
         let tmp = tempfile::tempdir().unwrap();
         let config = Config::new(tmp.path().to_path_buf(), true);
-        let builtin = crate::data::BUILTIN_SKILLS.first().unwrap();
-
         WorkspaceInit::init(&config).unwrap();
-        let skill = config.skills_dir().join(builtin.name);
-        assert!(skill.join("SKILL.md").exists());
-        let first_file = builtin.files.first().unwrap();
-        let first_path = skill.join(first_file.relative_path);
-        let original = fs::read(&first_path).unwrap();
 
-        fs::write(&first_path, b"user-owned\n").unwrap();
-        WorkspaceInit::init(&config).unwrap();
-        assert_eq!(fs::read(&first_path).unwrap(), b"user-owned\n");
-        assert_ne!(original, b"user-owned\n");
+        for builtin in crate::data::BUILTIN_SKILLS {
+            let skill = config.builtin_skills_dir().join(builtin.name);
+            assert!(skill.join("SKILL.md").exists(), "{:?}", skill);
+        }
+        // Codex reads CODEX_HOME/skills recursively, so this is the path it
+        // scans. A test that only checked the directory tera writes would pass
+        // with the skills somewhere codex never looks.
+        assert!(config
+            .builtin_skills_dir()
+            .starts_with(config.codex_home_dir().join("skills")));
     }
 
     #[test]
-    fn test_builtin_skill_executable_mode_is_seeded_and_tracked() {
+    fn test_an_edited_builtin_skill_is_rewritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Config::new(tmp.path().to_path_buf(), true);
+        let builtin = crate::data::BUILTIN_SKILLS.first().unwrap();
+        WorkspaceInit::init(&config).unwrap();
+
+        let file = config
+            .builtin_skills_dir()
+            .join(builtin.name)
+            .join(builtin.files.first().unwrap().relative_path);
+        let shipped = fs::read(&file).unwrap();
+        fs::write(&file, b"edited\n").unwrap();
+        WorkspaceInit::init(&config).unwrap();
+
+        assert_eq!(fs::read(&file).unwrap(), shipped);
+    }
+
+    #[test]
+    fn test_a_skill_tera_no_longer_ships_is_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Config::new(tmp.path().to_path_buf(), true);
+        WorkspaceInit::init(&config).unwrap();
+
+        let stale = config.builtin_skills_dir().join("retired");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("SKILL.md"), "old\n").unwrap();
+        WorkspaceInit::init(&config).unwrap();
+
+        assert!(!stale.exists());
+    }
+
+    #[test]
+    fn test_executable_mode_is_written() {
         let tmp = tempfile::tempdir().unwrap();
         let config = Config::new(tmp.path().to_path_buf(), true);
         let builtin = crate::data::BUILTIN_SKILLS
@@ -1074,105 +615,29 @@ mod tests {
         assert!(script.executable);
 
         WorkspaceInit::init(&config).unwrap();
+
         let installed = config
-            .skills_dir()
+            .builtin_skills_dir()
             .join(builtin.name)
             .join(script.relative_path);
         assert_ne!(
             fs::metadata(&installed).unwrap().permissions().mode() & 0o111,
             0
         );
-
-        fs::set_permissions(&installed, fs::Permissions::from_mode(0o644)).unwrap();
-        WorkspaceInit::init(&config).unwrap();
-
-        assert_eq!(
-            fs::metadata(&installed).unwrap().permissions().mode() & 0o111,
-            0
-        );
-        let state: serde_json::Value =
-            serde_json::from_slice(&fs::read(config.builtin_skills_state_path()).unwrap()).unwrap();
-        assert_eq!(state["skills"][builtin.name]["status"], "user-owned");
     }
 
     #[test]
-    fn test_untracked_skill_mode_change_is_preserved() {
+    fn test_the_owners_own_skills_are_left_alone() {
         let tmp = tempfile::tempdir().unwrap();
         let config = Config::new(tmp.path().to_path_buf(), true);
-        let builtin = crate::data::BUILTIN_SKILLS
-            .iter()
-            .find(|skill| skill.name == "spotify")
-            .unwrap();
-        let skill_path = config.skills_dir().join(builtin.name);
-        fs::create_dir_all(&skill_path).unwrap();
-        write_skill_files(&skill_path, builtin).unwrap();
-        let script = skill_path.join("scripts/spotify");
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).unwrap();
-
         WorkspaceInit::init(&config).unwrap();
 
-        assert_eq!(
-            fs::metadata(&script).unwrap().permissions().mode() & 0o111,
-            0
-        );
-        let state: serde_json::Value =
-            serde_json::from_slice(&fs::read(config.builtin_skills_state_path()).unwrap()).unwrap();
-        assert_eq!(state["skills"][builtin.name]["status"], "user-owned");
-    }
-
-    #[test]
-    fn test_skill_fingerprint_includes_executable_mode() {
-        let mut state = SkillPackageState {
-            files: BTreeMap::from([("scripts/tool".to_string(), "contents".to_string())]),
-            executables: BTreeSet::new(),
-        };
-        let regular = fingerprint_skill_state(&state);
-        state.executables.insert("scripts/tool".to_string());
-
-        assert_ne!(fingerprint_skill_state(&state), regular);
-    }
-
-    #[test]
-    fn test_existing_skill_directory_and_dangling_symlink_are_preserved() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = Config::new(tmp.path().to_path_buf(), true);
-        let builtin = crate::data::BUILTIN_SKILLS.first().unwrap();
-        let skill_path = config.skills_dir().join(builtin.name);
-        fs::create_dir_all(&skill_path).unwrap();
-        fs::write(skill_path.join("SKILL.md"), "user skill\n").unwrap();
-        WorkspaceInit::init(&config).unwrap();
-        assert_eq!(
-            fs::read_to_string(skill_path.join("SKILL.md")).unwrap(),
-            "user skill\n"
-        );
-
-        let symlink_tmp = tempfile::tempdir().unwrap();
-        let symlink_config = Config::new(symlink_tmp.path().to_path_buf(), true);
-        fs::create_dir_all(symlink_config.skills_dir()).unwrap();
-        let symlink_path = symlink_config.skills_dir().join(builtin.name);
-        symlink(symlink_tmp.path().join("missing-target"), &symlink_path).unwrap();
-        WorkspaceInit::init(&symlink_config).unwrap();
-        assert!(fs::symlink_metadata(symlink_path)
-            .unwrap()
-            .file_type()
-            .is_symlink());
-    }
-
-    #[test]
-    fn test_deleting_a_managed_skill_is_not_reversed_on_reinit() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = Config::new(tmp.path().to_path_buf(), true);
-        let builtin = crate::data::BUILTIN_SKILLS.first().unwrap();
-
-        WorkspaceInit::init(&config).unwrap();
-        fs::remove_dir_all(config.skills_dir().join(builtin.name)).unwrap();
-        WorkspaceInit::init(&config).unwrap();
+        let mine = config.skills_dir().join("mine");
+        fs::create_dir_all(&mine).unwrap();
+        fs::write(mine.join("SKILL.md"), "mine\n").unwrap();
         WorkspaceInit::init(&config).unwrap();
 
-        assert!(!has_path(&config.skills_dir().join(builtin.name)));
-        let state: serde_json::Value =
-            serde_json::from_slice(&fs::read(config.builtin_skills_state_path()).unwrap()).unwrap();
-        assert_eq!(state["skills"][builtin.name]["status"], "deleted");
+        assert_eq!(fs::read_to_string(mine.join("SKILL.md")).unwrap(), "mine\n");
     }
 
     #[test]
@@ -1182,19 +647,5 @@ mod tests {
         assert!(!is_safe_skill_path("../outside"));
         assert!(!is_safe_skill_path("scripts/../outside"));
         assert!(!is_safe_skill_path("/absolute"));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn test_skill_installation_does_not_replace_a_racing_destination() {
-        let tmp = tempfile::tempdir().unwrap();
-        let staging = tmp.path().join("staging");
-        let destination = tmp.path().join("skill");
-        fs::create_dir(&staging).unwrap();
-        fs::create_dir(&destination).unwrap();
-
-        assert!(!rename_skill_without_replace(&staging, &destination).unwrap());
-        assert!(staging.exists());
-        assert!(destination.exists());
     }
 }

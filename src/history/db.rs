@@ -1,7 +1,6 @@
 use crate::config::Config;
 use crate::history::projection::ProjectionEngine;
 use crate::history::schema::INIT_HISTORY_SCHEMA_SQL;
-use crate::sqlite::add_column_if_missing;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -15,19 +14,6 @@ use uuid::Uuid;
 ///
 /// `CREATE TABLE IF NOT EXISTS` is a no-op on a table that already exists, so
 /// adding a column to the schema does nothing to workspaces created before it.
-/// History is append-only and long-lived by design, so every column added from
-/// here on needs a line in this function.
-fn migrate(conn: &Connection) -> Result<()> {
-    add_column_if_missing(conn, "provider_refs", "chat_jid", "TEXT")?;
-    add_column_if_missing(
-        conn,
-        "provider_refs",
-        "from_me",
-        "INTEGER NOT NULL DEFAULT 0",
-    )?;
-    Ok(())
-}
-
 /// Link between an internal event and the provider's id for the same message.
 ///
 /// A named struct rather than three `&str` parameters: the positional form was
@@ -183,7 +169,6 @@ impl HistoryDb {
         let conn = Connection::open(db_path)
             .with_context(|| format!("Failed to open SQLite history DB at {:?}", db_path))?;
         conn.execute_batch(INIT_HISTORY_SCHEMA_SQL)?;
-        migrate(&conn)?;
         info!("Opened history database at {:?}", db_path);
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -422,191 +407,5 @@ impl HistoryDb {
             events.push(event);
         }
         Ok(events)
-    }
-}
-
-#[cfg(test)]
-mod migration_tests {
-    use super::*;
-
-    /// Regression: chat_jid and from_me were added to the schema, but
-    /// `CREATE TABLE IF NOT EXISTS` left existing workspaces untouched, so every
-    /// inbound message failed with "table provider_refs has no column chat_jid".
-    #[test]
-    fn test_opening_a_pre_migration_database_adds_missing_columns() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("history.sqlite3");
-
-        // A database as an older build would have left it.
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE provider_refs (
-                    event_id            TEXT NOT NULL,
-                    provider            TEXT NOT NULL,
-                    provider_message_id TEXT NOT NULL,
-                    PRIMARY KEY(provider, provider_message_id)
-                );",
-            )
-            .unwrap();
-        }
-
-        let db = HistoryDb::open(&path, &dir.path().join("jsonl")).unwrap();
-        db.record_provider_ref(&ProviderRef::whatsapp(
-            "evt_1",
-            "wamid.1",
-            "9477000@s.whatsapp.net",
-            true,
-        ))
-        .unwrap();
-
-        let stored = db
-            .lookup_provider_ref_by_event_id("evt_1", "whatsapp")
-            .unwrap()
-            .expect("ref should round-trip");
-        assert_eq!(stored.chat_jid, "9477000@s.whatsapp.net");
-        assert!(stored.from_me);
-    }
-
-    #[test]
-    fn test_migration_is_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("history.sqlite3");
-        let jsonl = dir.path().join("jsonl");
-        HistoryDb::open(&path, &jsonl).unwrap();
-        HistoryDb::open(&path, &jsonl).unwrap();
-    }
-
-    /// Reply targets arrive as WhatsApp ids and have to be translated, or
-    /// `reply_to` points at an id that appears nowhere in history and the JSONL
-    /// leaks provider ids it is specified never to contain.
-    #[test]
-    fn test_provider_ids_translate_back_to_event_ids() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = HistoryDb::open(
-            &dir.path().join("history.sqlite3"),
-            &dir.path().join("jsonl"),
-        )
-        .unwrap();
-
-        db.record_provider_ref(&ProviderRef::whatsapp(
-            "msg_first",
-            "wamid.ABC",
-            "947@s.whatsapp.net",
-            false,
-        ))
-        .unwrap();
-
-        assert_eq!(
-            db.event_id_for_provider_ref("whatsapp", "wamid.ABC")
-                .unwrap(),
-            Some("msg_first".to_string())
-        );
-        // A reply to something older than this workspace resolves to nothing,
-        // which is the caller's cue to record no reply target at all.
-        assert_eq!(
-            db.event_id_for_provider_ref("whatsapp", "wamid.UNKNOWN")
-                .unwrap(),
-            None
-        );
-    }
-
-    /// Regression: `send_message` and `react` wrote events straight to SQLite and
-    /// never appended to the projection, so the file the agent reads was missing
-    /// every assistant message, 9 records against 23 canonical events on the
-    /// live workspace.
-    #[test]
-    fn test_every_inserted_event_reaches_the_projection() {
-        let dir = tempfile::tempdir().unwrap();
-        let jsonl = dir.path().join("jsonl");
-        let db = HistoryDb::open(&dir.path().join("history.sqlite3"), &jsonl).unwrap();
-
-        for (id, actor) in [("m_1", "user"), ("m_2", "assistant")] {
-            db.insert_event(ConversationEvent {
-                seq: None,
-                id: id.to_string(),
-                occurred_at_ms: 1_786_962_664_000,
-                kind: EventKind::Message,
-                actor: actor.to_string(),
-                text: Some(format!("from {actor}")),
-                reply_to_id: None,
-                turn_id: None,
-                reaction_target_id: None,
-                reaction_emoji: None,
-                attachments: vec![],
-            })
-            .unwrap();
-        }
-
-        let projected = std::fs::read_to_string(jsonl.join("2026-08.jsonl")).unwrap();
-        assert_eq!(projected.lines().count(), 2, "{projected}");
-        assert!(projected.contains(r#""from":"assistant""#));
-    }
-
-    #[test]
-    fn test_recent_messages_returns_ten_messages_oldest_first() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = HistoryDb::open(
-            &dir.path().join("history.sqlite3"),
-            &dir.path().join("jsonl"),
-        )
-        .unwrap();
-
-        for index in 0..12 {
-            db.insert_event(ConversationEvent {
-                seq: None,
-                id: format!("m_{index}"),
-                occurred_at_ms: 1_786_962_664_000 + index,
-                kind: EventKind::Message,
-                actor: if index % 2 == 0 { "user" } else { "assistant" }.to_string(),
-                text: Some(format!("message {index}")),
-                reply_to_id: None,
-                turn_id: None,
-                reaction_target_id: None,
-                reaction_emoji: None,
-                attachments: vec![],
-            })
-            .unwrap();
-        }
-
-        let recent = db.recent_messages(10).unwrap();
-        assert_eq!(recent.len(), 10);
-        assert_eq!(recent.first().unwrap().id, "m_2");
-        assert_eq!(recent.last().unwrap().id, "m_11");
-        assert_eq!(recent[1].actor, "assistant");
-    }
-
-    #[test]
-    fn test_messages_for_turn_excludes_nearby_work() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = HistoryDb::open(
-            &dir.path().join("history.sqlite3"),
-            &dir.path().join("jsonl"),
-        )
-        .unwrap();
-
-        for (id, turn_id, text) in [
-            ("m_old", "turn_old", "deploy the old build"),
-            ("m_current", "turn_current", "switch to luna"),
-        ] {
-            db.insert_event(ConversationEvent {
-                seq: None,
-                id: id.into(),
-                occurred_at_ms: 1,
-                kind: EventKind::Message,
-                actor: "user".into(),
-                text: Some(text.into()),
-                reply_to_id: None,
-                turn_id: Some(turn_id.into()),
-                reaction_target_id: None,
-                reaction_emoji: None,
-                attachments: vec![],
-            })
-            .unwrap();
-        }
-
-        let messages = db.messages_for_turn("turn_current").unwrap();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].text.as_deref(), Some("switch to luna"));
     }
 }

@@ -7,9 +7,6 @@ use tera::config::Config;
 use tera::conversation::{ConversationSession, TurnEngine};
 use tera::history::db::{ConversationEvent, EventKind, HistoryDb};
 use tera::history::projection::ProjectionEngine;
-use tera::memory::generations::GenerationManager;
-use tera::memory::NIGHTLY;
-use tera::runtime::ActivityTracker;
 use tera::runtime::RuntimeDb;
 use tera::scheduler::db::SchedulerDb;
 use tera::scheduler::recurrence::ScheduleTiming;
@@ -32,14 +29,14 @@ async fn test_workspace_init() {
     for skill in tera::data::BUILTIN_SKILLS {
         for file in skill.files {
             assert!(config
-                .skills_dir()
+                .builtin_skills_dir()
                 .join(skill.name)
                 .join(file.relative_path)
                 .exists());
         }
     }
-    assert!(config.memories_link().exists());
-    assert!(config.memories_link().join("INDEX.md").exists());
+    assert!(config.memories_dir().exists());
+    assert!(config.memories_dir().join("INDEX.md").exists());
 }
 
 /// The agent searches history with `sqlite3` against `conversation_fts`, not
@@ -263,63 +260,42 @@ async fn test_scheduler_persistence() {
     assert_eq!(list_after.len(), before);
 }
 
-/// The memory generation transaction, the part Rust owns. What a generation
-/// should *say* is the model's job and needs a live app-server, so it is covered
-/// by the live tests rather than here.
+/// Memory is versioned by git, and the commits are tera's own.
+///
+/// The identity matters: these commits are the assistant editing its notes, and
+/// signing them with the owner's global git identity would be a lie about who
+/// wrote them. It is set on the repository so nothing outside the workspace is
+/// touched.
 #[tokio::test]
-async fn test_memory_generation_promotion_is_atomic() {
+async fn test_memory_is_a_git_repository_tera_owns() {
     let temp_dir = TempDir::new().unwrap();
     let config = Config::new(temp_dir.path().to_path_buf(), true);
     WorkspaceInit::init(&config).unwrap();
 
-    let staging = NIGHTLY.prepare_staging(&config).unwrap();
-    fs::write(
-        staging.join("people.md"),
-        "# Amaya\n\nMoving in December.\n",
-    )
-    .unwrap();
+    let dir = config.memories_dir();
+    assert!(dir.join(".git").exists());
 
-    let generation = GenerationManager::atomic_swap_generation(&config, &staging).unwrap();
-    assert!(generation >= 2);
-    assert_eq!(
-        GenerationManager::get_current_generation_num(&config).unwrap(),
-        generation
-    );
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(&dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
 
-    // The symlink swings over to the new generation, and never dangles.
-    assert!(config.memories_link().join("people.md").is_file());
-    assert!(!config.workspace_dir.join("memories.new").exists());
-}
+    assert_eq!(git(&["config", "user.name"]), "Tera");
+    assert_eq!(git(&["config", "user.email"]), "tera@localhost");
 
-/// A generation that would break the workspace must not become active, and the
-/// failure must leave the current memory in place.
-#[tokio::test]
-async fn test_invalid_generation_is_refused() {
-    let temp_dir = TempDir::new().unwrap();
-    let config = Config::new(temp_dir.path().to_path_buf(), true);
+    // The seed is committed, so the very first edit the agent makes has a
+    // parent to diff against and can be reverted.
+    assert_eq!(git(&["status", "--porcelain"]), "");
+    assert!(git(&["log", "--format=%an", "-1"]) == "Tera");
+
+    // Init runs on every daemon start, so it has to be safe to repeat.
     WorkspaceInit::init(&config).unwrap();
-
-    let before = GenerationManager::get_current_generation_num(&config).unwrap();
-
-    // Missing HORIZON.md.
-    let bad = config.staging_dir().join("bad");
-    fs::create_dir_all(&bad).unwrap();
-    fs::write(bad.join("INDEX.md"), "# Index\n").unwrap();
-    assert!(GenerationManager::atomic_swap_generation(&config, &bad).is_err());
-
-    // A symlink escaping the generation.
-    let escaping = config.staging_dir().join("escaping");
-    fs::create_dir_all(&escaping).unwrap();
-    fs::write(escaping.join("INDEX.md"), "# Index\n").unwrap();
-    fs::write(escaping.join("HORIZON.md"), "# Horizon\n").unwrap();
-    std::os::unix::fs::symlink("/etc/passwd", escaping.join("secrets.md")).unwrap();
-    assert!(GenerationManager::atomic_swap_generation(&config, &escaping).is_err());
-
-    assert_eq!(
-        GenerationManager::get_current_generation_num(&config).unwrap(),
-        before
-    );
-    assert!(config.memories_link().join("INDEX.md").is_file());
+    assert_eq!(git(&["rev-list", "--count", "HEAD"]), "1");
 }
 
 /// A credential typed into the chat must never reach canonical history.
@@ -349,7 +325,6 @@ async fn test_a_secret_sent_through_chat_never_lands_in_history() {
         transport.clone(),
         ConversationSession::new(),
         CodexSupervisor::new(config.clone(), runtime_db, history_db.clone()),
-        ActivityTracker::new(),
     );
 
     engine
@@ -405,7 +380,6 @@ async fn test_a_buffered_message_activates_typing_for_the_canonical_chat() {
         transport.clone(),
         ConversationSession::new(),
         CodexSupervisor::new(config, runtime_db, history_db),
-        ActivityTracker::new(),
     );
 
     engine
