@@ -23,6 +23,23 @@ pub struct InboundMessage {
     pub is_group: bool,
 }
 
+impl InboundMessage {
+    /// Whether there is anything here for the assistant to answer.
+    ///
+    /// WhatsApp delivers protocol traffic and history sync replays through the
+    /// same callback as real chat, and those arrive carrying neither text nor an
+    /// attachment. Starting a turn for one gives the model nothing to work with,
+    /// and at pairing a burst of them opened a turn on the paired account's own
+    /// chat that the owner's first real message was then steered into.
+    pub fn is_answerable(&self) -> bool {
+        self.media_attachment.is_some()
+            || self
+                .text
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty())
+    }
+}
+
 /// The owner's live chat state. It is deliberately smaller than WhatsApp's
 /// event: the turn engine only needs to know whether more input is still coming.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,3 +113,48 @@ pub mod owner;
 pub mod whatsapp;
 pub use owner::{OwnerPolicy, Verdict};
 pub use whatsapp::{MockTransport, WhatsAppWebTransport};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(text: Option<&str>, media: Option<InboundMedia>) -> InboundMessage {
+        InboundMessage {
+            provider_msg_id: "wa_1".to_string(),
+            sender: "owner:26@s.whatsapp.net".to_string(),
+            text: text.map(str::to_string),
+            timestamp_ms: 0,
+            reply_to_provider_msg_id: None,
+            media_attachment: media,
+            chat_jid: "owner@s.whatsapp.net".to_string(),
+            from_own_account: true,
+            is_group: false,
+        }
+    }
+
+    fn media() -> InboundMedia {
+        InboundMedia {
+            media_type: "image".to_string(),
+            mime_type: "image/jpeg".to_string(),
+            filename: "photo.jpg".to_string(),
+            data: vec![1, 2, 3],
+        }
+    }
+
+    /// History sync replays arrive here with nothing in them. One of those
+    /// opened the turn that swallowed the owner's first message after a
+    /// re-pairing, so this is the guard that keeps them out.
+    #[test]
+    fn test_a_message_with_no_text_and_no_media_is_not_answerable() {
+        assert!(!message(None, None).is_answerable());
+        assert!(!message(Some(""), None).is_answerable());
+        assert!(!message(Some("   \n"), None).is_answerable());
+    }
+
+    #[test]
+    fn test_text_or_media_makes_a_message_answerable() {
+        assert!(message(Some("hi"), None).is_answerable());
+        // A bare photo carries no text and still has to be answered.
+        assert!(message(None, Some(media())).is_answerable());
+    }
+}

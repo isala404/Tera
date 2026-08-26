@@ -403,3 +403,56 @@ async fn test_a_buffered_message_activates_typing_for_the_canonical_chat() {
         Some(&("owner@s.whatsapp.net".to_string(), true))
     );
 }
+
+/// WhatsApp replays protocol traffic through the same callback as real chat when
+/// a device is linked, and those messages carry neither text nor an attachment.
+/// A burst of them opened a turn on the paired account's own chat once, and the
+/// owner's first real message was steered into it and answered there. Nothing
+/// with nothing in it may reach history or start a turn.
+#[tokio::test]
+async fn test_an_empty_message_is_neither_recorded_nor_answered() {
+    let temp_dir = TempDir::new().unwrap();
+    let config = Config::new(temp_dir.path().to_path_buf(), true);
+    WorkspaceInit::init(&config).unwrap();
+
+    let history_db = HistoryDb::open_for(&config).unwrap();
+    let runtime_db = RuntimeDb::open(&config.runtime_db_path()).unwrap();
+    let transport = std::sync::Arc::new(tera::transport::MockTransport::new());
+    let engine = TurnEngine::new(
+        config.clone(),
+        history_db.clone(),
+        runtime_db.clone(),
+        transport.clone(),
+        ConversationSession::new(),
+        CodexSupervisor::new(config, runtime_db, history_db.clone()),
+    );
+
+    for (id, text) in [("wa_sync_1", None), ("wa_sync_2", Some("   ".to_string()))] {
+        engine
+            .handle_inbound_message(InboundMessage {
+                provider_msg_id: id.to_string(),
+                sender: "owner@s.whatsapp.net".to_string(),
+                text,
+                timestamp_ms: Utc::now().timestamp_millis(),
+                reply_to_provider_msg_id: None,
+                media_attachment: None,
+                chat_jid: "owner@s.whatsapp.net".to_string(),
+                from_own_account: true,
+                is_group: false,
+            })
+            .await
+            .unwrap();
+    }
+
+    // Long enough that a burst opened by these would have fired its turn.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    assert!(
+        history_db.list_events_all().unwrap().is_empty(),
+        "an empty message reached canonical history"
+    );
+    assert!(
+        transport.typing_states.lock().unwrap().is_empty(),
+        "an empty message started a turn"
+    );
+}

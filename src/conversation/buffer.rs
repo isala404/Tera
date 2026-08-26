@@ -4,16 +4,20 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone)]
 pub struct MessageBurst {
     pub turn_id: String,
+    /// Chat the burst belongs to. The reply is addressed here, never to the key
+    /// the burst is filed under, which is a device-suffixed sender JID.
+    pub chat_jid: String,
     pub events: Vec<ConversationEvent>,
     pub created_at: Instant,
     pub last_updated_at: Instant,
 }
 
 impl MessageBurst {
-    pub fn new(turn_id: String, event: ConversationEvent) -> Self {
+    pub fn new(turn_id: String, chat_jid: String, event: ConversationEvent) -> Self {
         let now = Instant::now();
         Self {
             turn_id,
+            chat_jid,
             events: vec![event],
             created_at: now,
             last_updated_at: now,
@@ -65,7 +69,11 @@ mod tests {
             attachments: vec![],
         };
 
-        let mut burst = MessageBurst::new("turn_1".to_string(), ev1);
+        let mut burst = MessageBurst::new(
+            "turn_1".to_string(),
+            "owner@s.whatsapp.net".to_string(),
+            ev1,
+        );
         assert_eq!(burst.events.len(), 1);
 
         let ev2 = ConversationEvent {
@@ -89,7 +97,11 @@ mod tests {
 
     #[test]
     fn test_quiet_period_is_what_normally_bounds_the_wait() {
-        let burst = MessageBurst::new("turn_1".to_string(), event("m_1"));
+        let burst = MessageBurst::new(
+            "turn_1".to_string(),
+            "owner@s.whatsapp.net".to_string(),
+            event("m_1"),
+        );
         let remaining = burst.remaining_wait(Duration::from_millis(2500), Duration::from_secs(8));
         assert!(remaining > Duration::from_millis(2000));
         assert!(remaining <= Duration::from_millis(2500));
@@ -99,7 +111,11 @@ mod tests {
     /// ceiling on the total wait, they never get an answer.
     #[test]
     fn test_a_long_burst_is_capped_by_the_maximum_wait() {
-        let burst = MessageBurst::new("turn_1".to_string(), event("m_1"));
+        let burst = MessageBurst::new(
+            "turn_1".to_string(),
+            "owner@s.whatsapp.net".to_string(),
+            event("m_1"),
+        );
         // Max wait already elapsed: nothing left to wait for, whatever the quiet
         // period says.
         let remaining = burst.remaining_wait(Duration::from_secs(3), Duration::ZERO);
@@ -108,7 +124,11 @@ mod tests {
 
     #[test]
     fn test_restarting_quiet_period_preserves_the_absolute_deadline() {
-        let mut burst = MessageBurst::new("turn_1".to_string(), event("m_1"));
+        let mut burst = MessageBurst::new(
+            "turn_1".to_string(),
+            "owner@s.whatsapp.net".to_string(),
+            event("m_1"),
+        );
         let created_at = burst.created_at;
         let previous_update = burst.last_updated_at;
 
