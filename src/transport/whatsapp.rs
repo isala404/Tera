@@ -466,12 +466,13 @@ impl Transport for WhatsAppWebTransport {
                     },
                 )
             }
-            "audio" => {
+            "audio" | "voice_note" => {
                 let upload = self.upload(&client, data, MediaType::Audio).await?;
                 media::audio_message(
                     upload,
                     media::AudioOptions {
                         mimetype: Some(mime),
+                        ptt: Some(media_type == "voice_note"),
                         context_info,
                         ..Default::default()
                     },

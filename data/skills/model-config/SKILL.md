@@ -1,64 +1,64 @@
 ---
 name: model-config
-description: Report or change Tera's active Codex model or provider safely, including checks and restart.
+description: Report or change Tera's Codex model or provider with live validation and restart verification.
 ---
 
-Use this when the owner asks what model is running or asks to use, switch, change or reset the conversation model, provider or reasoning effort. This is configuration work, not a Tera code change.
+Use this when the owner asks what model is running or asks to use, switch, change, update, or reset the conversation model, provider, or reasoning effort. This is native Codex configuration work, not a Tera code change.
 
-## Report the current agent model
+## Reporting the model
 
-Ask the Codex harness instead of relying on model self identification. Run the bundled helper from the workspace root.
+Ask the Codex harness instead of relying on self identification.
 
 ```bash
 .agents/skills/model-config/scripts/current-model
 ```
 
-Report the exact model id it prints. It uses `CODEX_THREAD_ID`, so a subagent reports its own model rather than the main conversation model.
+Report the exact id. It uses `CODEX_THREAD_ID`, so a subagent reports its own model. If the owner explicitly asks for the main conversation model, use `tera status --workspace "$PWD"` and its `Thread` line. Never infer a running model from config, documentation, memory, or the model's claim about itself. When a change is waiting for restart, distinguish the live model from the selection for the next start.
 
-Do not infer the model from config, documentation or self identification. An empty config uses a Codex default that can change. If the helper fails, report that and do not guess.
+## Research before every change
 
-If the owner asks for the main conversation model instead of this agent's model, run `tera status --workspace "$PWD"` and report its `Thread` line. Never use it to identify a subagent.
+Search the web every time. Model names, aliases, provider endpoints, and compatibility change too often to reuse remembered values. Prefer the provider's current official model and Codex integration documentation. Confirm all of these from current sources.
 
-When a configuration change is waiting for restart, distinguish the currently running model from the model selected for the next start.
+- the latest stable model when the owner asked for a family or provider rather than an exact id
+- the exact model id
+- the OpenAI Responses compatible base URL, ending immediately before `/responses`
+- the documented API key environment variable
+- the publication or update date when the provider exposes one.
 
-The source of truth is `.codex-home/config.toml`. Read it fully first. Tera preserves it and an empty file means native Codex defaults.
+For native OpenAI models, also ask Codex with `model/list`. Its live catalog is stronger evidence than a stale page. If current official evidence is unavailable, do not guess and do not change the provider.
 
-Use native keys such as `model`, `model_provider` and `model_reasoning_effort`. For a custom provider, use its documented `[model_providers.<id>]`, `base_url` and `wire_api = "responses"`. Verify model ids and endpoints against official docs. Never add a Tera specific format.
+The earlier GLM failure happened because a plausible looking URL passed static config checks but returned 404 from `/responses`. Documentation research and a real inference request are both required now.
 
-Keep credentials out of chat and Codex config. API keys live in the workspace `.env`. Confirm Git ignores it and its mode is `0600`. Never ask the owner to paste one into chat or print its value.
+## Editing native Codex config
 
-Get the variable name from provider docs. Check only whether it exists. Never display its line or source `.env` in an agent shell.
+Read `.codex-home/config.toml` fully before editing. Preserve unrelated settings and provider tables. An empty file means native Codex defaults. Use native keys such as `model`, `model_provider`, and `model_reasoning_effort`. Custom providers use `[model_providers.<id>]`, `base_url`, and the Responses wire API. Codex currently supports only `wire_api = "responses"` for custom providers.
 
-```bash
-rg -q '^PROVIDER_API_KEY=' .env
-```
+For a custom provider, read `references/provider-auth.md` before touching credentials. Keep credentials out of ordinary chat and Codex config.
 
-Configure native Codex command auth to load the value when Codex needs it. Use absolute paths and replace both placeholders with the real workspace path and documented variable name.
+Before editing, copy the current config to `.runtime/model-config.backup.toml`. Make a targeted edit. To restore native defaults, remove only `model`, `model_provider`, and `model_reasoning_effort`.
 
-```toml
-[model_providers.example.auth]
-command = "/bin/sh"
-args = ["-c", "set -a; . '/absolute/workspace/.env'; printf %s \"$PROVIDER_API_KEY\""]
-```
+## Proving the change before restart
 
-Codex is the only consumer of stdout. Never run this auth command yourself or combine it with another auth method.
-
-If it is missing, ask the owner to add it from a private terminal. Never populate `.env` from chat.
-
-Make a targeted edit that preserves unrelated settings and provider tables. To return to native Codex defaults, remove only `model`, `model_provider` and `model_reasoning_effort`. Keep unrelated user configuration.
-
-Validate before restarting.
+First validate syntax and local health.
 
 ```bash
 CODEX_HOME="$PWD/.codex-home" codex --strict-config doctor --summary
 ```
 
-The command's exit code is the validation result. An explanation for a nonzero exit does not make the configuration valid. If validation fails for a transient reason, fix that reason and retry and require exit zero. If it still fails, restore only your edit and report the error.
+Then exercise the selected provider and model with a real isolated inference.
 
-After validation passes, send the owner one short confirmation through `send_message`, naming the model and provider and saying the restart is scheduled. Then run the bundled helper and finish the turn immediately. The helper delays the service restart long enough for the reply and turn state to be committed, preventing Phoenix from treating the planned restart as interrupted work.
+```bash
+.agents/skills/model-config/scripts/preflight
+```
+
+Both commands must exit zero. The preflight is what proves the model id, auth path, base URL, `/responses` route, and response streaming work together. If either fails, restore `.runtime/model-config.backup.toml`, validate the restored config, remove any restart context, and explain the failure naturally. Do not restart.
+
+After both pass, write `.runtime/restart-context.md` as a few factual Markdown lines covering what the owner requested, the selected model and provider, the official documentation URLs checked, and that live inference passed. This is context for the startup agent, not a message template.
+
+Send one short natural confirmation through `send_message`, naming the selection and saying the verified restart is scheduled. Then run the helper and end the turn immediately.
 
 ```bash
 .agents/skills/model-config/scripts/restart-after-turn
 ```
 
-Do not restart the service directly from the active turn. Do not add or call a model configuration MCP tool. Do not change Tera source, build or deploy a binary, update Codex, or touch runtime database state, schedules or memory to switch the conversation model.
+Do not restart the service directly inside the active turn. On the new process, the startup agent independently checks the running model and tells the owner Tera is back. Do not claim the switch completed before that check.

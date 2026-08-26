@@ -133,6 +133,10 @@ mod tests {
             include_str!("../data/skills/model-config/scripts/current-model"),
         ),
         (
+            "skills/model-config/scripts/preflight",
+            include_str!("../data/skills/model-config/scripts/preflight"),
+        ),
+        (
             "skills/model-config/scripts/restart-after-turn",
             include_str!("../data/skills/model-config/scripts/restart-after-turn"),
         ),
@@ -160,8 +164,9 @@ mod tests {
         "LATE_MINUTES",
         "MISSED",
         "OWNER",
-        "WHAT_HAPPENED",
+        "STARTUP_FACTS",
         "PENDING_REQUEST",
+        "ABANDONED_REQUEST",
     ];
 
     fn placeholders_in(text: &str) -> Vec<String> {
@@ -411,27 +416,26 @@ mod tests {
         assert!(skill.contains("what model is running"));
         assert!(skill.contains("scripts/current-model"));
         assert!(skill.contains("a subagent reports its own model"));
-        assert!(skill.contains("Never use it to identify a subagent"));
         assert!(skill.contains("tera status --workspace \"$PWD\""));
         assert!(skill.contains("do not guess"));
-        assert!(skill.contains("use, switch, change or reset the conversation model"));
+        assert!(skill.contains("use, switch, change, update, or reset the conversation model"));
         assert!(skill.contains(".codex-home/config.toml"));
         assert!(skill.contains("codex --strict-config doctor --summary"));
+        assert!(skill.contains("scripts/preflight"));
+        assert!(skill.contains("Search the web every time"));
+        assert!(skill.contains("real isolated inference"));
         assert!(skill.contains("scripts/restart-after-turn"));
-        assert!(skill.contains("require exit zero"));
         assert!(skill.contains("Do not restart the service directly"));
-        assert!(skill.contains("Never ask the owner to paste one into chat"));
-        assert!(skill.contains("API keys live in the workspace `.env`"));
-        assert!(skill.contains("rg -q '^PROVIDER_API_KEY=' .env"));
-        assert!(skill.contains("Never run this auth command yourself"));
-        assert!(skill.contains("[model_providers.example.auth]"));
+        assert!(skill.contains("references/provider-auth.md"));
     }
 
     #[test]
     fn test_phoenix_recovery_stays_inside_the_interrupted_turn() {
         assert!(PHOENIX_RECOVERY_PROMPT.contains("complete scope"));
-        assert!(PHOENIX_RECOVERY_PROMPT.contains("Do not revive older requests"));
-        assert!(PHOENIX_RECOVERY_PROMPT.contains("Do not rebuild, redeploy, update"));
+        assert!(PHOENIX_RECOVERY_PROMPT.contains("Do not revive older work"));
+        assert!(PHOENIX_RECOVERY_PROMPT.contains("Do not rebuild, deploy, update"));
+        assert!(PHOENIX_RECOVERY_PROMPT.contains("Always say that you are back"));
+        assert!(PHOENIX_RECOVERY_PROMPT.contains("Do not use a canned sentence"));
     }
 
     /// The point of the split is that AGENTS.md is read every session and the rest

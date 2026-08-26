@@ -588,15 +588,10 @@ impl TurnEngine {
             // notes to Codex as real media rather than a text description of media.
             let inputs = self.turn_inputs(&burst.events);
 
-            // A degraded turn must read as degraded. Echoing a canned "I'm ready to
-            // assist" makes a dead Codex backend indistinguishable from a real reply.
-            let reply_text = match self.codex.run_main_turn(&inputs).await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    error!("Codex turn failed: {:?}", e);
-                    format!("⚠️ I couldn't complete that turn, the Codex backend errored: {e}")
-                }
-            };
+            let reply_text = self.codex.run_main_turn(&inputs).await.map_err(|error| {
+                error!("Codex turn failed: {error:?}");
+                error
+            })?;
 
             self.codex.note_main_activity();
 
@@ -609,15 +604,10 @@ impl TurnEngine {
                 return Ok(());
             }
 
-            // Nothing was sent and there is nothing to send: the user asked something
-            // and would otherwise get an answer, so say so rather than leave them waiting.
-            let reply_text = if reply_text.trim().is_empty() {
+            if reply_text.trim().is_empty() {
                 warn!("Turn produced neither a send_message nor any final text");
-                "⚠️ I finished working on that but didn't produce a reply. Try asking again."
-                    .to_string()
-            } else {
-                reply_text
-            };
+                anyhow::bail!("turn produced no user-visible reply");
+            }
 
             // The fallback answers the burst, so it quotes the message that
             // closed it, which is the one the owner is still looking at.

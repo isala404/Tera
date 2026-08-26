@@ -1,0 +1,1 @@
+Make one minimal inference request to prove this Codex configuration can reach its selected provider and model. Do not inspect files, call tools, change state, or explain the setup. Reply with a single short line confirming that inference completed.

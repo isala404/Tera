@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+workspace=${1:-"$PWD"}
+skill_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+
+CODEX_HOME="$workspace/.codex-home" \
+    codex exec --strict-config --ephemeral --skip-git-repo-check \
+    --sandbox read-only --color never --cd "$workspace" - \
+    < "$skill_dir/references/preflight.md"

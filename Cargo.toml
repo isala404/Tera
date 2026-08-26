@@ -39,3 +39,8 @@ debug = "line-tables-only"
 
 [profile.dev.package."*"]
 debug = 0
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

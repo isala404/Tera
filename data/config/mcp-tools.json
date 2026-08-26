@@ -8,7 +8,8 @@
         "text": { "type": "string", "description": "Message text. Plain, short, no markdown." },
         "image_path": { "type": "string", "description": "Path to an image file: absolute, or relative to the workspace root" },
         "video_path": { "type": "string", "description": "Path to a video file: absolute, or relative to the workspace root" },
-        "audio_path": { "type": "string", "description": "Path to an audio file: absolute, or relative to the workspace root" },
+        "audio_path": { "type": "string", "description": "Path to an ordinary audio attachment: absolute, or relative to the workspace root" },
+        "voice_note_path": { "type": "string", "description": "Path to an Ogg Opus voice note: absolute, or relative to the workspace root. Sends it with WhatsApp's push-to-talk flag." },
         "file_path": { "type": "string", "description": "Path to any other file to send as a WhatsApp document: absolute, or relative to the workspace root" },
         "reply_to": { "type": "string", "description": "Message id to quote, as shown in the transcript, e.g. msg_a1b2. Use it when answering one specific message out of several." }
       }

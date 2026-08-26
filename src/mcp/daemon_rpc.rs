@@ -235,7 +235,7 @@ impl DaemonRpcServer {
                 let outgoing = authored.as_deref().map(|text| self.secrets.expand(text));
 
                 if authored.is_none() && attachment.is_none() {
-                    return Err(anyhow!("send_message requires at least one of text, image_path, video_path, audio_path, or file_path"));
+                    return Err(anyhow!("send_message requires text or one attachment path"));
                 }
 
                 let reply_to = args["reply_to"].as_str();
@@ -441,6 +441,7 @@ fn attachment_argument(args: &Value) -> Result<Option<(&'static str, &str)>> {
         ("image", args["image_path"].as_str()),
         ("video", args["video_path"].as_str()),
         ("audio", args["audio_path"].as_str()),
+        ("voice_note", args["voice_note_path"].as_str()),
         ("document", args["file_path"].as_str()),
     ];
     let supplied: Vec<_> = candidates
@@ -487,6 +488,13 @@ mod tests {
         let args = json!({"file_path": "notes.pdf"});
         let attachment = attachment_argument(&args).unwrap();
         assert_eq!(attachment, Some(("document", "notes.pdf")));
+    }
+
+    #[test]
+    fn voice_notes_are_distinct_from_audio_attachments() {
+        let args = json!({"voice_note_path": "reply.ogg"});
+        let attachment = attachment_argument(&args).unwrap();
+        assert_eq!(attachment, Some(("voice_note", "reply.ogg")));
     }
 
     #[test]

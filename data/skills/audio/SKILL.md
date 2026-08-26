@@ -1,18 +1,42 @@
 ---
 name: audio
-description: Transcribe voice notes, audio files and video soundtracks locally with parakeet.cpp.
+description: Transcribe audio locally, synthesize speech, and send WhatsApp voice notes with Aloud Q8 models.
 ---
 
-Run `scripts/transcribe status` first. It prints four lines, and whichever one says `missing` decides what you do next. Everything here runs on this machine, so nothing is uploaded and there is no per minute cost.
+Use this for exact transcription, audio or video files on disk, text to speech, or a spoken WhatsApp reply. Short voice notes can still be understood directly in the turn. Reach for the local tool when the exact wording matters or when you need to create audio.
 
-If `parakeet-cli` or `model` is missing, run `scripts/transcribe setup`. It fetches a pinned parakeet.cpp build and the parakeet tdt 0.6b v3 weights into `.runtime/parakeet/`, verifies both against their checksums, and refuses to install anything that does not match. The model is about 0.9GB and takes a few minutes on a normal connection, so tell the owner it is downloading before you start and confirm when it lands. Setup is needed once per machine, never again. If `ffmpeg` is missing, say so and stop, because every input is decoded through it.
+Everything runs locally with [Aloud](https://github.com/isala404/aloud). The wrapper uses only the published Q8 GGUF models from `isala404/aloud`. Those are Audio8 ASR 0.1B for transcription and Audio8 TTS 0.6B for speech. Model files resolve through Aloud's `hf://` support, are downloaded atomically into the normal Hugging Face cache on first use, and work offline after that.
 
-Then run `scripts/transcribe <path>` and it prints the transcript to stdout. Any container ffmpeg reads works, so WhatsApp opus voice notes, mp3, m4a, wav, and mp4 or mov video all go in unchanged. Video transcribes as its soundtrack. Attachment paths come from the transcript as `[Attachment audio: ...]` and resolve relative to `history/jsonl/`.
+Start with this.
 
-Add `--json` when you need per word timing or confidence rather than prose, for example to quote a moment in a recording or to find where a topic starts. It prints one object with `text` and a `words` array carrying `start`, `end` and `conf` in seconds.
+```bash
+.agents/skills/audio/scripts/transcribe status
+```
 
-The model handles 25 European languages and picks the language itself, with punctuation and casing. It has no Sinhala, Tamil or Arabic, so a voice note in one of those comes back as nonsense rather than as an error. If the transcript reads like gibberish, suspect the language before you suspect the audio.
+If `aloud` is missing, run setup. It installs the pinned Aloud ARM64 Linux, Apple Silicon, or x86 64 Linux release under `.runtime/aloud/` after checking the release archive's SHA 256. It does not install a system package. `ffmpeg` must already be on `PATH` because incoming media needs conversion and WhatsApp voice notes need Opus.
 
-Audio longer than five minutes is cut into five minute pieces and rejoined, which is faster and leaner than one pass. A word landing exactly on a cut can come out garbled, so do not quote a single word from a long transcript as though it were exact.
+```bash
+.agents/skills/audio/scripts/transcribe setup
+```
 
-You still hear short voice notes directly as part of the turn. Reach for this skill when you need the exact words, when the file is long, when it is a video, or when it is a file on disk rather than something the owner just sent.
+Transcribe any audio or video container that ffmpeg can read. Video is treated as its soundtrack. Attachment paths in the transcript resolve relative to `history/jsonl/`.
+
+```bash
+.agents/skills/audio/scripts/transcribe path/to/note.ogg
+```
+
+Synthesize a WAV with either embedded voice.
+
+```bash
+.agents/skills/audio/scripts/transcribe tts "Text to speak" -o .runtime/reply.wav --voice sky
+```
+
+For a real WhatsApp voice note, ask the wrapper for Opus and send the resulting file through `voice_note_path`. This sets WhatsApp's push to talk flag. `audio_path` sends an ordinary audio attachment instead.
+
+```bash
+.agents/skills/audio/scripts/transcribe tts "Text to speak" -o .runtime/reply.ogg --voice aiden --voice-note
+```
+
+Then call `send_message` with `voice_note_path` set to `.runtime/reply.ogg`. Text is optional. Do not claim a WAV sent through `audio_path` is a voice note.
+
+Aloud ASR expects mono 16 kHz PCM and TTS emits mono 44.1 kHz PCM. The wrapper handles those conversions. Use `--device cpu` implicitly because Aloud currently selects CPU for `auto` and the release binaries are CPU builds.

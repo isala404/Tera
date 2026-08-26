@@ -714,9 +714,9 @@ async fn main() -> Result<()> {
                     activity.clone(),
                 ));
 
-                // Phoenix speaks before it repairs, and it cannot speak until the
-                // transport is up, which happens below. Retrying the whole job is
-                // safe: nothing is recorded until the owner has been told.
+                // The startup assistant writes the restart message after the
+                // transport and Codex are both usable. It retries while WhatsApp
+                // is still connecting.
                 let phoenix = Phoenix::new(
                     config.clone(),
                     history_db.clone(),
@@ -831,9 +831,12 @@ async fn main() -> Result<()> {
             // already runs.
             let mut update_signal =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
+            let mut terminate_signal =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
             tokio::select! {
                 result = tokio::signal::ctrl_c() => result?,
                 _ = update_signal.recv() => {}
+                _ = terminate_signal.recv() => {}
             }
 
             // Graceful shutdown. Systemd may restart us, so what matters is

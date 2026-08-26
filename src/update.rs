@@ -73,7 +73,7 @@ struct CodexUpdate {
     target: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum UpdateNotice {
     Applied {
         previous: BuildInfo,
@@ -88,62 +88,6 @@ pub enum UpdateNotice {
         codex_before: Option<String>,
         codex_after: Option<String>,
     },
-}
-
-impl UpdateNotice {
-    pub fn message(&self) -> String {
-        match self {
-            Self::Applied {
-                previous,
-                current,
-                codex_before,
-                codex_after,
-            } => {
-                let tera = if previous.commit_sha == current.commit_sha {
-                    format!("Tera {} was already current", current.version)
-                } else {
-                    format!(
-                        "Tera updated from {} ({}) to {} ({})",
-                        previous.version,
-                        previous.short_sha(),
-                        current.version,
-                        current.short_sha()
-                    )
-                };
-                let codex = match (codex_before, codex_after) {
-                    (Some(before), Some(after)) if before != after => {
-                        format!(", and Codex updated from {before} to {after}")
-                    }
-                    (Some(after), _) | (_, Some(after)) => format!(", with {after}"),
-                    _ => String::new(),
-                };
-                format!("{tera}{codex}. The new daemon passed its startup checks.")
-            }
-            Self::RolledBack {
-                attempted,
-                restored,
-                reason,
-                codex_before,
-                codex_after,
-            } => {
-                if attempted.commit_sha == restored.commit_sha {
-                    format!(
-                        "The Codex update from {} to {} failed its first startup. Phoenix restored the previous Codex executable. {reason}",
-                        codex_before.as_deref().unwrap_or("the prior version"),
-                        codex_after.as_deref().unwrap_or("the new version")
-                    )
-                } else {
-                    format!(
-                        "The update to Tera {} ({}) failed its first startup. Phoenix restored {} ({}), including the prior Codex executable when it changed. {reason}",
-                        attempted.version,
-                        attempted.short_sha(),
-                        restored.version,
-                        restored.short_sha()
-                    )
-                }
-            }
-        }
-    }
 }
 
 pub enum StartupAction {
@@ -777,23 +721,25 @@ mod tests {
     }
 
     #[test]
-    fn test_update_notice_names_the_installed_build() {
+    fn test_update_notice_serializes_the_installed_build_as_facts() {
         let mut previous = BuildInfo::current();
         previous.version = "1.0.0".to_string();
         previous.commit_sha = "1111111111111111".to_string();
         let mut current = previous.clone();
         current.version = "1.1.0".to_string();
         current.commit_sha = "2222222222222222".to_string();
-        let message = UpdateNotice::Applied {
+        let facts = serde_json::to_string(&UpdateNotice::Applied {
             previous,
             current,
             codex_before: Some("codex-cli 1.0".to_string()),
             codex_after: Some("codex-cli 1.1".to_string()),
-        }
-        .message();
-        assert!(message.contains("1.0.0 (111111111111)"));
-        assert!(message.contains("1.1.0 (222222222222)"));
-        assert!(message.contains("codex-cli 1.1"));
+        })
+        .unwrap();
+        assert!(facts.contains("1.0.0"));
+        assert!(facts.contains("1111111111111111"));
+        assert!(facts.contains("1.1.0"));
+        assert!(facts.contains("2222222222222222"));
+        assert!(facts.contains("codex-cli 1.1"));
     }
 
     #[test]

@@ -581,7 +581,26 @@ impl CodexProcessManager {
                 }
                 TurnEvent::Message(item.get("text")?.as_str()?.to_string())
             }
-            "turn/completed" => TurnEvent::Completed,
+            "turn/completed" => match params
+                .get("turn")
+                .and_then(|turn| turn.get("status"))
+                .and_then(Value::as_str)
+            {
+                Some("failed") | Some("interrupted") => {
+                    let turn = &params["turn"];
+                    let reason = turn
+                        .get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_else(|| {
+                            turn.get("status")
+                                .and_then(Value::as_str)
+                                .unwrap_or("turn failed")
+                        });
+                    TurnEvent::Failed(reason.to_string())
+                }
+                _ => TurnEvent::Completed,
+            },
             "turn/failed" => {
                 let reason = params
                     .get("error")
@@ -1000,6 +1019,22 @@ mod tests {
         });
         let (_, event) = CodexProcessManager::classify_notification(&v).unwrap();
         assert!(matches!(event, TurnEvent::Message(t) if t == "pong"));
+    }
+
+    #[test]
+    fn test_completed_notification_surfaces_a_failed_turn() {
+        let notification = json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "t1",
+                "turn": {
+                    "status": "failed",
+                    "error": {"message": "provider returned 404"}
+                }
+            }
+        });
+        let (_, event) = CodexProcessManager::classify_notification(&notification).unwrap();
+        assert!(matches!(event, TurnEvent::Failed(reason) if reason == "provider returned 404"));
     }
 
     #[test]
