@@ -40,20 +40,6 @@ const MAX_PRESENCE_HOLD: Duration = Duration::from_secs(5 * 60);
 const MODEL_FAILURE_REPLY: &str =
     "I couldn't complete that because the model provider is unavailable. Check Tera's service log for the cause, then try again.";
 
-/// Where a turn's reply is addressed.
-///
-/// Always a chat, never the key its burst is filed under: that key is a
-/// device-suffixed sender JID, which is not a routable address. The session
-/// holds the chat of the most recent accepted message, so a message steered into
-/// a running turn from somewhere else is answered where it came from rather than
-/// where the burst began. The burst's own chat covers the turn that runs before
-/// any message has set the session.
-fn reply_chat(session_chat: Option<String>, burst_chat: &str) -> String {
-    session_chat
-        .filter(|jid| !jid.is_empty())
-        .unwrap_or_else(|| burst_chat.to_string())
-}
-
 /// Bursts waiting out their quiet period, and the logical turn currently being
 /// executed.
 ///
@@ -420,10 +406,9 @@ impl TurnEngine {
 
         {
             let mut state = self.state.lock().await;
-            state.bursts.insert(
-                sender.to_string(),
-                MessageBurst::new(turn_id, chat_jid.to_string(), event),
-            );
+            state
+                .bursts
+                .insert(sender.to_string(), MessageBurst::new(turn_id, event));
         }
 
         let engine = self.clone();
@@ -605,7 +590,10 @@ impl TurnEngine {
         // Snapshot before the turn so send_message calls made during it are visible.
         let sends_before = self.session.count();
 
-        let chat_jid = reply_chat(self.session.chat(), &burst.chat_jid);
+        // A chat, never `sender`: that is a device-suffixed JID, which is not a
+        // routable address. The session was set from this message's chat before
+        // the burst opened.
+        let chat_jid = self.session.chat().unwrap_or_default();
         self.session.set_turn(Some(&burst.turn_id));
 
         let result = async {
@@ -716,7 +704,7 @@ mod presence_tests {
     #[test]
     fn test_composing_cannot_hold_a_burst_past_its_normal_ceiling() {
         let mut state = ConversationState::default();
-        let mut burst = MessageBurst::new("turn1".into(), "owner@s.whatsapp.net".into(), event());
+        let mut burst = MessageBurst::new("turn1".into(), event());
         burst.created_at = Instant::now() - MAX_BURST_WAIT;
         burst.last_updated_at = burst.created_at;
         state.bursts.insert("owner:26@lid".into(), burst);
@@ -728,7 +716,7 @@ mod presence_tests {
     #[test]
     fn test_paused_does_not_move_the_burst_deadline() {
         let mut state = ConversationState::default();
-        let mut burst = MessageBurst::new("turn1".into(), "owner@s.whatsapp.net".into(), event());
+        let mut burst = MessageBurst::new("turn1".into(), event());
         burst.created_at = Instant::now() - MAX_BURST_WAIT;
         burst.last_updated_at = burst.created_at;
         state.bursts.insert("owner".into(), burst);
@@ -737,33 +725,5 @@ mod presence_tests {
         state.update_presence("owner", InboundPresenceKind::Paused);
         let remaining = state.remaining_wait("owner").unwrap();
         assert_eq!(remaining, Duration::ZERO);
-    }
-
-    /// The bug this exists to stop. A burst opened by the paired account's own
-    /// history sync replay is keyed to that account's chat. The owner's real
-    /// message was steered into the running turn, so the session moved to the
-    /// owner's chat, and the answer has to follow it rather than go back to
-    /// where the burst started.
-    #[test]
-    fn test_a_steered_message_is_answered_where_it_came_from() {
-        let owner = "254910671147212@lid".to_string();
-        assert_eq!(
-            reply_chat(Some(owner.clone()), "94701919669@s.whatsapp.net"),
-            owner
-        );
-    }
-
-    #[test]
-    fn test_the_bursts_own_chat_answers_when_the_session_has_none() {
-        assert_eq!(
-            reply_chat(None, "owner@s.whatsapp.net"),
-            "owner@s.whatsapp.net"
-        );
-        // An empty session chat is the same as no session chat: it is not an
-        // address, and sending to it fails.
-        assert_eq!(
-            reply_chat(Some(String::new()), "owner@s.whatsapp.net"),
-            "owner@s.whatsapp.net"
-        );
     }
 }
