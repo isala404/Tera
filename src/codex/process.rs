@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -137,6 +137,7 @@ pub struct CodexProcessManager {
     /// Set once the child process is known to be gone, so callers stop waiting
     /// 15 seconds for a reply that will never come.
     dead: Arc<AtomicBool>,
+    login_completed_tx: broadcast::Sender<bool>,
 }
 
 impl CodexProcessManager {
@@ -248,6 +249,8 @@ impl CodexProcessManager {
         let turns_clone = active_turns.clone();
 
         let dead = Arc::new(AtomicBool::new(false));
+        let (login_completed_tx, _) = broadcast::channel(16);
+        let login_tx_for_reader = login_completed_tx.clone();
 
         // Reap the child so its exit is observable. Without this the handle was
         // dropped at the end of spawn and a crashed app-server looked identical to
@@ -293,7 +296,16 @@ impl CodexProcessManager {
                             let _ = reply_tx.send(line + "\n").await;
                         }
                     }
-                    (Some(_), None) => {
+                    (Some(method), None) => {
+                        if method == "account/login/completed" {
+                            let success = v
+                                .get("params")
+                                .and_then(|p| p.get("success"))
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false);
+                            info!("Codex notification account/login/completed: success={success}");
+                            let _ = login_tx_for_reader.send(success);
+                        }
                         log_notification(&v);
                         Self::track_active_turn(&turns_clone, &v).await;
                         if let Some((thread_id, event)) = Self::classify_notification(&v) {
@@ -323,6 +335,7 @@ impl CodexProcessManager {
             active_thread_id: Mutex::new(None),
             active_turns,
             dead,
+            login_completed_tx,
         };
 
         // 1. Send initialize handshake, then the `initialized` notification the
@@ -718,6 +731,56 @@ impl CodexProcessManager {
         .await?;
         info!("Interrupted turn {turn_id} on thread {thread_id}");
         Ok(())
+    }
+
+    pub fn subscribe_login_completed(&self) -> broadcast::Receiver<bool> {
+        self.login_completed_tx.subscribe()
+    }
+
+    /// Query whether Codex is authenticated (returns false if requires OpenAI auth and no authMethod).
+    pub async fn is_authenticated(&self) -> bool {
+        match self.send_request("getAuthStatus", Some(json!({}))).await {
+            Ok(res) => {
+                let requires_openai = res
+                    .get("requiresOpenaiAuth")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                if !requires_openai {
+                    return true;
+                }
+                let auth_method = res.get("authMethod");
+                auth_method.is_some() && !auth_method.unwrap().is_null()
+            }
+            Err(e) => {
+                warn!("Could not query getAuthStatus from codex app-server: {:?}", e);
+                false
+            }
+        }
+    }
+
+    /// Begin OAuth device-code login on app-server.
+    /// Returns `(verification_url, user_code)`.
+    pub async fn start_device_login(&self) -> Result<(String, String)> {
+        let res = self
+            .send_request(
+                "account/login/start",
+                Some(json!({ "type": "chatgptDeviceCode" })),
+            )
+            .await?;
+
+        let verification_url = res
+            .get("verificationUrl")
+            .and_then(Value::as_str)
+            .unwrap_or("https://auth.openai.com/codex/device")
+            .to_string();
+
+        let user_code = res
+            .get("userCode")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("App-server did not return a userCode: {res}"))?
+            .to_string();
+
+        Ok((verification_url, user_code))
     }
 
     async fn dispatch(

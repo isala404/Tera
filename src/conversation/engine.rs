@@ -19,7 +19,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -118,6 +118,7 @@ pub struct TurnEngine {
     owner_policy: OwnerPolicy,
     session: ConversationSession,
     secrets: SecretStore,
+    login_notifier_active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TurnEngine {
@@ -139,6 +140,7 @@ impl TurnEngine {
             state: Arc::new(Mutex::new(ConversationState::default())),
             codex,
             session,
+            login_notifier_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -608,6 +610,54 @@ impl TurnEngine {
                 text: last.text.clone(),
             });
 
+            if !self.codex.check_authenticated().await {
+                info!("Codex unauthenticated; sending device pairing instructions to {chat_jid}");
+
+                // Subscribe before asking for the code. A completion that landed
+                // between the request and the subscription would be lost, and the
+                // owner would sit waiting for a confirmation that never comes.
+                let completions = self.codex.subscribe_login_completed().await;
+
+                match self.codex.request_device_login().await {
+                    Ok((url, code)) => {
+                        // This turn ends here: waiting out the pairing would hold
+                        // the conversation open for up to fifteen minutes, and
+                        // every message sent meanwhile would steer into a turn
+                        // that cannot run. So say plainly that the question needs
+                        // sending again.
+                        let prompt = format!(
+                            "👋 I'm not paired with Codex yet, so I can't answer that.\n\n\
+                             Authorize this device:\n\
+                             1. Open {url}\n\
+                             2. Enter code: *{code}*\n\n\
+                             _The code expires in 15 minutes. I'll tell you when it's done, then send your message again._"
+                        );
+                        let outbound_msg_id = self
+                            .transport
+                            .send_text(&chat_jid, &prompt, reply_target.as_ref())
+                            .await?;
+                        record_assistant_message(
+                            &self.history_db,
+                            &chat_jid,
+                            &outbound_msg_id,
+                            &prompt,
+                            Some(burst.turn_id.clone()),
+                            burst.events.last().map(|e| e.id.clone()),
+                        )?;
+                        match completions {
+                            Ok(rx) => self.spawn_login_notifier(chat_jid.clone(), rx),
+                            Err(e) => warn!(
+                                "Pairing code sent, but login completions are unreadable so the owner will not be told: {e:?}"
+                            ),
+                        }
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        error!("Failed to request device login from codex app-server: {e:?}");
+                    }
+                }
+            }
+
             let reply_text = match self.codex.run_main_turn(&inputs).await {
                 Ok(reply) => reply,
                 Err(error) => {
@@ -678,6 +728,49 @@ impl TurnEngine {
 
         self.session.set_turn(None);
         result
+    }
+
+    /// Tell the owner how the pairing they were asked for turned out.
+    ///
+    /// One at a time: the code is cached until it resolves, so repeated messages
+    /// while pairing is open re-send that same code rather than opening a second
+    /// watcher for it.
+    fn spawn_login_notifier(&self, chat_jid: String, mut completions: broadcast::Receiver<bool>) {
+        use std::sync::atomic::Ordering;
+        if self.login_notifier_active.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        let codex = self.codex.clone();
+        let transport = self.transport.clone();
+        let notifier_flag = self.login_notifier_active.clone();
+
+        tokio::spawn(async move {
+            let told = match completions.recv().await {
+                Ok(true) => {
+                    info!("Codex login completed; notifying owner at {chat_jid}");
+                    Some("✅ Paired with Codex. Send your message again and I'll pick it up.")
+                }
+                Ok(false) => {
+                    warn!("Codex login attempt failed, expired or was rejected");
+                    Some("❌ Pairing wasn't completed. Send any message to get a new code.")
+                }
+                Err(e) => {
+                    warn!("Login completion channel closed before pairing resolved: {e:?}");
+                    None
+                }
+            };
+
+            // Whatever happened, the cached code is spent: a later message has to
+            // be able to ask for a fresh one.
+            codex.clear_active_login().await;
+            if let Some(text) = told {
+                if let Err(e) = transport.send_text(&chat_jid, text, None).await {
+                    warn!("Could not tell {chat_jid} how pairing ended: {e:?}");
+                }
+            }
+            notifier_flag.store(false, Ordering::SeqCst);
+        });
     }
 }
 

@@ -64,6 +64,13 @@ impl Phoenix {
             return Ok(());
         };
 
+        // Everything below needs a model turn. The crash mark and the update
+        // journal are both consumed by this start, so returning early here would
+        // lose the report for good rather than defer it: pair first, then run.
+        if !self.codex.check_authenticated().await {
+            self.pair_with_codex(&chat_jid).await?;
+        }
+
         let over_budget = crashed
             .as_ref()
             .is_some_and(|mark| mark.consecutive >= MAX_CONSECUTIVE_CRASHES);
@@ -98,6 +105,45 @@ impl Phoenix {
             }
         }
         Ok(())
+    }
+
+    /// Walk the owner through device pairing, and wait for it to resolve.
+    ///
+    /// Waiting rather than returning is what keeps the restart report and the
+    /// interrupted turns intact: both are answered by a model turn, and both
+    /// pieces of evidence are gone by the next start. Phoenix already runs on its
+    /// own task, so the wait costs nothing else, and it is bounded by Codex,
+    /// which reports the fifteen-minute expiry as a failed login. Failing puts
+    /// this back in the caller's retry loop, which starts over with a fresh code.
+    async fn pair_with_codex(&self, chat_jid: &str) -> Result<()> {
+        info!("Codex is unauthenticated on startup; pairing through {chat_jid} before reporting");
+
+        // Subscribe before asking for the code, or an authorization completed
+        // while the message is still in flight arrives with nobody listening.
+        let mut completions = self.codex.subscribe_login_completed().await?;
+        let (url, code) = self.codex.request_device_login().await?;
+
+        let msg = format!(
+            "👋 Tera restarted and isn't paired with Codex.\n\n\
+             Authorize this device:\n\
+             1. Open {url}\n\
+             2. Enter code: *{code}*\n\n\
+             _The code expires in 15 minutes. I'll pick up where I left off once it's done._"
+        );
+        self.transport.send_text(chat_jid, &msg, None).await?;
+
+        let outcome = completions.recv().await;
+        // Spent either way: a retry has to be able to ask for a fresh code.
+        self.codex.clear_active_login().await;
+
+        match outcome {
+            Ok(true) => {
+                info!("Paired with Codex; continuing the startup report");
+                Ok(())
+            }
+            Ok(false) => bail!("device pairing was refused or expired"),
+            Err(e) => bail!("Codex stopped before pairing resolved: {e}"),
+        }
     }
 
     fn chat_to_speak_into(&self, pending: &[ConversationTurn]) -> Result<Option<String>> {

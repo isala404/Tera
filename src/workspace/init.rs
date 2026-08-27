@@ -215,6 +215,48 @@ impl WorkspaceInit {
         Ok(())
     }
 
+    /// Run `codex login --device-auth` to pair this machine with Codex via device code.
+    pub fn login_codex_device_auth() -> Result<()> {
+        println!("\nStarting Codex device pairing (OAuth device authorization)...");
+        println!("Follow the instructions displayed below to authorize this device:\n");
+
+        let status = Command::new("codex")
+            .args(["login", "--device-auth"])
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()
+            .context("Failed to execute `codex login --device-auth`. Ensure `codex` is installed and on PATH.")?;
+
+        if status.success() {
+            println!("\nSuccessfully paired with Codex!");
+            Ok(())
+        } else {
+            bail!("`codex login --device-auth` exited with status {}", status);
+        }
+    }
+
+    /// Explicitly log in and link Codex credentials for the workspace.
+    pub fn login(config: &Config, force: bool) -> Result<()> {
+        let source = dirs_home()
+            .map(|h| h.join(".codex").join("auth.json"))
+            .context("Cannot determine HOME directory to locate ~/.codex/auth.json")?;
+
+        if source.exists() && !force {
+            println!(
+                "Codex credentials already exist at {}.\nUse `tera login --force` to re-authenticate with a new device token.",
+                source.display()
+            );
+        } else {
+            Self::login_codex_device_auth()?;
+        }
+
+        fs::create_dir_all(config.codex_home_dir())
+            .with_context(|| format!("Failed to create directory {:?}", config.codex_home_dir()))?;
+        Self::link_codex_credentials(config);
+        Ok(())
+    }
+
     /// Point `<workspace>/.codex-home/auth.json` at the operator's real Codex
     /// credentials.
     ///
@@ -225,7 +267,11 @@ impl WorkspaceInit {
     fn link_codex_credentials(config: &Config) {
         let link = config.codex_home_dir().join("auth.json");
         if fs::symlink_metadata(&link).is_ok() {
-            return;
+            if link.exists() {
+                return;
+            }
+            // Dangling symlink; remove so it can be re-linked
+            let _ = fs::remove_file(&link);
         }
 
         let Some(source) = dirs_home().map(|h| h.join(".codex").join("auth.json")) else {
@@ -234,10 +280,6 @@ impl WorkspaceInit {
         };
 
         if !source.exists() {
-            warn!(
-                "No Codex credentials at {:?}. Run `codex login` or Codex turns will fail to authenticate.",
-                source
-            );
             return;
         }
 
@@ -647,5 +689,19 @@ mod tests {
         assert!(!is_safe_skill_path("../outside"));
         assert!(!is_safe_skill_path("scripts/../outside"));
         assert!(!is_safe_skill_path("/absolute"));
+    }
+
+    #[test]
+    fn test_login_links_existing_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Config::new(tmp.path().to_path_buf(), true);
+
+        if let Some(source) = dirs_home().map(|h| h.join(".codex").join("auth.json")) {
+            if source.exists() {
+                WorkspaceInit::login(&config, false).unwrap();
+                let link = config.codex_home_dir().join("auth.json");
+                assert!(link.exists());
+            }
+        }
     }
 }

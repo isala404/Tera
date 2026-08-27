@@ -68,6 +68,14 @@ enum Commands {
         #[command(flatten)]
         workspace: WorkspaceArg,
     },
+    /// Pair / log in to Codex using device authorization grant
+    Login {
+        #[command(flatten)]
+        workspace: WorkspaceArg,
+        /// Force re-pairing even if credentials already exist
+        #[arg(long)]
+        force: bool,
+    },
     /// Stdio MCP server proxy for Codex App Server
     Mcp {
         #[arg(long)]
@@ -175,6 +183,7 @@ impl Commands {
         match self {
             Commands::Daemon { workspace, .. }
             | Commands::Init { workspace }
+            | Commands::Login { workspace, .. }
             | Commands::Status { workspace }
             | Commands::Update { workspace, .. } => Some(&workspace.workspace),
             Commands::History { sub } => Some(sub.workspace()),
@@ -275,6 +284,14 @@ async fn main() -> Result<()> {
             info!("Initialization finished successfully!");
         }
 
+        Commands::Login {
+            workspace: WorkspaceArg { workspace },
+            force,
+        } => {
+            let config = Config::new(workspace, false);
+            WorkspaceInit::login(&config, force)?;
+        }
+
         // Reports what is degraded, not just what is configured: a status command
         // that only echoes paths back cannot tell you why the assistant is quiet.
         Commands::Status {
@@ -351,6 +368,15 @@ async fn main() -> Result<()> {
                 config.owner_name
             );
             println!("Model config: {}", config.codex_config_path().display());
+            let codex_auth_path = config.codex_home_dir().join("auth.json");
+            println!(
+                "Codex auth:   {}",
+                if codex_auth_path.exists() {
+                    "authenticated (auth.json linked)"
+                } else {
+                    "NOT AUTHENTICATED (run `tera login` to pair)"
+                }
+            );
 
             if config.runtime_db_path().exists() {
                 let rdb = RuntimeDb::open(&config.runtime_db_path())?;

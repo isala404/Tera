@@ -48,6 +48,7 @@ Every subcommand takes `--workspace <path>`, default `/workspace`. Point it some
 | --- | --- |
 | `daemon` | the assistant itself with WhatsApp, MCP socket and scheduler |
 | `init` | idempotent workspace setup, called automatically by `daemon` |
+| `login [--force]` | pair with Codex via device code and link credentials to the workspace |
 | `version [--json]` | binary version, commit SHA, build time and installed Codex version |
 | `update [--component all\|tera\|codex]` | update Codex and Tera, then restart with Phoenix rollback protection |
 | `mcp --socket <path>` | stdio proxy Codex spawns to reach the daemon's tools, not for humans |

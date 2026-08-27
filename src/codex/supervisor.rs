@@ -21,7 +21,7 @@ use anyhow::Result;
 use chrono::Utc;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 use tracing::{error, info, warn};
 
 #[derive(Clone)]
@@ -30,6 +30,7 @@ pub struct CodexSupervisor {
     runtime_db: RuntimeDb,
     history_db: HistoryDb,
     mgr: Arc<Mutex<Option<Arc<CodexProcessManager>>>>,
+    active_login: Arc<Mutex<Option<(String, String)>>>,
 }
 
 impl CodexSupervisor {
@@ -39,6 +40,7 @@ impl CodexSupervisor {
             runtime_db,
             history_db,
             mgr: Arc::new(Mutex::new(None)),
+            active_login: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -53,6 +55,47 @@ impl CodexSupervisor {
                 Err(e) => error!("Failed to bootstrap Codex app-server on startup: {:?}", e),
             }
         });
+    }
+
+    /// Check whether Codex currently has valid authentication.
+    ///
+    /// Not gated on `cfg(test)`: integration tests link this crate compiled
+    /// without it, so a test that drove a turn to completion would spawn a real
+    /// app-server against the operator's own account.
+    pub async fn check_authenticated(&self) -> bool {
+        if self.config.mock_transport {
+            return true;
+        }
+        match self.ensure().await {
+            Ok(mgr) => mgr.is_authenticated().await,
+            Err(_) => false,
+        }
+    }
+
+    /// Request an OAuth device code for pairing.
+    /// Returns `(verification_url, user_code)`. Caches the active request until completed or cleared.
+    pub async fn request_device_login(&self) -> Result<(String, String)> {
+        let mut lock = self.active_login.lock().await;
+        if let Some(cached) = lock.as_ref() {
+            return Ok(cached.clone());
+        }
+
+        let mgr = self.ensure().await?;
+        let (url, code) = mgr.start_device_login().await?;
+        *lock = Some((url.clone(), code.clone()));
+        Ok((url, code))
+    }
+
+    /// Clear the cached device login code (e.g. after login finishes).
+    pub async fn clear_active_login(&self) {
+        let mut lock = self.active_login.lock().await;
+        *lock = None;
+    }
+
+    /// Subscribe to login completion notifications from the app-server.
+    pub async fn subscribe_login_completed(&self) -> Result<broadcast::Receiver<bool>> {
+        let mgr = self.ensure().await?;
+        Ok(mgr.subscribe_login_completed())
     }
 
     /// The live app-server, spawning and attaching the main thread if needed.
