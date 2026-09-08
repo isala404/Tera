@@ -173,8 +173,9 @@ pub fn run(config: &Config, component: Component, force: bool) -> Result<UpdateO
         }
     }
 
+    let binary_target = current_executable()?;
     let restart_scheduled = if changed {
-        schedule_daemon_restart(config, &current_executable()?)?
+        schedule_daemon_restart(config, &binary_target)?
     } else {
         false
     };
@@ -532,10 +533,8 @@ fn compare_versions(left: &str, right: &str) -> Result<std::cmp::Ordering> {
 }
 
 fn current_executable() -> Result<PathBuf> {
-    std::env::current_exe()
-        .context("could not locate the running Tera binary")?
-        .canonicalize()
-        .context("could not resolve the running Tera binary")
+    let exe = std::env::current_exe().context("could not locate the running Tera binary")?;
+    Ok(exe.canonicalize().unwrap_or(exe))
 }
 
 fn updates_dir(config: &Config) -> PathBuf {
