@@ -12,7 +12,7 @@ use tera::scheduler::db::SchedulerDb;
 use tera::scheduler::recurrence;
 use tera::scheduler::SchedulerRunner;
 use tera::secrets::SecretStore;
-use tera::transport::{MockTransport, Transport, WhatsAppWebTransport};
+use tera::transport::{MockTransport, OwnerPolicy, Transport, WhatsAppWebTransport};
 use tera::workspace::WorkspaceInit;
 
 /// How many times Phoenix retries before giving up on reaching the owner. Ten
@@ -80,6 +80,8 @@ enum Commands {
     Mcp {
         #[arg(long)]
         socket: PathBuf,
+        #[arg(long)]
+        worker_id: Option<String>,
     },
     /// Print system health and state status
     Status {
@@ -392,7 +394,15 @@ async fn main() -> Result<()> {
                     None => println!("Thread:      none recorded"),
                 }
 
-                let schedules = SchedulerDb::list_schedules(&rdb).unwrap_or_default();
+                let schedules = match SchedulerDb::list_schedules(&rdb) {
+                    Ok(schedules) => schedules,
+                    Err(e) => {
+                        eprintln!("Schedules:   failed to read schedules: {e}");
+                        return Err(anyhow::anyhow!(
+                            "failed to read schedules from runtime database: {e}"
+                        ));
+                    }
+                };
                 println!("Schedules:   {} active", schedules.len());
                 for item in schedules.iter().take(10) {
                     // Local time, because that is the timezone the rule is written
@@ -408,7 +418,15 @@ async fn main() -> Result<()> {
                     );
                 }
 
-                let runs = SchedulerDb::recent_runs(&rdb, 5).unwrap_or_default();
+                let runs = match SchedulerDb::recent_runs(&rdb, 5) {
+                    Ok(runs) => runs,
+                    Err(e) => {
+                        eprintln!("Recent runs: failed to read recent runs: {e}");
+                        return Err(anyhow::anyhow!(
+                            "failed to read recent schedule runs from runtime database: {e}"
+                        ));
+                    }
+                };
                 if !runs.is_empty() {
                     println!("Recent runs:");
                     for run in runs {
@@ -423,12 +441,12 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Mcp { socket } => {
+        Commands::Mcp { socket, worker_id } => {
             // The proxy is a child process Codex spawns, addressed only by socket:
             // it has no workspace flag. It still needs the owner's name, because the
             // tool descriptions it serves are prompt text.
             let owner = Config::new(std::path::PathBuf::from("."), false).owner_name;
-            let proxy = StdioMcpProxy::new(socket, owner);
+            let proxy = StdioMcpProxy::new(socket, owner, worker_id);
             proxy.run().await?;
         }
 
@@ -521,6 +539,11 @@ async fn main() -> Result<()> {
 
             let _lock = DaemonLock::acquire(&config.lock_file_path())?;
 
+            let mut update_signal =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
+            let mut terminate_signal =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
             // Armed before anything else can fail, and removed only by a clean
             // exit further down. Whatever this returns is the previous life.
             let crashed = runtime::crash_mark::arm(&config.runtime_dir())?;
@@ -595,7 +618,10 @@ async fn main() -> Result<()> {
                 Arc::new(MockTransport::new())
             } else {
                 let wa_session_db = config.runtime_dir().join("whatsapp_session.db");
-                let wa_transport = Arc::new(WhatsAppWebTransport::new(wa_session_db));
+                let wa_transport = Arc::new(WhatsAppWebTransport::new(
+                    wa_session_db,
+                    OwnerPolicy::new(config.whatsapp_owner_number.clone()),
+                ));
                 let wa_clone = wa_transport.clone();
 
                 let turn_engine = Arc::new(TurnEngine::new(
@@ -684,16 +710,16 @@ async fn main() -> Result<()> {
                 transport.clone(),
                 session.clone(),
             ));
-            tokio::spawn(async move {
-                if let Err(e) = rpc_server.run().await {
-                    tracing::error!("RPC Server failure: {:?}", e);
-                }
-            });
+            let rpc_listener = rpc_server.bind()?;
+            let rpc_server_clone = rpc_server.clone();
+            let mut rpc_task =
+                tokio::spawn(async move { rpc_server_clone.run_listener(rpc_listener).await });
 
             let scheduler_runner = Arc::new(SchedulerRunner::new(
                 config.clone(),
                 runtime_db.clone(),
                 codex.clone(),
+                session.clone(),
             ));
             scheduler_runner.start_loop();
 
@@ -708,14 +734,17 @@ async fn main() -> Result<()> {
             // person. Nothing here restarts the daemon itself, because a process
             // that supervises itself is a worse supervisor than the one the OS
             // already runs.
-            let mut update_signal =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
-            let mut terminate_signal =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
             tokio::select! {
                 result = tokio::signal::ctrl_c() => result?,
                 _ = update_signal.recv() => {}
                 _ = terminate_signal.recv() => {}
+                rpc_res = &mut rpc_task => {
+                    match rpc_res {
+                        Ok(Err(e)) => anyhow::bail!("MCP RPC server failed: {:?}", e),
+                        Ok(Ok(())) => anyhow::bail!("MCP RPC server stopped unexpectedly"),
+                        Err(join_err) => anyhow::bail!("MCP RPC server task panicked: {:?}", join_err),
+                    }
+                }
             }
 
             // Graceful shutdown. Systemd may restart us, so what matters is
@@ -730,6 +759,12 @@ async fn main() -> Result<()> {
             if let Err(e) = std::fs::remove_file(config.socket_path()) {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     warn!("Could not remove the runtime socket: {:?}", e);
+                }
+            }
+            drop(_lock);
+            if let Err(e) = std::fs::remove_file(config.lock_file_path()) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    warn!("Could not remove the daemon lock file: {:?}", e);
                 }
             }
 

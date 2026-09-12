@@ -1,6 +1,7 @@
 use crate::transport::owner::jid_user;
 use crate::transport::{
-    InboundMedia, InboundMessage, InboundPresence, InboundPresenceKind, MessageRef, Transport,
+    InboundMedia, InboundMessage, InboundPresence, InboundPresenceKind, MessageRef, OwnerPolicy,
+    Transport,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -8,7 +9,7 @@ use qrcode::render::unicode;
 use qrcode::QrCode;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 use whatsapp_rust::bot::MessageContext;
 use whatsapp_rust::media;
@@ -60,7 +61,7 @@ fn print_pairing_qr(payload: &str, timeout: std::time::Duration) {
 ///
 /// WhatsApp clients decide how to render an attachment from this, so a video
 /// labelled application/octet-stream shows up as an unplayable file.
-fn mime_for(media_type: &str, path: &Path) -> String {
+pub(crate) fn mime_for(media_type: &str, path: &Path) -> String {
     let ext = path
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
@@ -182,13 +183,15 @@ fn quoted_message_provider_id(message: &wa::Message) -> Option<String> {
 pub struct WhatsAppWebTransport {
     session_db_path: PathBuf,
     client_handle: Arc<Mutex<Option<Arc<Client>>>>,
+    owner_policy: OwnerPolicy,
 }
 
 impl WhatsAppWebTransport {
-    pub fn new(session_db_path: PathBuf) -> Self {
+    pub fn new(session_db_path: PathBuf, owner_policy: OwnerPolicy) -> Self {
         Self {
             session_db_path,
             client_handle: Arc::new(Mutex::new(None)),
+            owner_policy,
         }
     }
 
@@ -221,10 +224,10 @@ impl WhatsAppWebTransport {
     ///
     /// Done eagerly, inside the message handler: WhatsApp media references are
     /// short-lived, so a message parked in a burst buffer for a few seconds can
-    /// no longer be fetched by the time the turn runs. Failure degrades to no
-    /// attachment, the text still gets through, and the caller can see that the
-    /// media is missing rather than silently answering blind.
-    async fn fetch_media(ctx: &MessageContext) -> Option<InboundMedia> {
+    /// no longer be fetched by the time the turn runs. Failure degrades to an
+    /// explicit error, the caller can see that the media download failed rather
+    /// than silently answering blind.
+    async fn fetch_media(ctx: &MessageContext) -> Result<Option<InboundMedia>, String> {
         let base = ctx.message.get_base_message();
 
         macro_rules! try_download {
@@ -234,16 +237,16 @@ impl WhatsAppWebTransport {
                     return match ctx.client.download(media).await {
                         Ok(data) => {
                             info!("Downloaded {} attachment ({} bytes)", $kind, data.len());
-                            Some(InboundMedia {
+                            Ok(Some(InboundMedia {
                                 media_type: $kind.to_string(),
                                 filename: media_filename(&ctx.info.id, &mime, $default_ext),
                                 mime_type: mime,
                                 data,
-                            })
+                            }))
                         }
                         Err(e) => {
                             warn!("Failed to download {} attachment: {:?}", $kind, e);
-                            None
+                            Err(format!("Failed to download {} attachment: {:?}", $kind, e))
                         }
                     };
                 }
@@ -256,7 +259,7 @@ impl WhatsAppWebTransport {
         try_download!(base.document_message, "document", "bin");
         try_download!(base.sticker_message, "sticker", "webp");
 
-        None
+        Ok(None)
     }
 
     async fn upload(
@@ -300,6 +303,7 @@ impl WhatsAppWebTransport {
 
         let callback_arc = Arc::new(inbound_callback);
         let presence_callback = Arc::new(presence_callback);
+        let owner_policy = self.owner_policy.clone();
 
         let bot = Bot::builder()
             .with_backend(store)
@@ -342,15 +346,30 @@ impl WhatsAppWebTransport {
             })
             .on_message(move |ctx| {
                 let cb = callback_arc.clone();
+                let policy = owner_policy.clone();
                 async move {
                     let sender = ctx.info.source.sender.to_string();
+                    let from_own_account = Self::is_own_account(&ctx);
+                    let is_group = ctx.info.source.is_group;
+
+                    if !policy
+                        .evaluate_sender(&sender, from_own_account, is_group)
+                        .is_accepted()
+                    {
+                        debug!("Ignoring message from non-owner: {}", sender);
+                        return;
+                    }
+
                     let text = ctx
                         .message
                         .text_content()
                         .or_else(|| ctx.message.get_caption())
                         .map(|s| s.to_string());
 
-                    let media_attachment = Self::fetch_media(&ctx).await;
+                    let (media_attachment, media_error) = match Self::fetch_media(&ctx).await {
+                        Ok(media) => (media, None),
+                        Err(err) => (None, Some(err)),
+                    };
                     let timestamp_ms = ctx.info.timestamp.timestamp_millis();
 
                     let msg = InboundMessage {
@@ -360,9 +379,10 @@ impl WhatsAppWebTransport {
                         timestamp_ms,
                         reply_to_provider_msg_id: quoted_message_provider_id(&ctx.message),
                         media_attachment,
+                        media_error,
                         chat_jid: ctx.info.source.chat.to_non_ad_string(),
-                        from_own_account: Self::is_own_account(&ctx),
-                        is_group: ctx.info.source.is_group,
+                        from_own_account,
+                        is_group,
                     };
 
                     cb(msg);

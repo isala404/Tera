@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::conversation::ConversationSession;
-use crate::history::db::{ConversationEvent, EventKind, HistoryDb, ProviderRef};
+use crate::history::assets::AssetStorage;
+use crate::history::db::{Attachment, ConversationEvent, HistoryDb, ProviderRef};
 use crate::runtime::RuntimeDb;
 use crate::scheduler::db::SchedulerDb;
 use crate::scheduler::recurrence::{self as recurrence, ScheduleTiming};
@@ -18,10 +19,9 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 /// One-line JSON summary for logs; tool arguments can carry whole documents.
-fn brief(v: &Value) -> String {
-    let s = v.to_string();
+fn brief(s: &str) -> String {
     if s.chars().count() <= 300 {
-        return s;
+        return s.to_string();
     }
     let head: String = s.chars().take(300).collect();
     format!("{head}… (+{} more chars)", s.chars().count() - 300)
@@ -32,6 +32,8 @@ pub struct DaemonRpcRequest {
     pub id: u64,
     pub tool_name: String,
     pub arguments: Value,
+    #[serde(default)]
+    pub worker_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,11 +45,11 @@ pub struct DaemonRpcResponse {
 
 pub struct DaemonRpcServer {
     config: Config,
+    secrets: SecretStore,
     history_db: HistoryDb,
     runtime_db: RuntimeDb,
     transport: Arc<dyn Transport>,
     session: ConversationSession,
-    secrets: SecretStore,
 }
 
 impl DaemonRpcServer {
@@ -68,7 +70,7 @@ impl DaemonRpcServer {
         }
     }
 
-    pub async fn run(self: Arc<Self>) -> Result<()> {
+    pub fn bind(&self) -> Result<UnixListener> {
         let sock_path = self.config.socket_path();
         if sock_path.exists() {
             let _ = std::fs::remove_file(&sock_path);
@@ -84,7 +86,10 @@ impl DaemonRpcServer {
             "Daemon MCP RPC server listening on Unix socket {:?}",
             sock_path
         );
+        Ok(listener)
+    }
 
+    pub async fn run_listener(self: Arc<Self>, listener: UnixListener) -> Result<()> {
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
@@ -100,6 +105,11 @@ impl DaemonRpcServer {
                 }
             }
         }
+    }
+
+    pub async fn run(self: Arc<Self>) -> Result<()> {
+        let listener = self.bind()?;
+        self.run_listener(listener).await
     }
 
     async fn handle_client(&self, stream: UnixStream) -> Result<()> {
@@ -130,22 +140,33 @@ impl DaemonRpcServer {
 
             // Both sides of every tool call are logged: this is the boundary
             // where the agent acts on the outside world.
+            let redacted_args = self.secrets.redact(&req.arguments.to_string());
+            let logged_args = brief(&redacted_args);
             info!(
                 target: "mcp::tool",
                 "-> {}({})",
                 req.tool_name,
-                brief(&req.arguments)
+                logged_args
             );
             let started = std::time::Instant::now();
 
-            let response = match self.execute_tool(&req.tool_name, &req.arguments).await {
+            let worker_id = req
+                .worker_id
+                .as_deref()
+                .or_else(|| req.arguments["worker_id"].as_str());
+
+            let response = match self
+                .execute_tool(&req.tool_name, &req.arguments, worker_id)
+                .await
+            {
                 Ok(val) => {
+                    let redacted_val = self.secrets.redact(&val.to_string());
                     info!(
                         target: "mcp::tool",
                         "<- {} ok in {}ms: {}",
                         req.tool_name,
                         started.elapsed().as_millis(),
-                        brief(&val)
+                        brief(&redacted_val)
                     );
                     DaemonRpcResponse {
                         id: req.id,
@@ -154,11 +175,13 @@ impl DaemonRpcServer {
                     }
                 }
                 Err(e) => {
+                    let redacted_err = self.secrets.redact(&e.to_string());
                     warn!(
                         target: "mcp::tool",
-                        "<- {} FAILED in {}ms: {e}",
+                        "<- {} FAILED in {}ms: {}",
                         req.tool_name,
-                        started.elapsed().as_millis()
+                        started.elapsed().as_millis(),
+                        brief(&redacted_err)
                     );
                     DaemonRpcResponse {
                         id: req.id,
@@ -213,11 +236,19 @@ impl DaemonRpcServer {
                 stored.chat_jid
             },
             from_me: stored.from_me,
-            text: self.history_db.get_event(event_id)?.and_then(|e| e.text),
+            text: self
+                .history_db
+                .get_event(event_id)?
+                .and_then(|e| e.text().map(str::to_string)),
         }))
     }
 
-    async fn execute_tool(&self, name: &str, args: &Value) -> Result<Value> {
+    pub async fn execute_tool(
+        &self,
+        name: &str,
+        args: &Value,
+        worker_id: Option<&str>,
+    ) -> Result<Value> {
         match name {
             "send_message" => {
                 let recipient = self.recipient()?;
@@ -247,58 +278,86 @@ impl DaemonRpcServer {
                 };
                 let reply_target = reply_target.as_ref();
 
-                let provider_msg_id = if let Some((media_type, media_path_str)) = attachment {
-                    let path = resolve_media_path(&self.config.workspace_dir, media_path_str)?;
-                    self.transport
-                        .send_media(
-                            &recipient,
-                            media_type,
-                            &path,
-                            outgoing.as_deref(),
-                            reply_target,
-                        )
-                        .await?
-                } else {
-                    self.transport
-                        .send_text(
-                            &recipient,
-                            outgoing.as_deref().unwrap_or_default(),
-                            reply_target,
-                        )
-                        .await?
-                };
+                let (provider_msg_id, attachments, event_id, occurred_at_ms) =
+                    if let Some((media_type, media_path_str)) = attachment {
+                        let path = resolve_media_path(&self.config.workspace_dir, media_path_str)?;
+                        let provider_msg_id = self
+                            .transport
+                            .send_media(
+                                &recipient,
+                                media_type,
+                                &path,
+                                outgoing.as_deref(),
+                                reply_target,
+                            )
+                            .await?;
+                        let data = std::fs::read(&path)
+                            .with_context(|| format!("Failed to read media from {:?}", path))?;
+                        let filename = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("attachment");
+                        let event_id = format!("m_{}", Uuid::new_v4().simple());
+                        let occurred_at_ms = Utc::now().timestamp_millis();
+                        let (_full, relative_path) = AssetStorage::save_attachment(
+                            &self.config,
+                            &event_id,
+                            occurred_at_ms,
+                            filename,
+                            &data,
+                        )?;
+                        let mime_type =
+                            Some(crate::transport::whatsapp::mime_for(media_type, &path));
+                        let att = Attachment {
+                            id: None,
+                            event_id: event_id.clone(),
+                            position: 0,
+                            media_type: media_type.to_string(),
+                            relative_path,
+                            mime_type,
+                            original_name: Some(filename.to_string()),
+                        };
+                        (provider_msg_id, vec![att], event_id, occurred_at_ms)
+                    } else {
+                        let provider_msg_id = self
+                            .transport
+                            .send_text(
+                                &recipient,
+                                outgoing.as_deref().unwrap_or_default(),
+                                reply_target,
+                            )
+                            .await?;
+                        let event_id = format!("m_{}", Uuid::new_v4().simple());
+                        let occurred_at_ms = Utc::now().timestamp_millis();
+                        (provider_msg_id, vec![], event_id, occurred_at_ms)
+                    };
 
-                let event = ConversationEvent {
-                    seq: None,
-                    id: format!("m_{}", Uuid::new_v4().simple()),
-                    occurred_at_ms: Utc::now().timestamp_millis(),
-                    kind: EventKind::Message,
-                    actor: "assistant".to_string(),
-                    text: authored,
-                    reply_to_id: reply_to.map(|id| id.to_string()),
-                    turn_id: self.session.turn(),
-                    reaction_target_id: None,
-                    reaction_emoji: None,
-                    attachments: vec![],
-                };
+                let event = ConversationEvent::message(
+                    event_id.clone(),
+                    occurred_at_ms,
+                    "assistant",
+                    authored,
+                    reply_to.map(str::to_string),
+                    self.session.turn_for(worker_id),
+                    attachments,
+                );
 
-                let saved_ev = self.history_db.insert_event(event)?;
-                self.history_db.record_provider_ref(&ProviderRef::whatsapp(
-                    &saved_ev.id,
-                    &provider_msg_id,
-                    &recipient,
-                    true,
-                ))?;
-                self.history_db
-                    .record_delivery_event(&saved_ev.id, "sent", None)?;
+                let provider_ref =
+                    ProviderRef::whatsapp(&event_id, &provider_msg_id, &recipient, true);
+
+                self.history_db.insert_event_full(
+                    event,
+                    Some(&provider_ref),
+                    Some(("sent", None)),
+                )?;
 
                 // Tell the turn engine the agent already spoke, so it does not
                 // deliver the final agent text on top of this.
-                self.session.record_send();
+                self.session.record_send_for(worker_id);
 
                 Ok(json!({
                     "status": "sent",
-                    "message_id": saved_ev.id,
+                    "message_id": event_id,
                     "provider_message_id": provider_msg_id
                 }))
             }
@@ -318,19 +377,13 @@ impl DaemonRpcServer {
                     .send_reaction(&recipient, &target, emoji)
                     .await?;
 
-                let event = ConversationEvent {
-                    seq: None,
-                    id: format!("r_{}", Uuid::new_v4().simple()),
-                    occurred_at_ms: Utc::now().timestamp_millis(),
-                    kind: EventKind::Reaction,
-                    actor: "assistant".to_string(),
-                    text: None,
-                    reply_to_id: None,
-                    turn_id: None,
-                    reaction_target_id: Some(msg_id.to_string()),
-                    reaction_emoji: Some(emoji.to_string()),
-                    attachments: vec![],
-                };
+                let event = ConversationEvent::reaction(
+                    format!("r_{}", Uuid::new_v4().simple()),
+                    Utc::now().timestamp_millis(),
+                    "assistant",
+                    msg_id,
+                    emoji,
+                );
                 self.history_db.insert_event(event)?;
 
                 Ok(json!({ "status": "reacted", "target": msg_id, "emoji": emoji }))
@@ -359,7 +412,7 @@ impl DaemonRpcServer {
                     "schedule_id": item.id,
                     "name": item.name,
                     "task_path": item.task_path,
-                    "first_run": recurrence::local_time(timing.first_run_ms),
+                    "first_run": recurrence::local_time(timing.first_run_ms()),
                 }))
             }
 
@@ -375,8 +428,8 @@ impl DaemonRpcServer {
                         json!({
                             "schedule_id": item.id,
                             "name": item.name,
-                            "type": item.schedule_type,
-                            "rrule": item.rrule,
+                            "type": item.schedule_type(),
+                            "rrule": item.rrule(),
                             "task_path": item.task_path,
                             "next_run": item.next_run_at_ms.map(recurrence::local_time),
                         })
@@ -564,6 +617,7 @@ mod tests {
             .execute_tool(
                 "send_message",
                 &json!({"text": "Log in: https://accounts.spotify.com/authorize?client_id=${SPOTIFY_CLIENT_ID}&state=x"}),
+                None,
             )
             .await
             .unwrap();
@@ -576,7 +630,7 @@ mod tests {
         );
 
         let events = server.history_db.list_events_all().unwrap();
-        let recorded = events[0].text.clone().unwrap();
+        let recorded = events[0].text().map(str::to_string).unwrap();
         assert!(
             recorded.contains("client_id=${SPOTIFY_CLIENT_ID}"),
             "{recorded}"
@@ -598,7 +652,11 @@ mod tests {
             .unwrap();
 
         server
-            .execute_tool("send_message", &json!({"text": "your id is abc123def456"}))
+            .execute_tool(
+                "send_message",
+                &json!({"text": "your id is abc123def456"}),
+                None,
+            )
             .await
             .unwrap();
 
@@ -613,19 +671,15 @@ mod tests {
 
         let incoming = server
             .history_db
-            .insert_event(ConversationEvent {
-                seq: None,
-                id: String::new(),
-                occurred_at_ms: 0,
-                kind: EventKind::Message,
-                actor: "user".to_string(),
-                text: Some("which one?".to_string()),
-                reply_to_id: None,
-                turn_id: None,
-                reaction_target_id: None,
-                reaction_emoji: None,
-                attachments: vec![],
-            })
+            .insert_event(ConversationEvent::message(
+                "",
+                0,
+                "user",
+                Some("which one?".to_string()),
+                None,
+                None,
+                vec![],
+            ))
             .unwrap();
         server
             .history_db
@@ -641,6 +695,7 @@ mod tests {
             .execute_tool(
                 "send_message",
                 &json!({"text": "that one", "reply_to": incoming.id}),
+                None,
             )
             .await
             .unwrap();
@@ -655,7 +710,7 @@ mod tests {
             .into_iter()
             .find(|e| e.actor == "assistant")
             .unwrap();
-        assert_eq!(reply.reply_to_id, Some(incoming.id));
+        assert_eq!(reply.reply_to_id(), Some(incoming.id.as_str()));
     }
 
     #[tokio::test]
@@ -664,9 +719,71 @@ mod tests {
         let (_transport, server) = test_server(dir.path());
 
         let error = server
-            .execute_tool("send_message", &json!({"text": "hi", "reply_to": "m_nope"}))
+            .execute_tool(
+                "send_message",
+                &json!({"text": "hi", "reply_to": "m_nope"}),
+                None,
+            )
             .await
             .unwrap_err();
         assert!(error.to_string().contains("cannot reply to it"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn outbound_attachments_are_saved_in_canonical_history() {
+        use crate::history::projection::ProjectionEngine;
+
+        let dir = tempdir().unwrap();
+        let (transport, server) = test_server(dir.path());
+
+        // Create a scratch file in workspace
+        let scratch_dir = dir.path().join("scratch");
+        std::fs::create_dir_all(&scratch_dir).unwrap();
+        let image_file = scratch_dir.join("photo.jpg");
+        std::fs::write(&image_file, b"test-jpeg-image-bytes").unwrap();
+
+        server
+            .execute_tool(
+                "send_message",
+                &json!({
+                    "image_path": image_file.to_str().unwrap(),
+                    "text": "here is the picture"
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(transport.sent_messages.lock().unwrap().len(), 1);
+
+        // Delete the original scratch file
+        std::fs::remove_file(&image_file).unwrap();
+
+        // Check canonical history has the attachment
+        let events = server.history_db.list_events_all().unwrap();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.attachments.len(), 1);
+        let att = &event.attachments[0];
+        assert_eq!(att.media_type, "image");
+
+        // Rebuild JSONL projection and verify reconstruction
+        let tmp_dir = dir.path().join(".runtime").join("tmp");
+        ProjectionEngine::rebuild_all(
+            &server.config.history_jsonl_dir(),
+            &tmp_dir,
+            &server.history_db,
+        )
+        .unwrap();
+
+        // Verify the saved asset still exists on disk
+        let saved_asset_full_path = server.config.resolve_asset(&att.relative_path);
+        assert!(
+            saved_asset_full_path.exists(),
+            "saved asset should exist at {:?}",
+            saved_asset_full_path
+        );
+        let asset_data = std::fs::read(&saved_asset_full_path).unwrap();
+        assert_eq!(asset_data, b"test-jpeg-image-bytes");
     }
 }

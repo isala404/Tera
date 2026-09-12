@@ -9,7 +9,7 @@ pub use engine::TurnEngine;
 pub use phoenix::Phoenix;
 pub use session::ConversationSession;
 
-use crate::history::db::{ConversationEvent, EventKind, HistoryDb, ProviderRef};
+use crate::history::db::{ConversationEvent, HistoryDb, ProviderRef};
 use anyhow::Result;
 use uuid::Uuid;
 
@@ -26,25 +26,19 @@ pub fn record_assistant_message(
     turn_id: Option<String>,
     reply_to_id: Option<String>,
 ) -> Result<String> {
-    let saved = history_db.insert_event(ConversationEvent {
-        seq: None,
-        id: format!("msg_{}", Uuid::new_v4().simple()),
-        occurred_at_ms: chrono::Utc::now().timestamp_millis(),
-        kind: EventKind::Message,
-        actor: "assistant".to_string(),
-        text: Some(text.to_string()),
+    let event_id = format!("msg_{}", Uuid::new_v4().simple());
+    let ev = ConversationEvent::message(
+        &event_id,
+        chrono::Utc::now().timestamp_millis(),
+        "assistant",
+        Some(text.to_string()),
         reply_to_id,
         turn_id,
-        reaction_target_id: None,
-        reaction_emoji: None,
-        attachments: vec![],
-    })?;
-    history_db.record_provider_ref(&ProviderRef::whatsapp(
-        &saved.id,
-        provider_msg_id,
-        chat_jid,
-        true,
-    ))?;
-    history_db.record_delivery_event(&saved.id, "sent", None)?;
+        vec![],
+    );
+    let pref = ProviderRef::whatsapp(&event_id, provider_msg_id, chat_jid, true);
+    let saved = history_db
+        .insert_event_full(ev, Some(&pref), Some(("sent", None)))?
+        .expect("assistant message must insert");
     Ok(saved.id)
 }

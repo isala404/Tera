@@ -97,9 +97,6 @@ async fn live_handshake_and_turn_round_trip() {
     );
 }
 
-/// PLAN.md Phase 1 success criterion:
-/// "Codex can start in /workspace and call a dummy MCP tool."
-///
 /// Exercises the whole bootstrap path: workspace init writes `.codex-home`,
 /// the daemon binds its Unix socket, the app-server starts against that Codex
 /// home, and Codex reaches back through the stdio MCP proxy into the daemon.
@@ -155,7 +152,7 @@ async fn live_codex_starts_in_workspace_and_calls_mcp_tool() {
 }
 
 /// The main thread must survive a daemon restart, or every restart silently
-/// drops the user's conversation context (PLAN.md section 12).
+/// drops the user's conversation context.
 #[tokio::test]
 #[ignore = "spawns a real codex app-server and consumes account tokens"]
 async fn live_thread_resume_preserves_context() {

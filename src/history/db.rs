@@ -97,36 +97,177 @@ impl rusqlite::types::FromSql for EventKind {
     }
 }
 
+pub(crate) const EVENT_COLUMNS: &str =
+    "seq, id, occurred_at_ms, kind, actor, text, reply_to_id, turn_id, reaction_target_id, reaction_emoji";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EventPayload {
+    Message {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+    },
+    Reaction {
+        target_id: String,
+        emoji: String,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationEvent {
     pub seq: Option<i64>,
     pub id: String,
     pub occurred_at_ms: i64,
-    pub kind: EventKind,
     pub actor: String,
-    pub text: Option<String>,
-    pub reply_to_id: Option<String>,
-    pub turn_id: Option<String>,
-    pub reaction_target_id: Option<String>,
-    pub reaction_emoji: Option<String>,
+    pub payload: EventPayload,
     pub attachments: Vec<Attachment>,
 }
 
-/// `get_event`, `list_events_all` and `recent_messages` each select the same
-/// columns in the same order; sharing the mapper is what keeps them from
-/// drifting when a column is added.
+impl ConversationEvent {
+    pub fn message(
+        id: impl Into<String>,
+        occurred_at_ms: i64,
+        actor: impl Into<String>,
+        text: Option<String>,
+        reply_to_id: Option<String>,
+        turn_id: Option<String>,
+        attachments: Vec<Attachment>,
+    ) -> Self {
+        Self {
+            seq: None,
+            id: id.into(),
+            occurred_at_ms,
+            actor: actor.into(),
+            payload: EventPayload::Message {
+                text,
+                reply_to_id,
+                turn_id,
+            },
+            attachments,
+        }
+    }
+
+    pub fn reaction(
+        id: impl Into<String>,
+        occurred_at_ms: i64,
+        actor: impl Into<String>,
+        target_id: impl Into<String>,
+        emoji: impl Into<String>,
+    ) -> Self {
+        Self {
+            seq: None,
+            id: id.into(),
+            occurred_at_ms,
+            actor: actor.into(),
+            payload: EventPayload::Reaction {
+                target_id: target_id.into(),
+                emoji: emoji.into(),
+            },
+            attachments: vec![],
+        }
+    }
+
+    pub fn kind(&self) -> EventKind {
+        match &self.payload {
+            EventPayload::Message { .. } => EventKind::Message,
+            EventPayload::Reaction { .. } => EventKind::Reaction,
+        }
+    }
+
+    pub fn text(&self) -> Option<&str> {
+        match &self.payload {
+            EventPayload::Message { text, .. } => text.as_deref(),
+            EventPayload::Reaction { .. } => None,
+        }
+    }
+
+    pub fn reply_to_id(&self) -> Option<&str> {
+        match &self.payload {
+            EventPayload::Message { reply_to_id, .. } => reply_to_id.as_deref(),
+            EventPayload::Reaction { .. } => None,
+        }
+    }
+
+    pub fn turn_id(&self) -> Option<&str> {
+        match &self.payload {
+            EventPayload::Message { turn_id, .. } => turn_id.as_deref(),
+            EventPayload::Reaction { .. } => None,
+        }
+    }
+
+    pub fn reaction_target_id(&self) -> Option<&str> {
+        match &self.payload {
+            EventPayload::Message { .. } => None,
+            EventPayload::Reaction { target_id, .. } => Some(target_id.as_str()),
+        }
+    }
+
+    pub fn reaction_emoji(&self) -> Option<&str> {
+        match &self.payload {
+            EventPayload::Message { .. } => None,
+            EventPayload::Reaction { emoji, .. } => Some(emoji.as_str()),
+        }
+    }
+}
+
+/// `get_event`, `list_events_all`, `recent_messages` and `messages_for_turn` each
+/// select the same columns in the same order; sharing the mapper is what keeps
+/// them from drifting when a column is added.
 fn row_to_event(row: &Row) -> rusqlite::Result<ConversationEvent> {
+    let seq: Option<i64> = Some(row.get(0)?);
+    let id: String = row.get(1)?;
+    let occurred_at_ms: i64 = row.get(2)?;
+    let kind: EventKind = row.get(3)?;
+    let actor: String = row.get(4)?;
+    let text: Option<String> = row.get(5)?;
+    let reply_to_id: Option<String> = row.get(6)?;
+    let turn_id: Option<String> = row.get(7)?;
+    let reaction_target_id: Option<String> = row.get(8)?;
+    let reaction_emoji: Option<String> = row.get(9)?;
+
+    let payload = match kind {
+        EventKind::Message => EventPayload::Message {
+            text,
+            reply_to_id,
+            turn_id,
+        },
+        EventKind::Reaction => {
+            let target_id = reaction_target_id
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        8,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "malformed reaction event: missing reaction_target_id",
+                        )),
+                    )
+                })?;
+            let emoji = reaction_emoji.filter(|s| !s.is_empty()).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    9,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "malformed reaction event: missing reaction_emoji",
+                    )),
+                )
+            })?;
+            EventPayload::Reaction { target_id, emoji }
+        }
+    };
+
     Ok(ConversationEvent {
-        seq: Some(row.get(0)?),
-        id: row.get(1)?,
-        occurred_at_ms: row.get(2)?,
-        kind: row.get(3)?,
-        actor: row.get(4)?,
-        text: row.get(5)?,
-        reply_to_id: row.get(6)?,
-        turn_id: row.get(7)?,
-        reaction_target_id: row.get(8)?,
-        reaction_emoji: row.get(9)?,
+        seq,
+        id,
+        occurred_at_ms,
+        actor,
+        payload,
         attachments: vec![],
     })
 }
@@ -184,25 +325,48 @@ impl HistoryDb {
 
     /// Append the event to canonical history, then project it into JSONL.
     ///
-    /// A failed projection is not a failed write: SQLite has committed, so the
-    /// event exists. The projection is marked dirty and rebuilt on next start.
+    /// Wrapped in a SQLite transaction together with any dependent rows: if an
+    /// attachment or provider reference fails to write, no orphaned event row or
+    /// projection survives.
     pub fn insert_event(&self, event: ConversationEvent) -> Result<ConversationEvent> {
-        let event = self.insert_event_sqlite(event)?;
-
-        if let Err(e) = ProjectionEngine::append_event(&self.jsonl_dir, &event) {
-            error!(
-                "Failed to append event {} to the JSONL projection: {:?}. \
-                 Canonical history is intact; the projection will be rebuilt on next start.",
-                event.id, e
-            );
-            ProjectionEngine::mark_dirty(&self.jsonl_dir);
-        }
-
-        Ok(event)
+        self.insert_event_full(event, None, None)
+            .map(|opt| opt.expect("event without provider ref cannot be deduplicated away"))
     }
 
-    fn insert_event_sqlite(&self, mut event: ConversationEvent) -> Result<ConversationEvent> {
-        let conn = self.conn.lock().unwrap();
+    /// Insert an inbound event and its provider reference atomically.
+    ///
+    /// Returns `Ok(None)` if the provider reference has already been accepted,
+    /// deduplicating replayed messages before side effects can happen.
+    pub fn insert_inbound_event(
+        &self,
+        event: ConversationEvent,
+        provider_ref: ProviderRef,
+    ) -> Result<Option<ConversationEvent>> {
+        self.insert_event_full(event, Some(&provider_ref), None)
+    }
+
+    pub fn insert_event_full(
+        &self,
+        mut event: ConversationEvent,
+        provider_ref: Option<&ProviderRef>,
+        delivery: Option<(&str, Option<&str>)>,
+    ) -> Result<Option<ConversationEvent>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        if let Some(r) = provider_ref {
+            let mut check_stmt = tx.prepare(
+                "SELECT 1 FROM provider_refs WHERE provider = ?1 AND provider_message_id = ?2",
+            )?;
+            let exists = check_stmt
+                .query_row(params![r.provider, r.provider_msg_id], |_| Ok(()))
+                .optional()?
+                .is_some();
+            if exists {
+                return Ok(None);
+            }
+        }
+
         if event.id.is_empty() {
             event.id = format!("m_{}", Uuid::new_v4().simple());
         }
@@ -210,30 +374,54 @@ impl HistoryDb {
             event.occurred_at_ms = Utc::now().timestamp_millis();
         }
 
-        conn.execute(
+        let (kind, text, reply_to_id, turn_id, reaction_target_id, reaction_emoji) =
+            match &event.payload {
+                EventPayload::Message {
+                    text,
+                    reply_to_id,
+                    turn_id,
+                } => (
+                    EventKind::Message,
+                    text.as_deref(),
+                    reply_to_id.as_deref(),
+                    turn_id.as_deref(),
+                    None,
+                    None,
+                ),
+                EventPayload::Reaction { target_id, emoji } => (
+                    EventKind::Reaction,
+                    None,
+                    None,
+                    None,
+                    Some(target_id.as_str()),
+                    Some(emoji.as_str()),
+                ),
+            };
+
+        tx.execute(
             "INSERT INTO conversation_events (
                 id, occurred_at_ms, kind, actor, text, reply_to_id, turn_id, reaction_target_id, reaction_emoji
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 event.id,
                 event.occurred_at_ms,
-                event.kind,
+                kind,
                 event.actor,
-                event.text,
-                event.reply_to_id,
-                event.turn_id,
-                event.reaction_target_id,
-                event.reaction_emoji,
+                text,
+                reply_to_id,
+                turn_id,
+                reaction_target_id,
+                reaction_emoji,
             ],
         )?;
 
-        let seq = conn.last_insert_rowid();
+        let seq = tx.last_insert_rowid();
         event.seq = Some(seq);
 
         for (pos, att) in event.attachments.iter_mut().enumerate() {
             att.event_id = event.id.clone();
             att.position = pos as i32;
-            conn.execute(
+            tx.execute(
                 "INSERT INTO attachments (
                     event_id, position, media_type, relative_path, mime_type, original_name
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -246,10 +434,54 @@ impl HistoryDb {
                     att.original_name,
                 ],
             )?;
-            att.id = Some(conn.last_insert_rowid());
+            att.id = Some(tx.last_insert_rowid());
         }
 
-        Ok(event)
+        if let Some(r) = provider_ref {
+            tx.execute(
+                "INSERT INTO provider_refs (event_id, provider, provider_message_id, chat_jid, from_me)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![event.id, r.provider, r.provider_msg_id, r.chat_jid, r.from_me as i32],
+            )?;
+        }
+
+        if let Some((state, detail)) = delivery {
+            tx.execute(
+                "INSERT INTO delivery_events (event_id, occurred_at_ms, state, detail) VALUES (?1, ?2, ?3, ?4)",
+                params![event.id, Utc::now().timestamp_millis(), state, detail],
+            )?;
+        }
+
+        tx.commit()?;
+        drop(conn);
+
+        if let Err(e) = ProjectionEngine::append_event(&self.jsonl_dir, &event) {
+            error!(
+                "Failed to append event {} to the JSONL projection: {:?}. \
+                 Canonical history is intact; the projection will be rebuilt on next start.",
+                event.id, e
+            );
+            ProjectionEngine::mark_dirty(&self.jsonl_dir);
+        }
+
+        Ok(Some(event))
+    }
+
+    /// Whether this provider message has already been recorded in history.
+    pub fn is_provider_message_recorded(
+        &self,
+        provider: &str,
+        provider_msg_id: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT 1 FROM provider_refs WHERE provider = ?1 AND provider_message_id = ?2",
+        )?;
+        let exists = stmt
+            .query_row(params![provider, provider_msg_id], |_| Ok(()))
+            .optional()?
+            .is_some();
+        Ok(exists)
     }
 
     /// Our event id for a message the provider knows by its own id.
@@ -276,9 +508,15 @@ impl HistoryDb {
     pub fn record_provider_ref(&self, r: &ProviderRef) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO provider_refs (event_id, provider, provider_message_id, chat_jid, from_me)
+            "INSERT INTO provider_refs (event_id, provider, provider_message_id, chat_jid, from_me)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![r.event_id, r.provider, r.provider_msg_id, r.chat_jid, r.from_me as i32],
+            params![
+                r.event_id,
+                r.provider,
+                r.provider_msg_id,
+                r.chat_jid,
+                r.from_me as i32
+            ],
         )?;
         Ok(())
     }
@@ -308,6 +546,47 @@ impl HistoryDb {
         Ok(res)
     }
 
+    pub fn lookup_provider_ref_by_provider_id(
+        &self,
+        provider_msg_id: &str,
+        provider: &str,
+    ) -> Result<Option<ProviderRef>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT event_id, chat_jid, from_me FROM provider_refs
+             WHERE provider_message_id = ?1 AND provider = ?2",
+        )?;
+        let res = stmt
+            .query_row(params![provider_msg_id, provider], |row| {
+                let from_me: i32 = row.get(2)?;
+                Ok(ProviderRef {
+                    event_id: row.get(0)?,
+                    provider: provider.to_string(),
+                    provider_msg_id: provider_msg_id.to_string(),
+                    chat_jid: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    from_me: from_me != 0,
+                })
+            })
+            .optional()?;
+        Ok(res)
+    }
+
+    pub fn list_turn_events(&self, turn_id: &str) -> Result<Vec<ConversationEvent>> {
+        let conn = self.conn.lock().unwrap();
+        let query = format!(
+            "SELECT {EVENT_COLUMNS} FROM conversation_events WHERE turn_id = ?1 ORDER BY seq ASC"
+        );
+        let mut stmt = conn.prepare(&query)?;
+        let rows = stmt.query_map(params![turn_id], row_to_event)?;
+        let mut events = Vec::new();
+        for row in rows {
+            let mut ev = row?;
+            ev.attachments = load_attachments(&conn, &ev.id)?;
+            events.push(ev);
+        }
+        Ok(events)
+    }
+
     pub fn record_delivery_event(
         &self,
         event_id: &str,
@@ -324,10 +603,8 @@ impl HistoryDb {
 
     pub fn get_event(&self, event_id: &str) -> Result<Option<ConversationEvent>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT seq, id, occurred_at_ms, kind, actor, text, reply_to_id, turn_id, reaction_target_id, reaction_emoji
-             FROM conversation_events WHERE id = ?1"
-        )?;
+        let query = format!("SELECT {EVENT_COLUMNS} FROM conversation_events WHERE id = ?1");
+        let mut stmt = conn.prepare(&query)?;
         let event_opt = stmt.query_row(params![event_id], row_to_event).optional()?;
 
         if let Some(mut ev) = event_opt {
@@ -347,10 +624,8 @@ impl HistoryDb {
 
     pub fn list_events_all(&self) -> Result<Vec<ConversationEvent>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT seq, id, occurred_at_ms, kind, actor, text, reply_to_id, turn_id, reaction_target_id, reaction_emoji
-             FROM conversation_events ORDER BY seq ASC"
-        )?;
+        let query = format!("SELECT {EVENT_COLUMNS} FROM conversation_events ORDER BY seq ASC");
+        let mut stmt = conn.prepare(&query)?;
 
         let mut events = Vec::new();
         let rows = stmt.query_map([], row_to_event)?;
@@ -369,12 +644,12 @@ impl HistoryDb {
     /// rejoin the conversation without receiving the whole history database.
     pub fn recent_messages(&self, limit: usize) -> Result<Vec<ConversationEvent>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT seq, id, occurred_at_ms, kind, actor, text, reply_to_id, turn_id, reaction_target_id, reaction_emoji
-             FROM conversation_events
+        let query = format!(
+            "SELECT {EVENT_COLUMNS} FROM conversation_events
              WHERE kind = 'message'
-             ORDER BY seq DESC LIMIT ?1",
-        )?;
+             ORDER BY seq DESC LIMIT ?1"
+        );
+        let mut stmt = conn.prepare(&query)?;
         let rows = stmt.query_map(params![limit as i64], row_to_event)?;
 
         let mut events = Vec::new();
@@ -392,12 +667,12 @@ impl HistoryDb {
     /// Recovery must not mistake nearby history for part of the interrupted job.
     pub fn messages_for_turn(&self, turn_id: &str) -> Result<Vec<ConversationEvent>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT seq, id, occurred_at_ms, kind, actor, text, reply_to_id, turn_id, reaction_target_id, reaction_emoji
-             FROM conversation_events
+        let query = format!(
+            "SELECT {EVENT_COLUMNS} FROM conversation_events
              WHERE kind = 'message' AND turn_id = ?1
-             ORDER BY seq ASC",
-        )?;
+             ORDER BY seq ASC"
+        );
+        let mut stmt = conn.prepare(&query)?;
         let rows = stmt.query_map(params![turn_id], row_to_event)?;
 
         let mut events = Vec::new();

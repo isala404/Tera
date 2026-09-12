@@ -23,6 +23,8 @@ pub struct Config {
     /// Codex can spawn the MCP proxy. Overridable via `TERA_BIN`. Under
     /// `cargo test` the current executable is the test harness, not the daemon.
     pub tera_bin: PathBuf,
+    /// Path or command for the Codex executable (defaults to "codex", overridable per instance).
+    pub codex_bin: PathBuf,
 }
 
 impl Config {
@@ -38,13 +40,23 @@ impl Config {
             .or_else(|| std::env::current_exe().ok())
             .unwrap_or_else(|| PathBuf::from("tera"));
 
+        let codex_bin = std::env::var_os("TERA_CODEX_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("codex"));
+
         Self {
             workspace_dir,
             owner_name: resolve_owner_name(),
             whatsapp_owner_number,
             mock_transport,
             tera_bin,
+            codex_bin,
         }
+    }
+
+    pub fn with_codex_bin(mut self, bin: impl Into<PathBuf>) -> Self {
+        self.codex_bin = bin.into();
+        self
     }
 
     pub fn runtime_dir(&self) -> PathBuf {

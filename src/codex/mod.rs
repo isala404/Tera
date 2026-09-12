@@ -4,11 +4,10 @@
 pub const CACHE_TTL_MS: i64 = 30 * 60 * 1000;
 
 pub mod log;
-pub mod models;
 pub mod process;
 pub mod rpc;
 pub mod supervisor;
 pub mod thread_router;
 
-pub use process::CodexProcessManager;
+pub use process::{CodexProcessManager, ThreadOptions, TurnInput};
 pub use supervisor::CodexSupervisor;

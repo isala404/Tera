@@ -73,7 +73,7 @@ fn try_seed(runtime_db: &RuntimeDb, builtin: &Builtin) -> Result<()> {
         "Seeded the {} schedule ({}); first run {}",
         builtin.name,
         item.id,
-        recurrence::local_time(timing.first_run_ms)
+        recurrence::local_time(timing.first_run_ms())
     );
     Ok(())
 }
@@ -101,7 +101,7 @@ mod tests {
                 .iter()
                 .find(|item| item.name == builtin.name)
                 .unwrap_or_else(|| panic!("{} was not seeded", builtin.name));
-            assert_eq!(seeded.rrule.as_deref(), Some(builtin.rrule));
+            assert_eq!(seeded.rrule(), Some(builtin.rrule));
             assert!(seeded.next_run_at_ms.is_some(), "it would never fire");
         }
 

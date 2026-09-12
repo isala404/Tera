@@ -174,29 +174,79 @@ impl SecretStore {
         Ok(removed)
     }
 
+    fn pending_path(&self) -> PathBuf {
+        self.path.with_file_name("pending_secret.json")
+    }
+
     /// Claim the owner's next message as the value for `name`.
     pub fn request(&self, name: &str, now_ms: i64) -> Result<()> {
         let name = validate_name(name)?;
         let mut contents = self.load()?;
-        contents.pending = Some(PendingRequest {
-            name,
+        let req = PendingRequest {
+            name: name.clone(),
             requested_at_ms: now_ms,
-        });
-        self.save(&contents)
+        };
+        contents.pending = Some(req.clone());
+        self.save(&contents)?;
+
+        let parent = self
+            .pending_path()
+            .parent()
+            .context("Secret store path has no parent directory")?
+            .to_path_buf();
+        fs::create_dir_all(&parent)?;
+        let mut serialized = serde_json::to_vec_pretty(&req)?;
+        serialized.push(b'\n');
+        crate::runtime::write_atomic(&self.pending_path(), &serialized, 0o600)?;
+        Ok(())
     }
 
     pub fn pending(&self, now_ms: i64) -> Result<Option<PendingRequest>> {
-        Ok(self
-            .load()?
-            .pending
-            .filter(|request| !request.expired(now_ms)))
+        let p_path = self.pending_path();
+        if p_path.exists() {
+            match fs::read_to_string(&p_path) {
+                Ok(raw) => match serde_json::from_str::<PendingRequest>(&raw) {
+                    Ok(req) => {
+                        if !req.expired(now_ms) {
+                            return Ok(Some(req));
+                        }
+                    }
+                    Err(e) => {
+                        bail!("Pending credential storage {:?} is corrupted: {e}", p_path);
+                    }
+                },
+                Err(e) => {
+                    bail!("Cannot read pending credential storage {:?}: {e}", p_path);
+                }
+            }
+        }
+
+        match self.load() {
+            Ok(contents) => Ok(contents.pending.filter(|r| !r.expired(now_ms))),
+            Err(e) => {
+                if self.path.exists() {
+                    bail!("Secret store {:?} is unreadable: {e}", self.path);
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    pub fn has_pending(&self, now_ms: i64) -> bool {
+        match self.pending(now_ms) {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(_) => true,
+        }
     }
 
     pub fn clear_pending(&self) -> Result<()> {
-        let mut contents = self.load()?;
-        if contents.pending.is_some() {
-            contents.pending = None;
-            self.save(&contents)?;
+        let _ = fs::remove_file(self.pending_path());
+        if let Ok(mut contents) = self.load() {
+            if contents.pending.is_some() {
+                contents.pending = None;
+                self.save(&contents)?;
+            }
         }
         Ok(())
     }
@@ -226,11 +276,22 @@ impl SecretStore {
             };
             // Whatever happened, an explicit /secret ends any guided request:
             // leaving it armed would claim the owner's next ordinary message.
-            self.clear_pending()?;
+            self.clear_pending().ok();
             return Ok(outcome);
         }
 
-        let Some(request) = self.pending(now_ms)? else {
+        let pending = match self.pending(now_ms) {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(Capture::Rejected {
+                    reason: format!(
+                        "a credential was requested, but the secret store could not be read: {e}"
+                    ),
+                });
+            }
+        };
+
+        let Some(request) = pending else {
             return Ok(Capture::Passthrough);
         };
 
@@ -242,7 +303,7 @@ impl SecretStore {
         } else {
             self.store(request.name, value, now_ms)
         };
-        self.clear_pending()?;
+        self.clear_pending().ok();
         Ok(outcome)
     }
 
@@ -612,5 +673,52 @@ mod tests {
         store.set("TOKEN", "value", 0).unwrap();
         assert!(store.remove("TOKEN").unwrap());
         assert!(!store.remove("TOKEN").unwrap());
+    }
+
+    #[test]
+    fn test_pending_request_shared_across_distinct_instances() {
+        let (dir, store1) = store();
+        let store2 = SecretStore::new(dir.path().join("secrets.json"));
+
+        store1.request("API_KEY", 0).unwrap();
+        assert!(store2.has_pending(0));
+
+        let outcome = store2.capture("my-secret-key-12345", 100).unwrap();
+        assert_eq!(
+            outcome,
+            Capture::Stored {
+                name: "API_KEY".to_string(),
+            }
+        );
+        assert!(!store1.has_pending(100));
+        assert!(!store2.has_pending(100));
+    }
+
+    #[test]
+    fn test_corrupt_store_fails_closed_and_does_not_pass_through() {
+        let (dir, store) = store();
+        let path = dir.path().join("secrets.json");
+        std::fs::write(&path, "CORRUPT NOT JSON").unwrap();
+
+        // Corrupt store must fail closed: has_pending returns true, capture returns Rejected
+        assert!(store.has_pending(0));
+        let capture = store.capture("potential-secret-leak", 0).unwrap();
+        assert!(matches!(capture, Capture::Rejected { .. }));
+    }
+
+    #[test]
+    fn test_request_on_corrupt_store_fails_without_erasing_store() {
+        let (dir, store) = store();
+        let path = dir.path().join("secrets.json");
+        let corrupt_content = "CORRUPT NOT JSON CONTENT";
+        std::fs::write(&path, corrupt_content).unwrap();
+
+        let res = store.request("NEW_KEY", 0);
+        assert!(res.is_err(), "request on corrupt store must return Err");
+        let content_after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            content_after, corrupt_content,
+            "store was erased or overwritten"
+        );
     }
 }

@@ -1,0 +1,40 @@
+name: Verify
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  verify:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install required tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg sqlite3 jq
+          mkdir -p "$HOME/.local/bin"
+          if ! command -v codex >/dev/null 2>&1; then
+            cat << 'EOF' > "$HOME/.local/bin/codex"
+          #!/bin/sh
+          echo "codex 0.1.0"
+          EOF
+            chmod +x "$HOME/.local/bin/codex"
+          fi
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Rust tests
+        run: cargo test --all-targets --locked
+      - name: Python tests
+        run: python3 -m unittest tests/audio_skill_test.py tests/model_config_skill_test.py tests/spotify_skill_test.py

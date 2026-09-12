@@ -11,6 +11,7 @@ pub struct InboundMessage {
     pub timestamp_ms: i64,
     pub reply_to_provider_msg_id: Option<String>,
     pub media_attachment: Option<InboundMedia>,
+    pub media_error: Option<String>,
     /// Chat this message belongs to, without a device suffix. Replies and
     /// reactions must address this, not the sending device.
     pub chat_jid: String,
@@ -33,6 +34,7 @@ impl InboundMessage {
     /// chat that the owner's first real message was then steered into.
     pub fn is_answerable(&self) -> bool {
         self.media_attachment.is_some()
+            || self.media_error.is_some()
             || self
                 .text
                 .as_deref()
@@ -126,6 +128,7 @@ mod tests {
             timestamp_ms: 0,
             reply_to_provider_msg_id: None,
             media_attachment: media,
+            media_error: None,
             chat_jid: "owner@s.whatsapp.net".to_string(),
             from_own_account: true,
             is_group: false,
@@ -156,5 +159,9 @@ mod tests {
         assert!(message(Some("hi"), None).is_answerable());
         // A bare photo carries no text and still has to be answered.
         assert!(message(None, Some(media())).is_answerable());
+
+        let mut failed = message(None, None);
+        failed.media_error = Some("failed to download".to_string());
+        assert!(failed.is_answerable());
     }
 }

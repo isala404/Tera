@@ -42,13 +42,15 @@ pub struct StdioMcpProxy {
     /// addressed by socket and has no workspace of its own, so it is passed in
     /// rather than read from a `Config`.
     owner_name: String,
+    worker_id: Option<String>,
 }
 
 impl StdioMcpProxy {
-    pub fn new(socket_path: PathBuf, owner_name: String) -> Self {
+    pub fn new(socket_path: PathBuf, owner_name: String, worker_id: Option<String>) -> Self {
         Self {
             socket_path,
             owner_name,
+            worker_id,
         }
     }
 
@@ -157,10 +159,27 @@ impl StdioMcpProxy {
 
         let (reader, mut writer) = stream.into_split();
 
+        let worker_id = self
+            .worker_id
+            .clone()
+            .or_else(|| std::env::var("TERA_WORKER_ID").ok())
+            .or_else(|| {
+                std::fs::read_to_string(".worker_id")
+                    .or_else(|_| std::fs::read_to_string("WORKER_ID"))
+                    .ok()
+                    .map(|s| s.trim().to_string())
+            })
+            .or_else(|| {
+                args.get("worker_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+
         let req = DaemonRpcRequest {
             id,
             tool_name: name.to_string(),
             arguments: args,
+            worker_id,
         };
 
         let req_line = serde_json::to_string(&req)? + "\n";

@@ -28,18 +28,15 @@ use std::str::FromStr;
 /// and then fired on the very next tick, "every minute for five minutes"
 /// delivered five messages at once.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScheduleTiming {
-    pub schedule_type: String,
-    pub one_shot_at_ms: Option<i64>,
-    pub rrule: Option<String>,
-    /// When this schedule should first fire.
-    pub first_run_ms: i64,
+pub enum ScheduleTiming {
+    Once { at_ms: i64 },
+    Recurring { rrule: String, first_run_ms: i64 },
 }
 
 impl ScheduleTiming {
     pub fn parse(timing: &serde_json::Value, now_ms: i64) -> Result<Self> {
-        let schedule_type = timing["type"].as_str().unwrap_or("once").to_string();
-        let rrule = timing["rrule"].as_str().map(str::to_string);
+        let schedule_type = timing["type"].as_str().unwrap_or("once");
+        let rrule = timing["rrule"].as_str();
 
         let one_shot_at_ms = match timing["at"].as_str() {
             Some(at) => Some(
@@ -52,7 +49,7 @@ impl ScheduleTiming {
             None => None,
         };
 
-        match schedule_type.as_str() {
+        match schedule_type {
             "once" => {
                 let at_ms = one_shot_at_ms.ok_or_else(|| {
                     anyhow!("a one-shot schedule requires timing.at as an RFC3339 timestamp")
@@ -64,40 +61,55 @@ impl ScheduleTiming {
                         rfc3339(now_ms),
                     ));
                 }
+                Ok(Self::Once { at_ms })
             }
             "recurring" => {
-                let rule = rrule.as_deref().ok_or_else(|| {
+                let rule = rrule.ok_or_else(|| {
                     anyhow!("a recurring schedule requires timing.rrule (a cron expression in local time, or EVERY_<n>M / EVERY_<n>H / EVERY_<n>D)")
                 })?;
-                // Rejected here rather than at fire time: the agent is holding the
-                // conversation and can read the error and correct itself, which
-                // nothing can do five hours later inside the scheduler loop.
                 Recurrence::parse(rule)?;
+                let first_run_ms =
+                    RecurrenceEngine::compute_next_run("recurring", None, Some(rule), now_ms)?
+                        .ok_or_else(|| {
+                            anyhow!("could not derive a first run time from the given timing")
+                        })?;
+                Ok(Self::Recurring {
+                    rrule: rule.to_string(),
+                    first_run_ms,
+                })
             }
-            other => {
-                return Err(anyhow!(
-                    "unknown schedule type {other:?}; use \"once\" or \"recurring\""
-                ))
-            }
+            other => Err(anyhow!(
+                "unknown schedule type {other:?}; use \"once\" or \"recurring\""
+            )),
         }
+    }
 
-        // A recurring schedule has no `at`, so its first run must be derived from
-        // the rule; storing None left it permanently not-due, because the runner
-        // only selects rows that have a next run.
-        let first_run_ms = RecurrenceEngine::compute_next_run(
-            &schedule_type,
-            one_shot_at_ms,
-            rrule.as_deref(),
-            now_ms,
-        )?
-        .ok_or_else(|| anyhow!("could not derive a first run time from the given timing"))?;
+    pub fn first_run_ms(&self) -> i64 {
+        match self {
+            Self::Once { at_ms } => *at_ms,
+            Self::Recurring { first_run_ms, .. } => *first_run_ms,
+        }
+    }
 
-        Ok(Self {
-            schedule_type,
-            one_shot_at_ms,
-            rrule,
-            first_run_ms,
-        })
+    pub fn schedule_type(&self) -> &'static str {
+        match self {
+            Self::Once { .. } => "once",
+            Self::Recurring { .. } => "recurring",
+        }
+    }
+
+    pub fn one_shot_at_ms(&self) -> Option<i64> {
+        match self {
+            Self::Once { at_ms } => Some(*at_ms),
+            Self::Recurring { .. } => None,
+        }
+    }
+
+    pub fn rrule(&self) -> Option<&str> {
+        match self {
+            Self::Once { .. } => None,
+            Self::Recurring { rrule, .. } => Some(rrule),
+        }
     }
 }
 
@@ -342,8 +354,8 @@ mod tests {
         let future_ms = now + 300_000;
         let timing = json!({"type": "once", "at": rfc3339(future_ms)});
         let parsed = ScheduleTiming::parse(&timing, now).unwrap();
-        assert_eq!(parsed.first_run_ms, future_ms);
-        assert_eq!(parsed.one_shot_at_ms, Some(future_ms));
+        assert_eq!(parsed.first_run_ms(), future_ms);
+        assert_eq!(parsed.one_shot_at_ms(), Some(future_ms));
     }
 
     /// Regression: a recurring schedule stored next_run_at_ms = None, and the
@@ -353,7 +365,7 @@ mod tests {
         let now = 1_700_000_000_000;
         let timing = json!({"type": "recurring", "rrule": "EVERY_1M"});
         let parsed = ScheduleTiming::parse(&timing, now).unwrap();
-        assert_eq!(parsed.first_run_ms, now + 60_000);
+        assert_eq!(parsed.first_run_ms(), now + 60_000);
     }
 
     #[test]
@@ -388,7 +400,7 @@ mod tests {
         ] {
             let timing = json!({"type": "recurring", "rrule": bad});
             let err = ScheduleTiming::parse(&timing, now)
-                .map(|t| t.first_run_ms)
+                .map(|t| t.first_run_ms())
                 .unwrap_err()
                 .to_string();
             assert!(

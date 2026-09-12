@@ -1,6 +1,7 @@
 use crate::codex::log::{is_stderr_problem, log_notification, strip_ansi, truncate};
 use crate::codex::rpc::{JsonRpcRequest, JsonRpcResponse};
 use crate::config::Config;
+use crate::secrets::SecretStore;
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -43,11 +44,22 @@ struct ResumeConfig {
 #[derive(Debug, Clone)]
 pub struct ThreadOptions {
     pub cwd: std::path::PathBuf,
+    pub worker_id: Option<String>,
 }
 
 impl ThreadOptions {
     pub fn new(cwd: impl Into<std::path::PathBuf>) -> Self {
-        Self { cwd: cwd.into() }
+        Self {
+            cwd: cwd.into(),
+            worker_id: None,
+        }
+    }
+
+    pub fn with_worker(cwd: impl Into<std::path::PathBuf>, worker_id: impl Into<String>) -> Self {
+        Self {
+            cwd: cwd.into(),
+            worker_id: Some(worker_id.into()),
+        }
     }
 }
 
@@ -140,25 +152,74 @@ pub struct CodexProcessManager {
     login_completed_tx: broadcast::Sender<bool>,
 }
 
+struct TurnGuard {
+    listeners: Arc<Mutex<HashMap<String, TurnListener>>>,
+    listener_id: String,
+    active_turns: Arc<Mutex<HashMap<String, String>>>,
+    thread_id: String,
+    active: bool,
+}
+
+impl TurnGuard {
+    async fn cleanup(&mut self) {
+        if self.active {
+            self.active = false;
+            self.listeners.lock().await.remove(&self.listener_id);
+            self.active_turns.lock().await.remove(&self.thread_id);
+        }
+    }
+}
+
+impl Drop for TurnGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let listeners = self.listeners.clone();
+            let listener_id = self.listener_id.clone();
+            let active_turns = self.active_turns.clone();
+            let thread_id = self.thread_id.clone();
+            tokio::spawn(async move {
+                listeners.lock().await.remove(&listener_id);
+                active_turns.lock().await.remove(&thread_id);
+            });
+        }
+    }
+}
+
 impl CodexProcessManager {
     pub async fn spawn(codex_home: Option<&std::path::Path>) -> Result<Self> {
-        Self::spawn_with_overrides(codex_home, &[]).await
+        let secrets_path = codex_home
+            .and_then(|p| p.parent())
+            .map(|p| p.join("secrets.json"))
+            .unwrap_or_else(|| std::path::PathBuf::from("secrets.json"));
+        Self::spawn_with_overrides(codex_home, &[], SecretStore::new(secrets_path), None).await
     }
 
     pub async fn spawn_for(config: &Config) -> Result<Self> {
-        Self::spawn_with_overrides(Some(&config.codex_home_dir()), &config.codex_overrides()).await
+        Self::spawn_with_overrides(
+            Some(&config.codex_home_dir()),
+            &config.codex_overrides(),
+            SecretStore::new(config.secrets_path()),
+            Some(&config.codex_bin),
+        )
+        .await
     }
 
     async fn spawn_with_overrides(
         codex_home: Option<&std::path::Path>,
         overrides: &[String],
+        secrets: SecretStore,
+        codex_bin_override: Option<&std::path::Path>,
     ) -> Result<Self> {
         info!(
             "Spawning persistent 'codex app-server' process (codex_home={:?})",
             codex_home
         );
 
-        let mut cmd = Command::new("codex");
+        let codex_bin = codex_bin_override
+            .map(|p| p.to_string_lossy().to_string())
+            .or_else(|| std::env::var("TERA_CODEX_BIN").ok())
+            .unwrap_or_else(|| "codex".to_string());
+        let mut cmd = Command::new(codex_bin);
         for value in overrides {
             cmd.arg("-c").arg(value);
         }
@@ -257,12 +318,14 @@ impl CodexProcessManager {
         // a slow one: requests and turns could wait indefinitely instead of failing.
         let dead_on_exit = dead.clone();
         let listeners_on_exit = turn_listeners.clone();
+        let waiters_on_exit = waiters.clone();
         tokio::spawn(async move {
             match child.wait().await {
                 Ok(status) => error!("codex app-server exited: {status}"),
                 Err(e) => error!("Could not wait on codex app-server: {e}"),
             }
             dead_on_exit.store(true, Ordering::SeqCst);
+            waiters_on_exit.lock().await.clear();
             Self::fail_listeners(&listeners_on_exit, "codex app-server exited").await;
         });
 
@@ -306,7 +369,7 @@ impl CodexProcessManager {
                             info!("Codex notification account/login/completed: success={success}");
                             let _ = login_tx_for_reader.send(success);
                         }
-                        log_notification(&v);
+                        log_notification(&v, &secrets);
                         Self::track_active_turn(&turns_clone, &v).await;
                         if let Some((thread_id, event)) = Self::classify_notification(&v) {
                             Self::dispatch(&listeners_clone, &thread_id, event).await;
@@ -324,6 +387,7 @@ impl CodexProcessManager {
             }
             warn!("codex app-server stdout closed");
             dead_on_eof.store(true, Ordering::SeqCst);
+            waiters_clone.lock().await.clear();
             Self::fail_listeners(&listeners_clone, "codex app-server stdout closed").await;
         });
 
@@ -367,11 +431,21 @@ impl CodexProcessManager {
     /// a task thread rooted in `tasks/memory-compaction` searches that directory
     /// and stops, so the owner's own skills go missing from every scheduled run.
     fn thread_params(opts: &ThreadOptions) -> Value {
+        let mut config_obj = json!({ "project_root_markers": [".codex-home"] });
+        if let Some(worker_id) = &opts.worker_id {
+            config_obj["mcp_servers"] = json!({
+                "tera": {
+                    "env": {
+                        "TERA_WORKER_ID": worker_id
+                    }
+                }
+            });
+        }
         json!({
             "cwd": opts.cwd.to_string_lossy(),
             "approvalPolicy": "never",
             "sandbox": "danger-full-access",
-            "config": { "project_root_markers": [".codex-home"] },
+            "config": config_obj,
         })
     }
 
@@ -718,8 +792,7 @@ impl CodexProcessManager {
         Ok(())
     }
 
-    /// Stop the turn running on a thread. Used to get out of the way of real work
-    /// when maintenance is holding the app-server.
+    /// Stop the turn running on a thread.
     pub async fn interrupt(&self, thread_id: &str) -> Result<()> {
         let Some(turn_id) = self.active_turn_of(thread_id).await else {
             return Ok(());
@@ -752,7 +825,10 @@ impl CodexProcessManager {
                 auth_method.is_some() && !auth_method.unwrap().is_null()
             }
             Err(e) => {
-                warn!("Could not query getAuthStatus from codex app-server: {:?}", e);
+                warn!(
+                    "Could not query getAuthStatus from codex app-server: {:?}",
+                    e
+                );
                 false
             }
         }
@@ -791,7 +867,17 @@ impl CodexProcessManager {
         let lock = listeners.lock().await;
         for listener in lock.values() {
             if listener.thread_id == thread_id {
-                let _ = listener.tx.try_send(event.clone());
+                let is_terminal = matches!(event, TurnEvent::Completed | TurnEvent::Failed(_));
+                if let Err(mpsc::error::TrySendError::Full(ev)) =
+                    listener.tx.try_send(event.clone())
+                {
+                    if is_terminal {
+                        let tx = listener.tx.clone();
+                        tokio::spawn(async move {
+                            let _ = tx.send(ev).await;
+                        });
+                    }
+                }
             }
         }
     }
@@ -799,7 +885,13 @@ impl CodexProcessManager {
     async fn fail_listeners(listeners: &Arc<Mutex<HashMap<String, TurnListener>>>, reason: &str) {
         let lock = listeners.lock().await;
         for listener in lock.values() {
-            let _ = listener.tx.try_send(TurnEvent::Failed(reason.to_string()));
+            let event = TurnEvent::Failed(reason.to_string());
+            if let Err(mpsc::error::TrySendError::Full(ev)) = listener.tx.try_send(event) {
+                let tx = listener.tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(ev).await;
+                });
+            }
         }
     }
 
@@ -841,7 +933,10 @@ impl CodexProcessManager {
 
         let resp = tokio::time::timeout(std::time::Duration::from_secs(15), rx)
             .await
-            .map_err(|_| anyhow!("Timeout waiting for response to method '{}'", method))??;
+            .map_err(|_| anyhow!("Timeout waiting for response to method '{}'", method))?
+            .map_err(|_| {
+                anyhow!("codex app-server exited while waiting for response to '{method}'")
+            })?;
 
         if let Some(err) = resp.error {
             return Err(anyhow!(
@@ -852,6 +947,14 @@ impl CodexProcessManager {
         }
 
         Ok(resp.result.unwrap_or(Value::Null))
+    }
+
+    pub async fn active_turn_count(&self) -> usize {
+        self.active_turns.lock().await.len()
+    }
+
+    pub async fn turn_listener_count(&self) -> usize {
+        self.turn_listeners.lock().await.len()
     }
 
     /// Convenience for text-only turns (tests, scheduled prompts).
@@ -887,6 +990,14 @@ impl CodexProcessManager {
             );
         }
 
+        let mut guard = TurnGuard {
+            listeners: self.turn_listeners.clone(),
+            listener_id: listener_id.clone(),
+            active_turns: self.active_turns.clone(),
+            thread_id: thread_id.clone(),
+            active: true,
+        };
+
         let turn_req = json!({
             "threadId": thread_id,
             "input": inputs.iter().map(TurnInput::to_json).collect::<Vec<_>>(),
@@ -915,12 +1026,7 @@ impl CodexProcessManager {
             }
         };
 
-        {
-            let mut lock = self.turn_listeners.lock().await;
-            lock.remove(&listener_id);
-        }
-        self.active_turns.lock().await.remove(&thread_id);
-
+        guard.cleanup().await;
         outcome
     }
 
@@ -1294,5 +1400,112 @@ mod tests {
 
         let error = waiting.await.unwrap().unwrap_err();
         assert!(error.to_string().contains("codex app-server exited"));
+    }
+
+    #[tokio::test]
+    async fn test_overflow_queue_delivers_completed() {
+        let listeners = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, mut rx) = mpsc::channel(256);
+        listeners.lock().await.insert(
+            "listener".to_string(),
+            TurnListener {
+                thread_id: "thread".to_string(),
+                tx,
+            },
+        );
+
+        let waiting = tokio::spawn(async move { CodexProcessManager::collect_turn(&mut rx).await });
+
+        // Flood the 256-event channel with 300 delta events
+        for i in 0..300 {
+            CodexProcessManager::dispatch(
+                &listeners,
+                "thread",
+                TurnEvent::Delta(format!("chunk_{i}")),
+            )
+            .await;
+        }
+
+        // Terminal event must be delivered reliably despite queue full
+        CodexProcessManager::dispatch(&listeners, "thread", TurnEvent::Completed).await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+            .await
+            .expect("collect_turn should not hang when queue overflows")
+            .expect("join should succeed")
+            .expect("turn should complete");
+
+        assert!(result.contains("chunk_0"));
+    }
+
+    #[tokio::test]
+    async fn test_overflow_queue_delivers_failure() {
+        let listeners = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, mut rx) = mpsc::channel(256);
+        listeners.lock().await.insert(
+            "listener".to_string(),
+            TurnListener {
+                thread_id: "thread".to_string(),
+                tx,
+            },
+        );
+
+        let waiting = tokio::spawn(async move { CodexProcessManager::collect_turn(&mut rx).await });
+
+        for i in 0..300 {
+            CodexProcessManager::dispatch(
+                &listeners,
+                "thread",
+                TurnEvent::Delta(format!("chunk_{i}")),
+            )
+            .await;
+        }
+
+        CodexProcessManager::fail_listeners(&listeners, "process crash on overflow").await;
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+            .await
+            .expect("collect_turn should not hang when process fails on overflow")
+            .expect("join should succeed")
+            .expect_err("turn should fail");
+
+        assert!(err.to_string().contains("process crash on overflow"));
+    }
+
+    #[tokio::test]
+    async fn test_turn_guard_cleans_up_on_drop() {
+        let listeners: Arc<Mutex<HashMap<String, TurnListener>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let active_turns: Arc<Mutex<HashMap<String, String>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let (tx, _rx) = mpsc::channel(256);
+        listeners.lock().await.insert(
+            "test_listener".to_string(),
+            TurnListener {
+                thread_id: "th_test".to_string(),
+                tx,
+            },
+        );
+        active_turns
+            .lock()
+            .await
+            .insert("th_test".to_string(), "turn_test".to_string());
+
+        // Exercise production TurnGuard on drop
+        {
+            let _guard = TurnGuard {
+                listeners: listeners.clone(),
+                listener_id: "test_listener".to_string(),
+                active_turns: active_turns.clone(),
+                thread_id: "th_test".to_string(),
+                active: true,
+            };
+            // Guard dropped here
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(listeners.lock().await.is_empty());
+        assert!(active_turns.lock().await.is_empty());
     }
 }

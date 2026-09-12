@@ -7,7 +7,7 @@
 //! Appends are driven from `HistoryDb::insert_event` rather than from each call
 //! site, so there is no way to write an event and forget the projection.
 
-use crate::history::db::{ConversationEvent, EventKind, HistoryDb};
+use crate::history::db::{ConversationEvent, EventPayload, HistoryDb};
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -21,21 +21,30 @@ use tracing::{info, warn};
 /// projection has drifted from SQLite and rebuilds it.
 const DIRTY_MARKER: &str = ".projection-dirty";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum JsonlRecord {
     Message(JsonlMessage),
     Reaction(JsonlReaction),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl JsonlRecord {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Message(m) => &m.id,
+            Self::Reaction(r) => &r.id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JsonlAsset {
     #[serde(rename = "type")]
     pub media_type: String,
     pub path: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JsonlMessage {
     pub id: String,
     pub t: String,
@@ -50,7 +59,7 @@ pub struct JsonlMessage {
     pub assets: Option<Vec<JsonlAsset>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JsonlReaction {
     pub id: String,
     pub t: String,
@@ -66,39 +75,44 @@ impl ProjectionEngine {
         let dt: DateTime<Utc> = Utc.timestamp_millis_opt(event.occurred_at_ms).unwrap();
         let t_str = dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
-        if event.kind == EventKind::Reaction {
-            JsonlRecord::Reaction(JsonlReaction {
+        match &event.payload {
+            EventPayload::Reaction { target_id, emoji } => JsonlRecord::Reaction(JsonlReaction {
                 id: event.id.clone(),
                 t: t_str,
                 from: event.actor.clone(),
-                reaction: event.reaction_emoji.clone().unwrap_or_default(),
-                to: event.reaction_target_id.clone().unwrap_or_default(),
-            })
-        } else {
-            let assets = if !event.attachments.is_empty() {
-                Some(
-                    event
-                        .attachments
-                        .iter()
-                        .map(|a| JsonlAsset {
-                            media_type: a.media_type.clone(),
-                            path: a.relative_path.clone(),
-                        })
-                        .collect(),
-                )
-            } else {
-                None
-            };
+                reaction: emoji.clone(),
+                to: target_id.clone(),
+            }),
+            EventPayload::Message {
+                text,
+                reply_to_id,
+                turn_id,
+            } => {
+                let assets = if !event.attachments.is_empty() {
+                    Some(
+                        event
+                            .attachments
+                            .iter()
+                            .map(|a| JsonlAsset {
+                                media_type: a.media_type.clone(),
+                                path: a.relative_path.clone(),
+                            })
+                            .collect(),
+                    )
+                } else {
+                    None
+                };
 
-            JsonlRecord::Message(JsonlMessage {
-                id: event.id.clone(),
-                t: t_str,
-                from: event.actor.clone(),
-                turn: event.turn_id.clone(),
-                reply_to: event.reply_to_id.clone(),
-                text: event.text.clone(),
-                assets,
-            })
+                JsonlRecord::Message(JsonlMessage {
+                    id: event.id.clone(),
+                    t: t_str,
+                    from: event.actor.clone(),
+                    turn: turn_id.clone(),
+                    reply_to: reply_to_id.clone(),
+                    text: text.clone(),
+                    assets,
+                })
+            }
         }
     }
 
@@ -159,32 +173,87 @@ impl ProjectionEngine {
         Ok(total)
     }
 
+    /// Validate the JSONL projection files against canonical history.
+    ///
+    /// Checks:
+    /// - Not marked dirty.
+    /// - Every line parses as valid JSON matching `JsonlRecord`.
+    /// - No duplicate IDs.
+    /// - Total record count matches canonical event count.
+    /// - Every canonical event corresponds to a projected record with identical
+    ///   fields (id, timestamp, actor, text/reaction, assets).
+    pub fn validate_projection(jsonl_dir: &Path, history_db: &HistoryDb) -> Result<bool> {
+        if Self::is_dirty(jsonl_dir) {
+            return Ok(false);
+        }
+        if !jsonl_dir.exists() {
+            let count = history_db.count_events()?;
+            return Ok(count == 0);
+        }
+
+        let mut projected_records = HashMap::new();
+        for entry in fs::read_dir(jsonl_dir)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|e| e == "jsonl") {
+                let content = fs::read_to_string(&path)?;
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let record: JsonlRecord = match serde_json::from_str(trimmed) {
+                        Ok(r) => r,
+                        Err(_) => return Ok(false), // invalid JSON
+                    };
+                    if projected_records
+                        .insert(record.id().to_string(), record)
+                        .is_some()
+                    {
+                        return Ok(false); // duplicate ID
+                    }
+                }
+            }
+        }
+
+        let canonical_events = history_db.list_events_all()?;
+        if canonical_events.len() != projected_records.len() {
+            return Ok(false); // count mismatch
+        }
+
+        for event in canonical_events {
+            let Some(projected) = projected_records.get(&event.id) else {
+                return Ok(false); // missing record
+            };
+            let expected = Self::event_to_record(&event);
+            if projected != &expected {
+                return Ok(false); // changed text, mismatched reaction, or differing fields
+            }
+        }
+
+        Ok(true)
+    }
+
     /// Check the projection against canonical history on daemon start, and
     /// rebuild it if they disagree.
-    ///
-    /// The dirty marker only catches appends that failed loudly, and writing the
-    /// marker can itself fail. A projection short of canonical history reads to
-    /// the agent as a conversation that never happened, so counting is worth
-    /// doing on every start rather than on suspicion.
     pub fn verify_and_repair(
         jsonl_dir: &Path,
         staging_root: &Path,
         history_db: &HistoryDb,
     ) -> Result<()> {
-        let canonical = history_db.count_events()?;
-        let projected = Self::projected_line_count(jsonl_dir)?;
-        let dirty = Self::is_dirty(jsonl_dir);
+        let is_valid = match Self::validate_projection(jsonl_dir, history_db) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Failed to validate projection: {e}; rebuilding");
+                false
+            }
+        };
 
-        if !dirty && canonical == projected {
-            info!("JSONL projection is in sync with history ({canonical} events)");
+        if is_valid {
+            info!("JSONL projection is in sync with canonical history");
             return Ok(());
         }
 
-        warn!(
-            "JSONL projection is out of sync (history {canonical} events, projection \
-             {projected} records{}); rebuilding it",
-            if dirty { ", marked dirty" } else { "" }
-        );
+        warn!("JSONL projection is out of sync or corrupt; rebuilding it");
         Self::rebuild_all(jsonl_dir, staging_root, history_db)
     }
 
@@ -264,19 +333,7 @@ mod tests {
     use crate::history::db::Attachment;
 
     fn message(id: &str, actor: &str, at_ms: i64, text: &str) -> ConversationEvent {
-        ConversationEvent {
-            seq: None,
-            id: id.to_string(),
-            occurred_at_ms: at_ms,
-            kind: EventKind::Message,
-            actor: actor.to_string(),
-            text: Some(text.to_string()),
-            reply_to_id: None,
-            turn_id: None,
-            reaction_target_id: None,
-            reaction_emoji: None,
-            attachments: vec![],
-        }
+        ConversationEvent::message(id, at_ms, actor, Some(text.to_string()), None, None, vec![])
     }
 
     #[test]
@@ -297,11 +354,7 @@ mod tests {
 
     #[test]
     fn test_reaction_renders_as_a_reaction_record() {
-        let mut ev = message("r_1", "user", 1_786_962_664_000, "");
-        ev.kind = EventKind::Reaction;
-        ev.text = None;
-        ev.reaction_emoji = Some("❤️".to_string());
-        ev.reaction_target_id = Some("m_1".to_string());
+        let ev = ConversationEvent::reaction("r_1", 1_786_962_664_000, "user", "m_1", "❤️");
 
         let v: serde_json::Value =
             serde_json::to_value(ProjectionEngine::event_to_record(&ev)).unwrap();
@@ -351,5 +404,54 @@ mod tests {
         assert!(!ProjectionEngine::is_dirty(&jsonl));
         ProjectionEngine::mark_dirty(&jsonl);
         assert!(ProjectionEngine::is_dirty(&jsonl));
+    }
+
+    #[test]
+    fn test_validate_projection_detects_corruption_and_repairs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("history.sqlite3");
+        let jsonl_dir = dir.path().join("jsonl");
+        let staging = dir.path().join("staging");
+        let db = HistoryDb::open(&db_path, &jsonl_dir).unwrap();
+
+        let ev = message("m_1", "user", 1_785_538_800_000, "original message");
+        db.insert_event(ev).unwrap();
+
+        // Initially valid
+        assert!(ProjectionEngine::validate_projection(&jsonl_dir, &db).unwrap());
+
+        // 1. Invalid JSON corrupts projection
+        let month_file = jsonl_dir.join("2026-07.jsonl");
+        fs::write(&month_file, "not JSON at all\n").unwrap();
+        assert!(!ProjectionEngine::validate_projection(&jsonl_dir, &db).unwrap());
+        // Verify and repair fixes it
+        ProjectionEngine::verify_and_repair(&jsonl_dir, &staging, &db).unwrap();
+        assert!(ProjectionEngine::validate_projection(&jsonl_dir, &db).unwrap());
+
+        // 2. Changed text corrupts projection
+        fs::write(
+            &month_file,
+            "{\"id\":\"m_1\",\"t\":\"2026-07-31T23:00:00.000Z\",\"from\":\"user\",\"text\":\"tampered message\"}\n",
+        )
+        .unwrap();
+        assert!(!ProjectionEngine::validate_projection(&jsonl_dir, &db).unwrap());
+        ProjectionEngine::verify_and_repair(&jsonl_dir, &staging, &db).unwrap();
+        assert!(ProjectionEngine::validate_projection(&jsonl_dir, &db).unwrap());
+
+        // 3. Duplicate IDs corrupt projection
+        let rec = serde_json::to_string(&ProjectionEngine::event_to_record(
+            &db.get_event("m_1").unwrap().unwrap(),
+        ))
+        .unwrap();
+        fs::write(&month_file, format!("{rec}\n{rec}\n")).unwrap();
+        assert!(!ProjectionEngine::validate_projection(&jsonl_dir, &db).unwrap());
+        ProjectionEngine::verify_and_repair(&jsonl_dir, &staging, &db).unwrap();
+        assert!(ProjectionEngine::validate_projection(&jsonl_dir, &db).unwrap());
+
+        // 4. Missing record corrupts projection
+        fs::write(&month_file, "").unwrap();
+        assert!(!ProjectionEngine::validate_projection(&jsonl_dir, &db).unwrap());
+        ProjectionEngine::verify_and_repair(&jsonl_dir, &staging, &db).unwrap();
+        assert!(ProjectionEngine::validate_projection(&jsonl_dir, &db).unwrap());
     }
 }

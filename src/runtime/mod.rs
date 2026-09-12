@@ -5,4 +5,4 @@ pub mod state;
 
 pub use fs::{executable_on_path, write_atomic};
 pub use locks::DaemonLock;
-pub use state::{ConversationTurn, MainThreadState, ModelObservation, RuntimeDb};
+pub use state::{ConversationTurn, MainThreadState, RuntimeDb, TurnState};

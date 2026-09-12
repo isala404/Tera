@@ -58,6 +58,66 @@ pub struct MainThreadState {
 
 /// A foreground turn's lifecycle, mirroring [`ScheduleRun`].
 ///
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnState {
+    Running,
+    Completed,
+    Failed,
+    Abandoned,
+}
+
+impl TurnState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Abandoned => "abandoned",
+        }
+    }
+}
+
+impl std::fmt::Display for TurnState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TurnState {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "abandoned" => Ok(Self::Abandoned),
+            other => Err(anyhow::anyhow!("unknown turn state {other:?}")),
+        }
+    }
+}
+
+impl rusqlite::types::ToSql for TurnState {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(self.as_str().into())
+    }
+}
+
+impl rusqlite::types::FromSql for TurnState {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        let s = value.as_str()?;
+        match s {
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "abandoned" => Ok(Self::Abandoned),
+            other => Err(rusqlite::types::FromSqlError::Other(
+                format!("unknown turn state {other:?}").into(),
+            )),
+        }
+    }
+}
+
 /// The scheduler already models "work a crash can interrupt" as a row with a
 /// state; a conversation turn is the same thing with a person waiting on it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,16 +129,7 @@ pub struct ConversationTurn {
     pub finished_at_ms: Option<i64>,
     /// Recovery attempts spent on this turn. Zero until Phoenix picks it up.
     pub attempts: i64,
-    /// "running" | "completed" | "failed" | "abandoned"
-    pub state: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelObservation {
-    pub model_id: String,
-    pub display_name: Option<String>,
-    pub is_default: bool,
-    pub observed_at_ms: i64,
+    pub state: TurnState,
 }
 
 #[derive(Clone)]
@@ -183,13 +234,67 @@ impl RuntimeDb {
         Ok(())
     }
 
-    pub fn finish_turn(&self, turn_id: &str, state: &str) -> Result<()> {
+    pub fn finish_turn(&self, turn_id: &str, state: TurnState) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE conversation_turns SET finished_at_ms = ?1, state = ?2 WHERE turn_id = ?3",
-            params![Utc::now().timestamp_millis(), state, turn_id],
+            params![Utc::now().timestamp_millis(), state.as_str(), turn_id],
         )?;
         Ok(())
+    }
+
+    pub fn update_turn_last_provider_msg_id(
+        &self,
+        turn_id: &str,
+        last_provider_msg_id: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE conversation_turns SET last_provider_msg_id = ?1 WHERE turn_id = ?2",
+            params![last_provider_msg_id, turn_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_turn(&self, turn_id: &str) -> Result<Option<ConversationTurn>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT turn_id, chat_jid, last_provider_msg_id, started_at_ms, finished_at_ms, attempts, state
+             FROM conversation_turns WHERE turn_id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![turn_id], |row| {
+            let state_str: String = row.get(6)?;
+            let state = match state_str.as_str() {
+                "running" => TurnState::Running,
+                "completed" => TurnState::Completed,
+                "failed" => TurnState::Failed,
+                "abandoned" => TurnState::Abandoned,
+                other => {
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("unknown turn state {other:?}"),
+                        )),
+                    ));
+                }
+            };
+            Ok(ConversationTurn {
+                turn_id: row.get(0)?,
+                chat_jid: row.get(1)?,
+                last_provider_msg_id: row.get(2)?,
+                started_at_ms: row.get(3)?,
+                finished_at_ms: row.get(4)?,
+                attempts: row.get(5)?,
+                state,
+            })
+        })?;
+        if let Some(res) = rows.next() {
+            Ok(Some(res?))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Turns with no terminal state, oldest first.
@@ -203,6 +308,23 @@ impl RuntimeDb {
              FROM conversation_turns WHERE finished_at_ms IS NULL ORDER BY started_at_ms ASC",
         )?;
         let rows = stmt.query_map([], |row| {
+            let state_str: String = row.get(6)?;
+            let state = match state_str.as_str() {
+                "running" => TurnState::Running,
+                "completed" => TurnState::Completed,
+                "failed" => TurnState::Failed,
+                "abandoned" => TurnState::Abandoned,
+                other => {
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("unknown turn state {other:?}"),
+                        )),
+                    ));
+                }
+            };
             Ok(ConversationTurn {
                 turn_id: row.get(0)?,
                 chat_jid: row.get(1)?,
@@ -210,7 +332,7 @@ impl RuntimeDb {
                 started_at_ms: row.get(3)?,
                 finished_at_ms: row.get(4)?,
                 attempts: row.get(5)?,
-                state: row.get(6)?,
+                state,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -244,42 +366,6 @@ impl RuntimeDb {
         )?;
         Ok(attempts)
     }
-
-    pub fn record_model_observation(&self, obs: &ModelObservation) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT OR REPLACE INTO model_observations (
-                model_id, display_name, is_default, observed_at_ms
-            ) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                obs.model_id,
-                obs.display_name,
-                if obs.is_default { 1 } else { 0 },
-                obs.observed_at_ms
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn get_last_default_model(&self) -> Result<Option<ModelObservation>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT model_id, display_name, is_default, observed_at_ms
-             FROM model_observations WHERE is_default = 1 ORDER BY observed_at_ms DESC LIMIT 1",
-        )?;
-        let res = stmt
-            .query_row([], |row| {
-                let is_def_num: i32 = row.get(2)?;
-                Ok(ModelObservation {
-                    model_id: row.get(0)?,
-                    display_name: row.get(1)?,
-                    is_default: is_def_num != 0,
-                    observed_at_ms: row.get(3)?,
-                })
-            })
-            .optional()?;
-        Ok(res)
-    }
 }
 
 #[cfg(test)]
@@ -298,7 +384,7 @@ mod tests {
             .unwrap();
         db.start_turn("turn_2", "947@s.whatsapp.net", "wamid.2")
             .unwrap();
-        db.finish_turn("turn_2", "completed").unwrap();
+        db.finish_turn("turn_2", TurnState::Completed).unwrap();
 
         let open = db.unfinished_turns().unwrap();
         assert_eq!(open.len(), 1);
@@ -329,7 +415,7 @@ mod tests {
         assert_eq!(db.record_turn_attempt("turn_1").unwrap(), 1);
         assert_eq!(db.record_turn_attempt("turn_1").unwrap(), 2);
 
-        db.finish_turn("turn_1", "abandoned").unwrap();
+        db.finish_turn("turn_1", TurnState::Abandoned).unwrap();
         assert!(db.unfinished_turns().unwrap().is_empty());
     }
 }

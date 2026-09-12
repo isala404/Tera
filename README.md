@@ -107,7 +107,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now tera
 ```
 
-Add `sudo loginctl enable-linger "$USER"` to keep it running while logged out. It expects the binary at `~/.local/bin/tera` and installs nothing for you. Stop it with `SIGINT`, not `SIGTERM`. The shutdown path listens for that to clear the typing indicator and remove the socket. Written but never run on Linux, since development happened on macOS.
+Add `sudo loginctl enable-linger "$USER"` to keep it running while logged out. It expects the binary at `~/.local/bin/tera` and installs nothing for you. Stop it with `SIGTERM` or `SIGINT`. The shutdown path listens for both to clear the typing indicator, release runtime state and remove the socket. Written but never run on Linux, since development happened on macOS.
 
 ## Known rough edges
 

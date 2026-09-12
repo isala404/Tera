@@ -64,6 +64,7 @@ pub struct IntegrityReport {
     pub event_count: usize,
     pub projected_records: usize,
     pub projection_dirty: bool,
+    pub projection_valid: bool,
     pub missing_assets: Vec<String>,
 }
 
@@ -71,6 +72,7 @@ impl IntegrityReport {
     pub fn is_healthy(&self) -> bool {
         self.sqlite_ok
             && !self.projection_dirty
+            && self.projection_valid
             && self.event_count == self.projected_records
             && self.missing_assets.is_empty()
     }
@@ -83,6 +85,12 @@ pub fn check_integrity(
     let conn = Connection::open(config.history_db_path())?;
     let result: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
 
+    let projection_valid = crate::history::projection::ProjectionEngine::validate_projection(
+        config.history_jsonl_dir().as_path(),
+        db,
+    )
+    .unwrap_or(false);
+
     let mut report = IntegrityReport {
         sqlite_ok: result == "ok",
         event_count: db.count_events()?,
@@ -92,6 +100,7 @@ pub fn check_integrity(
         projection_dirty: crate::history::projection::ProjectionEngine::is_dirty(
             config.history_jsonl_dir().as_path(),
         ),
+        projection_valid,
         missing_assets: Vec::new(),
     };
 
@@ -133,7 +142,7 @@ pub fn clear_stale_scratch(config: &Config) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::db::{Attachment, ConversationEvent, EventKind, HistoryDb};
+    use crate::history::db::{Attachment, ConversationEvent, HistoryDb};
     use crate::workspace::init::WorkspaceInit;
 
     fn workspace() -> (tempfile::TempDir, Config) {
@@ -147,19 +156,15 @@ mod tests {
     fn test_backup_is_a_readable_copy_of_history() {
         let (_tmp, config) = workspace();
         let db = HistoryDb::open_for(&config).unwrap();
-        db.insert_event(ConversationEvent {
-            seq: None,
-            id: "m_1".to_string(),
-            occurred_at_ms: 1_786_962_664_000,
-            kind: EventKind::Message,
-            actor: "user".to_string(),
-            text: Some("remember this".to_string()),
-            reply_to_id: None,
-            turn_id: None,
-            reaction_target_id: None,
-            reaction_emoji: None,
-            attachments: vec![],
-        })
+        db.insert_event(ConversationEvent::message(
+            "m_1",
+            1_786_962_664_000,
+            "user",
+            Some("remember this".to_string()),
+            None,
+            None,
+            vec![],
+        ))
         .unwrap();
 
         let backup = backup_history(&config, "20260817T120000").unwrap();
@@ -167,7 +172,7 @@ mod tests {
         let restored = HistoryDb::open(&backup, &config.history_jsonl_dir()).unwrap();
         assert_eq!(restored.count_events().unwrap(), 1);
         assert_eq!(
-            restored.get_event("m_1").unwrap().unwrap().text.unwrap(),
+            restored.get_event("m_1").unwrap().unwrap().text().unwrap(),
             "remember this"
         );
     }
@@ -176,18 +181,14 @@ mod tests {
     fn test_integrity_reports_a_missing_asset() {
         let (_tmp, config) = workspace();
         let db = HistoryDb::open_for(&config).unwrap();
-        db.insert_event(ConversationEvent {
-            seq: None,
-            id: "m_2".to_string(),
-            occurred_at_ms: 1_786_962_664_000,
-            kind: EventKind::Message,
-            actor: "user".to_string(),
-            text: None,
-            reply_to_id: None,
-            turn_id: None,
-            reaction_target_id: None,
-            reaction_emoji: None,
-            attachments: vec![Attachment {
+        db.insert_event(ConversationEvent::message(
+            "m_2",
+            1_786_962_664_000,
+            "user",
+            None,
+            None,
+            None,
+            vec![Attachment {
                 id: None,
                 event_id: "m_2".to_string(),
                 position: 0,
@@ -196,7 +197,7 @@ mod tests {
                 mime_type: None,
                 original_name: Some("gone.jpg".to_string()),
             }],
-        })
+        ))
         .unwrap();
 
         let report = check_integrity(&config, &db).unwrap();
@@ -210,19 +211,15 @@ mod tests {
     fn test_healthy_history_reports_healthy() {
         let (_tmp, config) = workspace();
         let db = HistoryDb::open_for(&config).unwrap();
-        db.insert_event(ConversationEvent {
-            seq: None,
-            id: "m_3".to_string(),
-            occurred_at_ms: 1_786_962_664_000,
-            kind: EventKind::Message,
-            actor: "assistant".to_string(),
-            text: Some("fine".to_string()),
-            reply_to_id: None,
-            turn_id: None,
-            reaction_target_id: None,
-            reaction_emoji: None,
-            attachments: vec![],
-        })
+        db.insert_event(ConversationEvent::message(
+            "m_3",
+            1_786_962_664_000,
+            "assistant",
+            Some("fine".to_string()),
+            None,
+            None,
+            vec![],
+        ))
         .unwrap();
 
         assert!(check_integrity(&config, &db).unwrap().is_healthy());

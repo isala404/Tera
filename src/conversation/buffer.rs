@@ -47,40 +47,31 @@ impl MessageBurst {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::db::EventKind;
 
     #[test]
     fn test_message_burst_buffering() {
-        let ev1 = ConversationEvent {
-            seq: None,
-            id: "m_1".to_string(),
-            occurred_at_ms: 1000,
-            kind: EventKind::Message,
-            actor: "user".to_string(),
-            text: Some("Hello".to_string()),
-            reply_to_id: None,
-            turn_id: None,
-            reaction_target_id: None,
-            reaction_emoji: None,
-            attachments: vec![],
-        };
+        let ev1 = ConversationEvent::message(
+            "m_1",
+            1000,
+            "user",
+            Some("Hello".to_string()),
+            None,
+            None,
+            vec![],
+        );
 
         let mut burst = MessageBurst::new("turn_1".to_string(), ev1);
         assert_eq!(burst.events.len(), 1);
 
-        let ev2 = ConversationEvent {
-            seq: None,
-            id: "m_2".to_string(),
-            occurred_at_ms: 1005,
-            kind: EventKind::Message,
-            actor: "user".to_string(),
-            text: Some("World".to_string()),
-            reply_to_id: None,
-            turn_id: None,
-            reaction_target_id: None,
-            reaction_emoji: None,
-            attachments: vec![],
-        };
+        let ev2 = ConversationEvent::message(
+            "m_2",
+            1005,
+            "user",
+            Some("World".to_string()),
+            None,
+            None,
+            vec![],
+        );
 
         burst.push(ev2);
         assert_eq!(burst.events.len(), 2);
@@ -119,18 +110,6 @@ mod tests {
     }
 
     fn event(id: &str) -> ConversationEvent {
-        ConversationEvent {
-            seq: None,
-            id: id.to_string(),
-            occurred_at_ms: 1000,
-            kind: EventKind::Message,
-            actor: "user".to_string(),
-            text: Some("hi".to_string()),
-            reply_to_id: None,
-            turn_id: None,
-            reaction_target_id: None,
-            reaction_emoji: None,
-            attachments: vec![],
-        }
+        ConversationEvent::message(id, 1000, "user", Some("hi".to_string()), None, None, vec![])
     }
 }

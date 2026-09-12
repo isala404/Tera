@@ -16,6 +16,12 @@ pub enum Verdict {
     Reject(RejectReason),
 }
 
+impl Verdict {
+    pub fn is_accepted(&self) -> bool {
+        matches!(self, Verdict::Accept)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RejectReason {
     NotOwner,
@@ -95,6 +101,7 @@ mod tests {
             timestamp_ms: 0,
             reply_to_provider_msg_id: None,
             media_attachment: None,
+            media_error: None,
             chat_jid: sender.split(':').next().unwrap_or(sender).to_string(),
             from_own_account,
             is_group,

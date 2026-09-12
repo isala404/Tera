@@ -1,4 +1,4 @@
-# Linux deployment unit for tera (PLAN.md section 6.4).
+# Linux deployment unit for tera.
 #
 # Install as a user service so the daemon runs as the account that owns the Codex
 # credentials and the WhatsApp pairing:

@@ -272,14 +272,26 @@ impl CodexSupervisor {
 
     /// A fresh thread rooted at `cwd`, not attached to the conversation.
     ///
-    /// Returned as an id rather than run-and-forget so the caller can interrupt
-    /// it. Memory maintenance has to be abandonable mid-turn.
+    /// Returned as an id rather than run-and-forget so the caller can track
+    /// and manage the isolated thread lifecycle.
     pub async fn start_isolated_thread(&self, cwd: &Path) -> Result<String> {
+        self.start_isolated_thread_with_worker(cwd, None).await
+    }
+
+    pub async fn start_isolated_thread_with_worker(
+        &self,
+        cwd: &Path,
+        worker_id: Option<&str>,
+    ) -> Result<String> {
         let mgr = self.ensure().await?;
-        let info = mgr.create_thread(&ThreadOptions::new(cwd)).await?;
+        let opts = match worker_id {
+            Some(id) => ThreadOptions::with_worker(cwd, id),
+            None => ThreadOptions::new(cwd),
+        };
+        let info = mgr.create_thread(&opts).await?;
         info!(
-            "NEW isolated thread {} (model {}) in {:?}. Separate from the conversation",
-            info.id, info.model, cwd
+            "NEW isolated thread {} (model {}, worker {:?}) in {:?}. Separate from the conversation",
+            info.id, info.model, worker_id, cwd
         );
         Ok(info.id)
     }
@@ -297,7 +309,18 @@ impl CodexSupervisor {
     /// for the log, anything the user should see is sent by the agent itself
     /// through the `send_message` tool.
     pub async fn run_task_turn(&self, cwd: &Path, prompt: &str) -> Result<String> {
-        let thread_id = self.start_isolated_thread(cwd).await?;
+        self.run_task_turn_with_worker(cwd, prompt, None).await
+    }
+
+    pub async fn run_task_turn_with_worker(
+        &self,
+        cwd: &Path,
+        prompt: &str,
+        worker_id: Option<&str>,
+    ) -> Result<String> {
+        let thread_id = self
+            .start_isolated_thread_with_worker(cwd, worker_id)
+            .await?;
         let result = self.run_turn_on_thread(&thread_id, prompt).await;
         if let Err(error) = self.archive_thread(&thread_id).await {
             warn!("Could not archive isolated thread {thread_id}: {error:?}");
@@ -310,8 +333,7 @@ impl CodexSupervisor {
         self.ensure().await?.list_models().await
     }
 
-    /// Interrupt whatever is running on a thread, so real work does not queue
-    /// behind maintenance.
+    /// Interrupt whatever is running on a thread.
     pub async fn interrupt_thread(&self, thread_id: &str) -> Result<()> {
         let lock = self.mgr.lock().await;
         match lock.as_ref() {

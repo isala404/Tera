@@ -11,7 +11,8 @@ use crate::conversation::session::ConversationSession;
 use crate::data;
 use crate::history::db::HistoryDb;
 use crate::runtime::crash_mark::CrashMark;
-use crate::runtime::{ConversationTurn, RuntimeDb};
+use crate::runtime::{ConversationTurn, RuntimeDb, TurnState};
+use crate::secrets::SecretStore;
 use crate::transport::{MessageRef, Transport};
 use crate::update::UpdateNotice;
 use crate::version::BuildInfo;
@@ -30,6 +31,7 @@ pub struct Phoenix {
     transport: Arc<dyn Transport>,
     codex: CodexSupervisor,
     session: ConversationSession,
+    secrets: SecretStore,
 }
 
 impl Phoenix {
@@ -41,6 +43,7 @@ impl Phoenix {
         codex: CodexSupervisor,
         session: ConversationSession,
     ) -> Self {
+        let secrets = SecretStore::new(config.secrets_path());
         Self {
             config,
             history_db,
@@ -48,6 +51,7 @@ impl Phoenix {
             transport,
             codex,
             session,
+            secrets,
         }
     }
 
@@ -92,10 +96,12 @@ impl Phoenix {
             self.runtime_db.record_turn_attempt(&turn.turn_id)?;
         }
         for turn in &recoverable {
-            self.runtime_db.finish_turn(&turn.turn_id, "completed")?;
+            self.runtime_db
+                .finish_turn(&turn.turn_id, TurnState::Completed)?;
         }
         for turn in &abandoned {
-            self.runtime_db.finish_turn(&turn.turn_id, "abandoned")?;
+            self.runtime_db
+                .finish_turn(&turn.turn_id, TurnState::Abandoned)?;
         }
 
         let restart_context = self.config.runtime_dir().join("restart-context.md");
@@ -185,44 +191,65 @@ impl Phoenix {
             ],
         );
 
-        let sends_before = self.session.count();
+        let worker_id = "phoenix";
+        let sends_before = self.session.count_for(Some(worker_id));
         self.session.set_chat(chat_jid);
-        self.session
-            .set_turn(recoverable.first().map(|turn| turn.turn_id.as_str()));
+        self.session.set_turn_for(
+            worker_id,
+            recoverable.first().map(|turn| turn.turn_id.as_str()),
+        );
         let result = self
             .codex
-            .run_task_turn(&self.config.workspace_dir, &prompt)
+            .run_task_turn_with_worker(&self.config.workspace_dir, &prompt, Some(worker_id))
             .await;
-        self.session.set_turn(None);
-        let summary = result?;
-        info!("Startup assistant finished: {summary}");
+        let summary = match result {
+            Ok(s) => s,
+            Err(e) => {
+                self.session.clear_worker(worker_id);
+                return Err(e);
+            }
+        };
+        let authored = self.secrets.redact(&summary);
+        info!("Startup assistant finished: {authored}");
 
-        if self.session.sends_since(sends_before) == 0 {
-            if summary.trim().is_empty() {
+        let sends_made = self.session.sends_since_for(Some(worker_id), sends_before);
+        if sends_made == 0 {
+            if authored.trim().is_empty() {
+                self.session.clear_worker(worker_id);
                 bail!("startup assistant produced no user-visible message for {chat_jid}");
             }
-            let reply_to = recoverable
-                .last()
-                .or_else(|| abandoned.last())
-                .map(|turn| MessageRef {
+            let reply_to = recoverable.last().or_else(|| abandoned.last()).map(|turn| {
+                let stored_ref = self
+                    .history_db
+                    .lookup_provider_ref_by_provider_id(&turn.last_provider_msg_id, "whatsapp")
+                    .ok()
+                    .flatten();
+                MessageRef {
                     provider_msg_id: turn.last_provider_msg_id.clone(),
-                    chat_jid: chat_jid.to_string(),
-                    from_me: false,
+                    chat_jid: stored_ref
+                        .as_ref()
+                        .filter(|r| !r.chat_jid.is_empty())
+                        .map(|r| r.chat_jid.clone())
+                        .unwrap_or_else(|| chat_jid.to_string()),
+                    from_me: stored_ref.as_ref().map(|r| r.from_me).unwrap_or(false),
                     text: self.quoted_text(&turn.last_provider_msg_id),
-                });
+                }
+            });
+            let outgoing = self.secrets.expand(&authored);
             let provider_msg_id = self
                 .transport
-                .send_text(chat_jid, &summary, reply_to.as_ref())
+                .send_text(chat_jid, &outgoing, reply_to.as_ref())
                 .await?;
             record_assistant_message(
                 &self.history_db,
                 chat_jid,
                 &provider_msg_id,
-                &summary,
+                &authored,
                 recoverable.first().map(|turn| turn.turn_id.clone()),
                 None,
             )?;
         }
+        self.session.clear_worker(worker_id);
         Ok(())
     }
 
@@ -245,6 +272,6 @@ impl Phoenix {
             .ok()
             .flatten()
             .and_then(|event_id| self.history_db.get_event(&event_id).ok().flatten())
-            .and_then(|event| event.text)
+            .and_then(|event| event.text().map(str::to_string))
     }
 }

@@ -7,8 +7,8 @@ use crate::conversation::renderer::InputRenderer;
 use crate::conversation::session::ConversationSession;
 use crate::conversation::typing::TypingGuard;
 use crate::history::assets::AssetStorage;
-use crate::history::db::{Attachment, ConversationEvent, EventKind, HistoryDb, ProviderRef};
-use crate::runtime::RuntimeDb;
+use crate::history::db::{Attachment, ConversationEvent, HistoryDb, ProviderRef};
+use crate::runtime::{RuntimeDb, TurnState};
 use crate::secrets::{Capture, SecretStore};
 use crate::transport::owner::jid_user;
 use crate::transport::{
@@ -16,7 +16,7 @@ use crate::transport::{
     Verdict,
 };
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex};
@@ -51,6 +51,7 @@ struct ConversationState {
     composing_since: HashMap<String, Instant>,
     /// Logical turn id of the turn being executed, if any.
     running_turn: Option<String>,
+    in_flight_provider_msgs: HashSet<String>,
 }
 
 impl ConversationState {
@@ -169,6 +170,48 @@ impl TurnEngine {
             return Ok(());
         }
 
+        // Deduplicate in-flight concurrent deliveries of the same message
+        {
+            let mut state = self.state.lock().await;
+            if !state
+                .in_flight_provider_msgs
+                .insert(msg.provider_msg_id.clone())
+            {
+                info!(
+                    "Dropping in-flight duplicate message {}",
+                    msg.provider_msg_id
+                );
+                return Ok(());
+            }
+        }
+
+        struct InFlightGuard {
+            state: Arc<Mutex<ConversationState>>,
+            id: String,
+        }
+        impl Drop for InFlightGuard {
+            fn drop(&mut self) {
+                let state = self.state.clone();
+                let id = self.id.clone();
+                tokio::spawn(async move {
+                    state.lock().await.in_flight_provider_msgs.remove(&id);
+                });
+            }
+        }
+        let _guard = InFlightGuard {
+            state: self.state.clone(),
+            id: msg.provider_msg_id.clone(),
+        };
+
+        // Deduplicate against already committed messages before secret capture or turn routing
+        if self
+            .history_db
+            .is_provider_message_recorded("whatsapp", &msg.provider_msg_id)?
+        {
+            info!("Dropping already recorded message {}", msg.provider_msg_id);
+            return Ok(());
+        }
+
         // Before the message is recorded, executed or even looked at: if it
         // carried a credential, take the value out and leave a note in its place.
         // Everything downstream, history, the JSONL projection, the thread and
@@ -192,34 +235,79 @@ impl TurnEngine {
         //    exchange could not be reconstructed.
         let (route, logical_turn) = self.route(&sender).await;
 
-        let conv_ev = ConversationEvent {
-            seq: None,
-            id: event_id.clone(),
-            occurred_at_ms: msg.timestamp_ms,
-            kind: EventKind::Message,
-            actor: "user".to_string(),
-            text: msg.text.clone(),
-            reply_to_id: self.resolve_reply_target(msg.reply_to_provider_msg_id.as_deref()),
-            turn_id: Some(logical_turn.clone()),
-            reaction_target_id: None,
-            reaction_emoji: None,
-            attachments,
+        let effective_text = match (msg.text.as_deref(), msg.media_error.as_deref()) {
+            (Some(caption), Some(err)) if !caption.trim().is_empty() => {
+                Some(format!("{caption}\n\n[Attachment download failed: {err}]"))
+            }
+            (_, Some(err)) => Some(format!("[Attachment download failed: {err}]")),
+            (Some(caption), None) => Some(caption.to_string()),
+            (None, None) => None,
         };
 
-        self.history_db.insert_event(conv_ev.clone())?;
-        self.history_db.record_provider_ref(&ProviderRef::whatsapp(
-            &event_id,
-            &msg.provider_msg_id,
-            &msg.chat_jid,
-            msg.from_own_account,
-        ))?;
+        let conv_ev = ConversationEvent::message(
+            event_id.clone(),
+            msg.timestamp_ms,
+            "user",
+            effective_text,
+            self.resolve_reply_target(msg.reply_to_provider_msg_id.as_deref()),
+            Some(logical_turn.clone()),
+            attachments,
+        );
+
+        let saved = self.history_db.insert_inbound_event(
+            conv_ev.clone(),
+            ProviderRef::whatsapp(
+                &event_id,
+                &msg.provider_msg_id,
+                &msg.chat_jid,
+                msg.from_own_account,
+            ),
+        )?;
+
+        if saved.is_none() {
+            info!(
+                "Inbound message {} deduplicated at commit",
+                msg.provider_msg_id
+            );
+            return Ok(());
+        }
 
         info!("Recorded inbound message from {}: {:?}", sender, msg.text);
+
+        if let Some(ref media_err) = msg.media_error {
+            let failure_reply = format!("⚠️ Could not download attachment: {media_err}");
+            let reply_target = MessageRef {
+                provider_msg_id: msg.provider_msg_id.clone(),
+                chat_jid: msg.chat_jid.clone(),
+                from_me: msg.from_own_account,
+                text: msg.text.clone(),
+            };
+            let outbound_msg_id = self
+                .transport
+                .send_text(&msg.chat_jid, &failure_reply, Some(&reply_target))
+                .await?;
+            record_assistant_message(
+                &self.history_db,
+                &msg.chat_jid,
+                &outbound_msg_id,
+                &failure_reply,
+                Some(logical_turn.clone()),
+                Some(event_id.clone()),
+            )?;
+
+            // If file-only, there is no user text to answer, so the turn ends here.
+            if msg.text.as_deref().is_none_or(|t| t.trim().is_empty()) {
+                return Ok(());
+            }
+        }
 
         match route {
             Route::Steer => {
                 let inputs = self.turn_inputs(std::slice::from_ref(&conv_ev));
                 if self.codex.steer_main_turn(&inputs).await? {
+                    let _ = self
+                        .runtime_db
+                        .update_turn_last_provider_msg_id(&logical_turn, &msg.provider_msg_id);
                     return Ok(());
                 }
                 // The turn finished in the gap. Fall through and treat this as the
@@ -231,7 +319,11 @@ impl TurnEngine {
             Route::JoinBurst => {
                 let mut state = self.state.lock().await;
                 if let Some(burst) = state.bursts.get_mut(&sender) {
+                    let turn_id = burst.turn_id.clone();
                     burst.push(conv_ev);
+                    let _ = self
+                        .runtime_db
+                        .update_turn_last_provider_msg_id(&turn_id, &msg.provider_msg_id);
                 } else {
                     // Its timer fired while we were writing to history.
                     drop(state);
@@ -287,18 +379,9 @@ impl TurnEngine {
         let outcome = match self.secrets.capture(text, msg.timestamp_ms) {
             Ok(outcome) => outcome,
             Err(error) => {
-                // The store is unreadable, so whether a request was armed is
-                // unknown. An explicit command is the one case where the message
-                // is known to hold a credential, so that must not fall through;
-                // swallowing every other message over a bad file would turn a
-                // broken extra into a broken daemon.
                 error!("Cannot reach the secret store: {error:?}");
-                if text.trim_start().starts_with("/secret") {
-                    Capture::Rejected {
-                        reason: format!("the secret store could not be read: {error}"),
-                    }
-                } else {
-                    Capture::Passthrough
+                Capture::Rejected {
+                    reason: format!("the secret store could not be read: {error}"),
                 }
             }
         };
@@ -393,8 +476,8 @@ impl TurnEngine {
         last_provider_msg_id: &str,
     ) {
         let turn_id = event
-            .turn_id
-            .clone()
+            .turn_id()
+            .map(str::to_string)
             .unwrap_or_else(|| format!("turn_{}", Uuid::new_v4().simple()));
 
         // Durable before the quiet period, not after: a crash while buffering
@@ -495,7 +578,7 @@ impl TurnEngine {
     fn turn_inputs(&self, events: &[ConversationEvent]) -> Vec<TurnInput> {
         let mut reply_targets = HashMap::new();
         for event in events {
-            let Some(reply_to) = event.reply_to_id.as_deref() else {
+            let Some(reply_to) = event.reply_to_id() else {
                 continue;
             };
             match self.history_db.get_event(reply_to) {
@@ -551,8 +634,7 @@ impl TurnEngine {
         burst: MessageBurst,
         last_provider_msg_id: &str,
     ) -> Result<()> {
-        // Registers the conversation as busy for the duration, which is what
-        // defers memory maintenance and interrupts it if it is already running.
+        // Registers the conversation turn as busy for the duration.
 
         let turn_id = burst.turn_id.clone();
         self.set_running(Some(turn_id.clone())).await;
@@ -563,9 +645,9 @@ impl TurnEngine {
         // logged failure, not something for Phoenix to resurrect at a restart
         // that might be days away.
         let state = if outcome.is_ok() {
-            "completed"
+            TurnState::Completed
         } else {
-            "failed"
+            TurnState::Failed
         };
         if let Err(e) = self.runtime_db.finish_turn(&turn_id, state) {
             warn!("Could not close turn {turn_id}: {e:?}");
@@ -577,6 +659,10 @@ impl TurnEngine {
         self.state.lock().await.running_turn = turn;
     }
 
+    /// Run the turn.
+    ///
+    /// Outside errors (transport down, Codex unauthenticated) are reported into
+    /// the chat rather than abandoned, so the owner sees what happened.
     async fn execute_turn(
         &self,
         sender: &str,
@@ -590,25 +676,42 @@ impl TurnEngine {
         );
 
         // Snapshot before the turn so send_message calls made during it are visible.
-        let sends_before = self.session.count();
+        let sends_before = self.session.count_for(Some("foreground"));
 
         // A chat, never `sender`: that is a device-suffixed JID, which is not a
         // routable address. The session was set from this message's chat before
         // the burst opened.
         let chat_jid = self.session.chat().unwrap_or_default();
-        self.session.set_turn(Some(&burst.turn_id));
+        self.session
+            .set_turn_for("foreground", Some(&burst.turn_id));
 
         let result = async {
             // Render events into a structured prompt, then hand any images and voice
             // notes to Codex as real media rather than a text description of media.
             let inputs = self.turn_inputs(&burst.events);
 
-            let reply_target = burst.events.last().map(|last| MessageRef {
-                provider_msg_id: last_provider_msg_id.to_string(),
-                chat_jid: chat_jid.clone(),
-                from_me: false,
-                text: last.text.clone(),
-            });
+            let reply_target = if let Some(last) = burst.events.last() {
+                let stored_ref = self
+                    .history_db
+                    .lookup_provider_ref_by_event_id(&last.id, "whatsapp")
+                    .ok()
+                    .flatten();
+                Some(MessageRef {
+                    provider_msg_id: stored_ref
+                        .as_ref()
+                        .map(|r| r.provider_msg_id.clone())
+                        .unwrap_or_else(|| last_provider_msg_id.to_string()),
+                    chat_jid: stored_ref
+                        .as_ref()
+                        .filter(|r| !r.chat_jid.is_empty())
+                        .map(|r| r.chat_jid.clone())
+                        .unwrap_or_else(|| chat_jid.clone()),
+                    from_me: stored_ref.as_ref().map(|r| r.from_me).unwrap_or(false),
+                    text: last.text().map(str::to_string),
+                })
+            } else {
+                None
+            };
 
             if !self.codex.check_authenticated().await {
                 info!("Codex unauthenticated; sending device pairing instructions to {chat_jid}");
@@ -662,7 +765,7 @@ impl TurnEngine {
                 Ok(reply) => reply,
                 Err(error) => {
                     error!("Codex turn failed: {error:?}");
-                    if self.session.sends_since(sends_before) == 0 {
+                    if self.session.sends_since_for(Some("foreground"), sends_before) == 0 {
                         match self
                             .transport
                             .send_text(&chat_jid, MODEL_FAILURE_REPLY, reply_target.as_ref())
@@ -695,7 +798,7 @@ impl TurnEngine {
             // usually does. Sending the final agent text unconditionally would then
             // deliver every answer twice. Only fall back when the turn produced no
             // user-visible message of its own.
-            if self.session.sends_since(sends_before) > 0 {
+            if self.session.sends_since_for(Some("foreground"), sends_before) > 0 {
                 info!("Turn replied via send_message; skipping final-text fallback");
                 return Ok(());
             }
@@ -706,27 +809,69 @@ impl TurnEngine {
             }
 
             // The fallback answers the burst, so it quotes the message that
-            // closed it, which is the one the owner is still looking at.
+            // closed it (including any steering message that arrived during the turn).
+            let latest_provider_msg_id = self
+                .runtime_db
+                .get_turn(&burst.turn_id)
+                .ok()
+                .flatten()
+                .map(|t| t.last_provider_msg_id)
+                .unwrap_or_else(|| last_provider_msg_id.to_string());
+
+            let reply_target = {
+                let stored_ref = self
+                    .history_db
+                    .lookup_provider_ref_by_provider_id(&latest_provider_msg_id, "whatsapp")
+                    .ok()
+                    .flatten();
+                let last_event = self
+                    .history_db
+                    .list_turn_events(&burst.turn_id)
+                    .ok()
+                    .and_then(|events| events.into_iter().last())
+                    .or_else(|| burst.events.last().cloned());
+                Some(MessageRef {
+                    provider_msg_id: latest_provider_msg_id.clone(),
+                    chat_jid: stored_ref
+                        .as_ref()
+                        .filter(|r| !r.chat_jid.is_empty())
+                        .map(|r| r.chat_jid.clone())
+                        .unwrap_or_else(|| chat_jid.clone()),
+                    from_me: stored_ref.as_ref().map(|r| r.from_me).unwrap_or(false),
+                    text: last_event.as_ref().and_then(|e| e.text()).map(str::to_string),
+                })
+            };
+
+            let authored = self.secrets.redact(&reply_text);
+            let outgoing = self.secrets.expand(&authored);
             let outbound_msg_id = self
                 .transport
-                .send_text(&chat_jid, &reply_text, reply_target.as_ref())
+                .send_text(&chat_jid, &outgoing, reply_target.as_ref())
                 .await?;
+
+            let last_event_id = self
+                .history_db
+                .list_turn_events(&burst.turn_id)
+                .ok()
+                .and_then(|events| events.into_iter().last())
+                .map(|e| e.id)
+                .or_else(|| burst.events.last().map(|e| e.id.clone()));
 
             record_assistant_message(
                 &self.history_db,
                 &chat_jid,
                 &outbound_msg_id,
-                &reply_text,
+                &authored,
                 Some(burst.turn_id.clone()),
-                burst.events.last().map(|e| e.id.clone()),
+                last_event_id,
             )?;
 
-            info!("Sent reply to {}: {}", chat_jid, reply_text);
+            info!("Sent reply to {}: {}", chat_jid, authored);
             Ok(())
         }
         .await;
 
-        self.session.set_turn(None);
+        self.session.set_turn_for("foreground", None);
         result
     }
 
@@ -741,32 +886,35 @@ impl TurnEngine {
             return;
         }
 
-        let codex = self.codex.clone();
-        let transport = self.transport.clone();
         let notifier_flag = self.login_notifier_active.clone();
+        let transport = self.transport.clone();
+        let config = self.config.clone();
+        let history_db = self.history_db.clone();
 
         tokio::spawn(async move {
-            let told = match completions.recv().await {
-                Ok(true) => {
-                    info!("Codex login completed; notifying owner at {chat_jid}");
-                    Some("✅ Paired with Codex. Send your message again and I'll pick it up.")
-                }
-                Ok(false) => {
-                    warn!("Codex login attempt failed, expired or was rejected");
-                    Some("❌ Pairing wasn't completed. Send any message to get a new code.")
-                }
-                Err(e) => {
-                    warn!("Login completion channel closed before pairing resolved: {e:?}");
-                    None
-                }
-            };
-
-            // Whatever happened, the cached code is spent: a later message has to
-            // be able to ask for a fresh one.
-            codex.clear_active_login().await;
-            if let Some(text) = told {
-                if let Err(e) = transport.send_text(&chat_jid, text, None).await {
-                    warn!("Could not tell {chat_jid} how pairing ended: {e:?}");
+            if let Ok(success) = completions.recv().await {
+                if success {
+                    let prompt = format!(
+                        "✨ Paired with Codex. What would you like help with, {}?",
+                        config.owner_name
+                    );
+                    match transport.send_text(&chat_jid, &prompt, None).await {
+                        Ok(outbound_msg_id) => {
+                            if let Err(e) = record_assistant_message(
+                                &history_db,
+                                &chat_jid,
+                                &outbound_msg_id,
+                                &prompt,
+                                None,
+                                None,
+                            ) {
+                                warn!("Could not record post-pairing greeting: {e:?}");
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to send paired notification: {e:?}");
+                        }
+                    }
                 }
             }
             notifier_flag.store(false, Ordering::SeqCst);
@@ -779,19 +927,15 @@ mod presence_tests {
     use super::*;
 
     fn event() -> ConversationEvent {
-        ConversationEvent {
-            seq: None,
-            id: "m1".into(),
-            occurred_at_ms: 1,
-            kind: EventKind::Message,
-            actor: "user".into(),
-            text: Some("one more thing".into()),
-            reply_to_id: None,
-            turn_id: Some("turn1".into()),
-            reaction_target_id: None,
-            reaction_emoji: None,
-            attachments: vec![],
-        }
+        ConversationEvent::message(
+            "m1",
+            1,
+            "user",
+            Some("one more thing".into()),
+            None,
+            Some("turn1".into()),
+            vec![],
+        )
     }
 
     #[test]
