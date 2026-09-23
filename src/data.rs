@@ -128,14 +128,6 @@ mod tests {
             include_str!("../data/skills/spotify/SKILL.md"),
         ),
         (
-            "skills/health/SKILL.md",
-            include_str!("../data/skills/health/SKILL.md"),
-        ),
-        (
-            "skills/health/references/data.md",
-            include_str!("../data/skills/health/references/data.md"),
-        ),
-        (
             "skills/audio/SKILL.md",
             include_str!("../data/skills/audio/SKILL.md"),
         ),

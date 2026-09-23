@@ -1,6 +1,6 @@
 # Health database
 
-The database is `.runtime/health/health.sqlite3` in the workspace. Open it read only with `sqlite3 -readonly`, and change data only through `scripts/health log`, so every value keeps the same shape.
+The database is `health.sqlite3` in `$HEALTH_HOME`, which defaults to `~/.local/share/health`. Open it read only with `sqlite3 -readonly`, and change data only through `scripts/health log`, so every value keeps the same shape.
 
 Every number is a row in `observations`, whatever produced it. The `source` column says where it came from, one of `garmin`, `ble` or `manual`. For Garmin daily summaries `at` is the day itself, and for point readings it is a local timestamp, so a day can hold several readings of one metric. Average per day before comparing days, the way the script does. Run `scripts/health metrics` for every metric name with its unit.
 

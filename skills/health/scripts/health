@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Personal health tracking for Tera.
+"""Personal health tracking, as an agent skill.
 
 Garmin Connect and Bluetooth health devices feed one local SQLite database, and
 everything else, the brief, trends and recommendations, is a query over it. The
@@ -11,6 +11,7 @@ private virtualenv, and those commands re-run themselves under it.
 import argparse
 import asyncio
 import fcntl
+import getpass
 import json
 import math
 import os
@@ -29,9 +30,6 @@ REQUIREMENTS = Path(__file__).resolve().with_name("requirements.txt")
 # garminconnect needs 3.12. The analysis side does not, so this is only the
 # floor for the virtualenv.
 VENV_PYTHON = (3, 12)
-# The name this skill asks for, and the one tera stores it under.
-EMAIL_SECRET = "GARMIN_EMAIL"
-PASSWORD_SECRET = "GARMIN_PASSWORD"
 DEFAULT_BACKFILL_DAYS = 30
 # Pause between Garmin requests. The API is unofficial and rate limits hard,
 # so a backfill trades speed for not getting the account throttled.
@@ -55,30 +53,14 @@ class NeedsDependencies(HealthError):
 # Paths
 
 
-def workspace_root():
-    codex_home = os.environ.get("CODEX_HOME")
-    if codex_home:
-        return Path(codex_home).resolve().parent
-    return Path.cwd().resolve()
-
-
 def runtime_root():
-    configured = os.environ.get("TERA_HEALTH_ROOT")
+    """Where the data lives. Outside the skill folder, so reinstalling or
+    updating the skill never touches the history."""
+    configured = os.environ.get("HEALTH_HOME")
     if configured:
-        return Path(configured)
-    return workspace_root() / ".runtime" / "health"
-
-
-def secrets_file():
-    """Where tera keeps credentials the owner sent through chat.
-
-    Read directly rather than through the tera binary, so the script works from
-    a shell with nothing else on the PATH. The daemon writes it, this only reads.
-    """
-    configured = os.environ.get("TERA_SECRETS_FILE")
-    if configured:
-        return Path(configured)
-    return workspace_root() / ".runtime" / "secrets.json"
+        return Path(configured).expanduser()
+    data_home = os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share"
+    return Path(data_home) / "health"
 
 
 def database_path():
@@ -121,18 +103,6 @@ def write_private(path, text):
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         handle.write(text)
     os.replace(temporary, path)
-
-
-def stored_secret(name):
-    try:
-        with secrets_file().open(encoding="utf-8") as handle:
-            entry = (json.load(handle).get("secrets") or {}).get(name) or {}
-    except FileNotFoundError:
-        return None
-    except (OSError, ValueError) as error:
-        raise HealthError(f"Cannot read {secrets_file()}: {error}") from error
-    value = str(entry.get("value") or "").strip()
-    return value or None
 
 
 # Dependencies
@@ -202,7 +172,7 @@ def setup():
 #
 # Every number lands in one table keyed by metric name, so trends, baselines and
 # history are one code path whether a value came from Garmin, a Bluetooth scale
-# or the owner typing it in. `better` is +1 when higher is better, -1 when lower
+# or the user typing it in. `better` is +1 when higher is better, -1 when lower
 # is, and 0 when neither direction is good news by itself.
 
 Metric = namedtuple("Metric", "label unit better")
@@ -619,7 +589,7 @@ Baseline = namedtuple("Baseline", "mean stdev count")
 
 
 def baseline(connection, name, day):
-    """The owner's normal for a metric: the 28 days before `day`."""
+    """The user's normal for a metric: the 28 days before `day`."""
     values = list(daily_series(connection, name, day - timedelta(days=BASELINE_DAYS), day - timedelta(days=1)).values())
     if len(values) < 7:
         return None
@@ -627,7 +597,7 @@ def baseline(connection, name, day):
 
 
 def deviation(value, normal):
-    """How unusual a value is, in standard deviations from the owner's normal.
+    """How unusual a value is, in standard deviations from the user's normal.
     A perfectly flat baseline says nothing about spread, so it gives no signal."""
     if value is None or normal is None or normal.stdev == 0:
         return None
@@ -1068,23 +1038,38 @@ def report_login(state):
         print(state["message"])
         return
     if state["state"] == "waiting-for-code":
-        print(f"{state['message']} Ask the owner for it, then run `health login --mfa CODE` within "
+        print(f"{state['message']} Ask the user for it, then run `health login --mfa CODE` within "
               f"{MFA_WAIT_SECONDS // 60} minutes.")
         return
     raise HealthError(state.get("message") or "Garmin login failed.")
 
 
-def login(mfa_code=None):
+def credentials(email):
+    """The email from the flag or GARMIN_EMAIL, the password from
+    GARMIN_PASSWORD or stdin. Stdin lets a secret manager pipe it in without it
+    ever sitting in an argument, and a terminal gets a hidden prompt."""
+    email = email or os.environ.get("GARMIN_EMAIL")
+    password = os.environ.get("GARMIN_PASSWORD")
+    if sys.stdin.isatty():
+        email = email or input("Garmin email: ").strip()
+        password = password or getpass.getpass("Garmin password: ")
+    elif not password:
+        password = sys.stdin.readline().rstrip("\r\n")
+    if not email or not password:
+        raise HealthError("Needs the Garmin email (--email or GARMIN_EMAIL) and password "
+                          "(GARMIN_PASSWORD or piped on stdin).")
+    return email, password
+
+
+def login(email=None, mfa_code=None):
     if mfa_code:
         submit_code(mfa_code)
         return
-    missing = [name for name in (EMAIL_SECRET, PASSWORD_SECRET) if not stored_secret(name)]
-    if missing:
-        raise HealthError(f"Missing {' and '.join(missing)}. Ask the owner for them with request_secret.")
     state = login_state()
     if state and state["state"] in ("starting", "waiting-for-code"):
         raise HealthError("A Garmin login is already waiting. Finish it with `health login --mfa CODE`, "
                           "or run `health logout` to start over.")
+    email, password = credentials(email)
     import_garmin()
     ensure_runtime_root()
     for path in (login_state_path(), login_code_path()):
@@ -1093,8 +1078,11 @@ def login(mfa_code=None):
     with (runtime_root() / "garmin-login.log").open("a") as log:
         worker = subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), "login-worker"],
-            stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+            stdin=subprocess.PIPE, stdout=log, stderr=log, start_new_session=True, text=True,
         )
+    # Handed over on a pipe, so the password never shows in ps or the environment.
+    worker.stdin.write(json.dumps({"email": email, "password": password}))
+    worker.stdin.close()
     # The worker writes the state file itself, so this cannot race its first report.
     started = time.monotonic()
     while login_state() is None:
@@ -1132,13 +1120,13 @@ def login_worker():
             {"state": state, "message": message, "pid": os.getpid(), "answered": answered}
         ))
 
+    account = json.loads(sys.stdin.read())
     update("starting")
     try:
-        client = garminconnect.Garmin(stored_secret(EMAIL_SECRET), stored_secret(PASSWORD_SECRET),
-                                      return_on_mfa=True)
+        client = garminconnect.Garmin(account["email"], account["password"], return_on_mfa=True)
         result, pending = client.login()
         if result == "needs_mfa":
-            update("waiting-for-code", "Garmin sent a verification code to the owner's email.")
+            update("waiting-for-code", "Garmin sent a verification code to the user's email.")
             deadline = time.monotonic() + MFA_WAIT_SECONDS
             while True:
                 attempt = next_code(deadline, answered)
@@ -1150,13 +1138,13 @@ def login_worker():
                     client.resume_login(pending, code)
                     break
                 except garminconnect.GarminConnectAuthenticationError:
-                    # The pending handshake survives a wrong code, so the owner
+                    # The pending handshake survives a wrong code, so the user
                     # can just send it again.
                     update("waiting-for-code", "Garmin rejected that code.")
         with garmin_lock():
             client.client.dump(str(token_dir()))
             name = garmin_client().get_full_name()
-        update("done", f"Logged in to Garmin as {name or 'the owner'}.")
+        update("done", f"Logged in to Garmin as {name or account['email']}.")
     except HealthError as error:
         update("failed", str(error))
     except garminconnect.GarminConnectAuthenticationError as error:
@@ -1526,14 +1514,12 @@ def ble_read(kind, address, seconds, to_garmin=False):
 
 
 def status():
-    credentials = stored_secret(EMAIL_SECRET) and stored_secret(PASSWORD_SECRET)
     state = login_state()
     if state and state["state"] != "done":
         garmin_login = state["state"]
     else:
         garmin_login = "complete" if token_dir().exists() else "missing"
     print(f"dependencies: {'installed' if venv_python().exists() else 'missing'}")
-    print(f"garmin-credentials: {'stored' if credentials else 'missing'}")
     print(f"garmin-login: {garmin_login}")
     if state and state["state"] == "failed":
         print(f"garmin-login-error: {state['message']}")
@@ -1569,6 +1555,7 @@ def parser():
     commands.add_parser("setup", help="install the Garmin and Bluetooth packages")
 
     login_parser = commands.add_parser("login", help="log in to Garmin Connect")
+    login_parser.add_argument("--email", help="default GARMIN_EMAIL, the password comes from GARMIN_PASSWORD or stdin")
     login_parser.add_argument("--mfa", metavar="CODE", help="finish a login that asked for a code")
     commands.add_parser("logout", help="forget the Garmin login")
     # Started by `login`, not meant to be run by hand.
@@ -1618,7 +1605,7 @@ def run(arguments):
     elif command == "setup":
         setup()
     elif command == "login":
-        login(arguments.mfa)
+        login(arguments.email, arguments.mfa)
     elif command == "login-worker":
         login_worker()
     elif command == "logout":

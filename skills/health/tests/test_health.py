@@ -15,8 +15,8 @@ from pathlib import Path
 from unittest import mock
 
 
-SCRIPT = Path(__file__).parents[1] / "data" / "skills" / "health" / "scripts" / "health"
-LOADER = importlib.machinery.SourceFileLoader("tera_health_skill", str(SCRIPT))
+SCRIPT = Path(__file__).parents[1] / "scripts" / "health"
+LOADER = importlib.machinery.SourceFileLoader("health_skill", str(SCRIPT))
 SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
 HEALTH = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(HEALTH)
@@ -105,20 +105,12 @@ class HealthTestCase(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.root = Path(self.tempdir.name).resolve()
-        self.secrets = self.root / "secrets.json"
-        self.environment = mock.patch.dict(
-            os.environ,
-            {"TERA_HEALTH_ROOT": str(self.root / "health"), "TERA_SECRETS_FILE": str(self.secrets)},
-        )
+        self.environment = mock.patch.dict(os.environ, {"HEALTH_HOME": str(self.root / "health")})
         self.environment.start()
 
     def tearDown(self):
         self.environment.stop()
         self.tempdir.cleanup()
-
-    def write_secrets(self, **values):
-        secrets = {name: {"value": value, "set_at_ms": 0} for name, value in values.items()}
-        self.secrets.write_text(json.dumps({"secrets": secrets}))
 
     def connection(self):
         return HEALTH.connect()
@@ -521,7 +513,7 @@ class AnalysisTest(HealthTestCase):
 
 
 class CommandLineTest(HealthTestCase):
-    """Runs the script as tera would, including the detached Garmin login worker."""
+    """Runs the script as an agent would, including the detached Garmin login worker."""
 
     def setUp(self):
         super().setUp()
@@ -537,16 +529,19 @@ class CommandLineTest(HealthTestCase):
             os.kill(state["pid"], 15)
         super().tearDown()
 
-    def health(self, *arguments, **extra_env):
+    def health(self, *arguments, stdin="", **extra_env):
         return subprocess.run(
-            [sys.executable, str(SCRIPT), *arguments],
+            [sys.executable, str(SCRIPT), *arguments], input=stdin,
             capture_output=True, text=True, timeout=60, env=dict(self.env, **extra_env),
         )
+
+    def login(self, password="right-password", **extra_env):
+        return self.health("login", "--email", "owner@example.com", stdin=password + "\n", **extra_env)
 
     def test_status_log_brief_and_trends_on_a_fresh_workspace(self):
         status = self.health("status")
         self.assertEqual(status.returncode, 0, status.stderr)
-        self.assertIn("garmin-credentials: missing", status.stdout)
+        self.assertIn("garmin-login: missing", status.stdout)
         self.assertIn("database: empty", status.stdout)
 
         logged = self.health("log", "weight_kg=72.4", "--at", "2026-09-23T07:30")
@@ -564,15 +559,19 @@ class CommandLineTest(HealthTestCase):
         self.assertEqual(bad.returncode, 1)
         self.assertTrue(bad.stderr.startswith("health: Unknown metric mood."))
 
-    def test_login_asks_for_missing_secrets(self):
+    def test_login_needs_an_email_and_password(self):
         result = self.health("login")
         self.assertEqual(result.returncode, 1)
-        self.assertIn("Missing GARMIN_EMAIL and GARMIN_PASSWORD", result.stderr)
-        self.assertIn("request_secret", result.stderr)
+        self.assertIn("Needs the Garmin email", result.stderr)
+        self.assertIn("garmin-login: missing", self.health("status").stdout)
+
+    def test_login_reads_credentials_from_the_environment(self):
+        result = self.health("login", GARMIN_EMAIL="owner@example.com", GARMIN_PASSWORD="right-password")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Logged in to Garmin as Test Owner.", result.stdout)
 
     def test_login_without_mfa_saves_a_private_token(self):
-        self.write_secrets(GARMIN_EMAIL="owner@example.com", GARMIN_PASSWORD="right-password")
-        result = self.health("login")
+        result = self.login()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Logged in to Garmin as Test Owner.", result.stdout)
         self.assertTrue((HEALTH.token_dir() / "garmin_tokens.json").exists())
@@ -581,20 +580,18 @@ class CommandLineTest(HealthTestCase):
         self.assertNotIn("right-password", HEALTH.login_state_path().read_text())
 
     def test_login_reports_a_wrong_password(self):
-        self.write_secrets(GARMIN_EMAIL="owner@example.com", GARMIN_PASSWORD="wrong")
-        result = self.health("login")
+        result = self.login("wrong")
         self.assertEqual(result.returncode, 1)
         self.assertIn("Garmin rejected the email or password", result.stderr)
         self.assertIn("garmin-login: failed", self.health("status").stdout)
 
     def test_mfa_code_arrives_in_a_later_process(self):
-        self.write_secrets(GARMIN_EMAIL="owner@example.com", GARMIN_PASSWORD="right-password")
-        started = self.health("login", FAKE_GARMIN_MFA="1")
+        started = self.login(FAKE_GARMIN_MFA="1")
         self.assertEqual(started.returncode, 0, started.stderr)
         self.assertIn("health login --mfa CODE", started.stdout)
         self.assertIn("garmin-login: waiting-for-code", self.health("status").stdout)
 
-        again = self.health("login", FAKE_GARMIN_MFA="1")
+        again = self.login(FAKE_GARMIN_MFA="1")
         self.assertEqual(again.returncode, 1)
         self.assertIn("already waiting", again.stderr)
 
@@ -612,8 +609,7 @@ class CommandLineTest(HealthTestCase):
         self.assertIn("No Garmin login is waiting", stray.stderr)
 
     def test_logout_stops_a_waiting_worker(self):
-        self.write_secrets(GARMIN_EMAIL="owner@example.com", GARMIN_PASSWORD="right-password")
-        self.assertEqual(self.health("login", FAKE_GARMIN_MFA="1").returncode, 0)
+        self.assertEqual(self.login(FAKE_GARMIN_MFA="1").returncode, 0)
         pid = HEALTH.read_json(HEALTH.login_state_path())["pid"]
         self.assertIn("Logged out of Garmin.", self.health("logout").stdout)
         deadline = time.monotonic() + 10
