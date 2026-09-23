@@ -1,0 +1,1663 @@
+#!/usr/bin/env python3
+"""Personal health tracking for Tera.
+
+Garmin Connect and Bluetooth health devices feed one local SQLite database, and
+everything else, the brief, trends and recommendations, is a query over it. The
+analysis runs on the standard library alone so it works on any python3. Only
+talking to Garmin or Bluetooth needs the pinned packages `setup` installs into a
+private virtualenv, and those commands re-run themselves under it.
+"""
+
+import argparse
+import asyncio
+import fcntl
+import json
+import math
+import os
+import shutil
+import sqlite3
+import statistics
+import subprocess
+import sys
+import time
+from collections import namedtuple
+from contextlib import contextmanager, suppress
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+REQUIREMENTS = Path(__file__).resolve().with_name("requirements.txt")
+# garminconnect needs 3.12. The analysis side does not, so this is only the
+# floor for the virtualenv.
+VENV_PYTHON = (3, 12)
+# The name this skill asks for, and the one tera stores it under.
+EMAIL_SECRET = "GARMIN_EMAIL"
+PASSWORD_SECRET = "GARMIN_PASSWORD"
+DEFAULT_BACKFILL_DAYS = 30
+# Pause between Garmin requests. The API is unofficial and rate limits hard,
+# so a backfill trades speed for not getting the account throttled.
+REQUEST_PAUSE_SECONDS = 0.5
+BASELINE_DAYS = 28
+RECENT_DAYS = 7
+# Garmin's emailed code is valid for about this long.
+MFA_WAIT_SECONDS = 600
+# How long `login` waits for the worker to learn whether Garmin wants a code.
+LOGIN_WAIT_SECONDS = 120
+
+
+class HealthError(Exception):
+    pass
+
+
+class NeedsDependencies(HealthError):
+    pass
+
+
+# Paths
+
+
+def workspace_root():
+    codex_home = os.environ.get("CODEX_HOME")
+    if codex_home:
+        return Path(codex_home).resolve().parent
+    return Path.cwd().resolve()
+
+
+def runtime_root():
+    configured = os.environ.get("TERA_HEALTH_ROOT")
+    if configured:
+        return Path(configured)
+    return workspace_root() / ".runtime" / "health"
+
+
+def secrets_file():
+    """Where tera keeps credentials the owner sent through chat.
+
+    Read directly rather than through the tera binary, so the script works from
+    a shell with nothing else on the PATH. The daemon writes it, this only reads.
+    """
+    configured = os.environ.get("TERA_SECRETS_FILE")
+    if configured:
+        return Path(configured)
+    return workspace_root() / ".runtime" / "secrets.json"
+
+
+def database_path():
+    return runtime_root() / "health.sqlite3"
+
+
+def token_dir():
+    # garminconnect refuses a token path with a symlink anywhere above it, and
+    # /tmp on macOS is one.
+    return (runtime_root() / "garmin").resolve()
+
+
+def login_state_path():
+    return runtime_root() / "garmin-login.json"
+
+
+def login_code_path():
+    return runtime_root() / "garmin-code.json"
+
+
+def venv_dir():
+    return runtime_root() / "venv"
+
+
+def venv_python():
+    return venv_dir() / "bin" / "python"
+
+
+def ensure_runtime_root():
+    root = runtime_root()
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    root.chmod(0o700)
+
+
+def write_private(path, text):
+    """Write a file only this user can read, replacing it atomically."""
+    ensure_runtime_root()
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    os.replace(temporary, path)
+
+
+def stored_secret(name):
+    try:
+        with secrets_file().open(encoding="utf-8") as handle:
+            entry = (json.load(handle).get("secrets") or {}).get(name) or {}
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as error:
+        raise HealthError(f"Cannot read {secrets_file()}: {error}") from error
+    value = str(entry.get("value") or "").strip()
+    return value or None
+
+
+# Dependencies
+
+
+def in_venv():
+    return Path(sys.prefix).resolve() == venv_dir().resolve()
+
+
+def reexec_in_venv():
+    """Run this command again under the private virtualenv, if that is where the
+    packages are. Returns only when there is nothing better to run under."""
+    if in_venv() or not venv_python().exists():
+        return
+    os.execv(str(venv_python()), [str(venv_python()), str(Path(__file__).resolve()), *sys.argv[1:]])
+
+
+def import_garmin():
+    try:
+        import garminconnect
+    except ImportError as error:
+        raise NeedsDependencies("Garmin support is not installed. Run `health setup` first.") from error
+    return garminconnect
+
+
+def import_bleak():
+    try:
+        import bleak
+    except ImportError as error:
+        raise NeedsDependencies("Bluetooth support is not installed. Run `health setup` first.") from error
+    return bleak
+
+
+def run_checked(command):
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()[-5:]
+        raise HealthError(f"{Path(command[0]).name} failed: " + " / ".join(detail))
+
+
+def setup():
+    """Create the private virtualenv and install the hash pinned packages.
+
+    uv is preferred because it can fetch a Python 3.12 where the system has an
+    older one, which is the case on Raspberry Pi OS Bookworm.
+    """
+    ensure_runtime_root()
+    uv = shutil.which("uv")
+    if not venv_python().exists():
+        if uv:
+            run_checked([uv, "venv", "--quiet", "--python", ">=3.12", str(venv_dir())])
+        elif sys.version_info >= VENV_PYTHON:
+            run_checked([sys.executable, "-m", "venv", str(venv_dir())])
+        else:
+            raise HealthError(
+                f"Needs Python 3.12 or uv to build the virtualenv, found {sys.version.split()[0]}."
+            )
+    if uv:
+        install = [uv, "pip", "install", "--quiet", "--python", str(venv_python())]
+    else:
+        install = [str(venv_python()), "-m", "pip", "install", "--quiet"]
+    run_checked([*install, "--require-hashes", "-r", str(REQUIREMENTS)])
+    print(f"Installed into {venv_dir()}.")
+
+
+# Metrics
+#
+# Every number lands in one table keyed by metric name, so trends, baselines and
+# history are one code path whether a value came from Garmin, a Bluetooth scale
+# or the owner typing it in. `better` is +1 when higher is better, -1 when lower
+# is, and 0 when neither direction is good news by itself.
+
+Metric = namedtuple("Metric", "label unit better")
+
+METRICS = {
+    "steps": Metric("steps", "", 1),
+    "active_kcal": Metric("active calories", "kcal", 1),
+    "intensity_minutes": Metric("intensity minutes", "min", 1),
+    "floors": Metric("floors climbed", "", 1),
+    "resting_hr": Metric("resting heart rate", "bpm", -1),
+    "stress_avg": Metric("average stress", "", -1),
+    "body_battery_high": Metric("body battery peak", "", 1),
+    "body_battery_low": Metric("body battery low", "", 1),
+    "body_battery_charged": Metric("body battery charged", "", 1),
+    "body_battery_drained": Metric("body battery drained", "", 0),
+    "sleep_hours": Metric("sleep", "h", 1),
+    "sleep_deep_hours": Metric("deep sleep", "h", 1),
+    "sleep_rem_hours": Metric("REM sleep", "h", 1),
+    "sleep_awake_hours": Metric("awake in bed", "h", -1),
+    "sleep_score": Metric("sleep score", "", 1),
+    "hrv_night": Metric("overnight HRV", "ms", 1),
+    "hrv_weekly": Metric("7 day HRV", "ms", 1),
+    "training_readiness": Metric("training readiness", "", 1),
+    "spo2_sleep": Metric("overnight SpO2", "%", 1),
+    "respiration_sleep": Metric("sleeping respiration", "brpm", 0),
+    "vo2max": Metric("VO2 max", "ml/kg/min", 1),
+    "weight_kg": Metric("weight", "kg", 0),
+    "body_fat_pct": Metric("body fat", "%", -1),
+    "bmi": Metric("BMI", "", 0),
+    "bp_systolic": Metric("systolic blood pressure", "mmHg", -1),
+    "bp_diastolic": Metric("diastolic blood pressure", "mmHg", -1),
+    "pulse": Metric("pulse", "bpm", 0),
+    "heart_rate": Metric("heart rate", "bpm", 0),
+    "hrv_rmssd": Metric("HRV RMSSD", "ms", 1),
+    "spo2": Metric("SpO2", "%", 1),
+    "body_temp_c": Metric("body temperature", "C", 0),
+}
+
+
+def metric(name):
+    if name not in METRICS:
+        raise HealthError(f"Unknown metric {name}. Known: {', '.join(sorted(METRICS))}")
+    return METRICS[name]
+
+
+# Storage
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS observations (
+    metric TEXT NOT NULL,
+    source TEXT NOT NULL,
+    at TEXT NOT NULL,
+    day TEXT NOT NULL,
+    value REAL NOT NULL,
+    device TEXT,
+    PRIMARY KEY (metric, source, at)
+);
+CREATE INDEX IF NOT EXISTS observations_by_day ON observations (metric, day);
+CREATE TABLE IF NOT EXISTS activities (
+    id TEXT PRIMARY KEY,
+    day TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    type TEXT,
+    name TEXT,
+    duration_min REAL,
+    distance_km REAL,
+    avg_hr REAL,
+    max_hr REAL,
+    calories REAL,
+    aerobic_te REAL,
+    anaerobic_te REAL,
+    training_load REAL
+);
+CREATE INDEX IF NOT EXISTS activities_by_day ON activities (day);
+CREATE TABLE IF NOT EXISTS raw (
+    source TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    day TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    body TEXT NOT NULL,
+    PRIMARY KEY (source, kind, day)
+);
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"""
+
+
+def connect():
+    ensure_runtime_root()
+    connection = sqlite3.connect(database_path())
+    connection.row_factory = sqlite3.Row
+    connection.executescript(SCHEMA)
+    return connection
+
+
+def now_local():
+    return datetime.now().replace(microsecond=0)
+
+
+def record(connection, name, at, value, source, device=None):
+    """Store one observation. `at` is a day for daily summaries and a local
+    timestamp for point readings, so re-syncing a day replaces it in place."""
+    metric(name)
+    if value is None:
+        return
+    at = at if isinstance(at, str) else at.isoformat(timespec="seconds")
+    connection.execute(
+        "INSERT OR REPLACE INTO observations (metric, source, at, day, value, device) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (name, source, at, at[:10], float(value), device),
+    )
+
+
+def set_meta(connection, key, value):
+    connection.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+
+
+def get_meta(connection, key):
+    row = connection.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def daily_series(connection, name, start, end):
+    """One value per day, the mean of whatever was recorded that day."""
+    rows = connection.execute(
+        "SELECT day, AVG(value) AS value FROM observations "
+        "WHERE metric = ? AND day BETWEEN ? AND ? GROUP BY day ORDER BY day",
+        (name, start.isoformat(), end.isoformat()),
+    )
+    return {date.fromisoformat(row["day"]): row["value"] for row in rows}
+
+
+# Garmin
+#
+# Each extractor turns one endpoint's JSON into (metric, at, value) triples. They
+# are pure so the parsing is testable against recorded responses without an
+# account, and the raw JSON is kept anyway so a better extractor can reread it.
+
+
+def hours(seconds):
+    return None if seconds is None else seconds / 3600
+
+
+def extract_summary(payload, day):
+    moderate = payload.get("moderateIntensityMinutes")
+    vigorous = payload.get("vigorousIntensityMinutes")
+    # WHO counts a vigorous minute as two moderate ones.
+    intensity = None if moderate is None and vigorous is None else (moderate or 0) + 2 * (vigorous or 0)
+    return [
+        ("steps", day, payload.get("totalSteps")),
+        ("active_kcal", day, payload.get("activeKilocalories")),
+        ("intensity_minutes", day, intensity),
+        ("floors", day, payload.get("floorsAscended")),
+        ("resting_hr", day, payload.get("restingHeartRate")),
+        ("stress_avg", day, positive(payload.get("averageStressLevel"))),
+        ("body_battery_high", day, payload.get("bodyBatteryHighestValue")),
+        ("body_battery_low", day, payload.get("bodyBatteryLowestValue")),
+        ("body_battery_charged", day, payload.get("bodyBatteryChargedValue")),
+        ("body_battery_drained", day, payload.get("bodyBatteryDrainedValue")),
+    ]
+
+
+def positive(value):
+    """Garmin reports -1 or -2 for 'not enough data' in several fields."""
+    return value if value is not None and value >= 0 else None
+
+
+def extract_sleep(payload, day):
+    sleep = payload.get("dailySleepDTO") or {}
+    if not sleep.get("sleepTimeSeconds"):
+        return []
+    score = ((sleep.get("sleepScores") or {}).get("overall") or {}).get("value")
+    return [
+        ("sleep_hours", day, hours(sleep.get("sleepTimeSeconds"))),
+        ("sleep_deep_hours", day, hours(sleep.get("deepSleepSeconds"))),
+        ("sleep_rem_hours", day, hours(sleep.get("remSleepSeconds"))),
+        ("sleep_awake_hours", day, hours(sleep.get("awakeSleepSeconds"))),
+        ("sleep_score", day, score),
+        ("spo2_sleep", day, sleep.get("averageSpO2Value") or sleep.get("avgSpO2")),
+        ("respiration_sleep", day, sleep.get("averageRespirationValue")),
+    ]
+
+
+def extract_hrv(payload, day):
+    summary = (payload or {}).get("hrvSummary") or {}
+    return [
+        ("hrv_night", day, summary.get("lastNightAvg")),
+        ("hrv_weekly", day, summary.get("weeklyAvg")),
+    ]
+
+
+def extract_readiness(payload, day):
+    entries = payload if isinstance(payload, list) else [payload] if payload else []
+    entries = [entry for entry in entries if entry and entry.get("score") is not None]
+    if not entries:
+        return []
+    # Readiness is recomputed through the day. The morning value is the one a
+    # plan for the day should rest on, so prefer it over the latest.
+    morning = [entry for entry in entries if entry.get("inputContext") == "AFTER_WAKEUP_RESET"]
+    chosen = max(morning or entries, key=lambda entry: entry.get("timestamp") or "")
+    return [("training_readiness", day, chosen.get("score"))]
+
+
+def extract_max_metrics(payload):
+    triples = []
+    for entry in payload if isinstance(payload, list) else [payload] if payload else []:
+        generic = (entry or {}).get("generic") or {}
+        value = generic.get("vo2MaxPreciseValue") or generic.get("vo2MaxValue")
+        if value and generic.get("calendarDate"):
+            triples.append(("vo2max", generic["calendarDate"], value))
+    return triples
+
+
+def local_timestamp(milliseconds):
+    return datetime.fromtimestamp(milliseconds / 1000).isoformat(timespec="seconds")
+
+
+def extract_body_composition(payload):
+    triples = []
+    for entry in (payload or {}).get("dateWeightList") or []:
+        at = entry.get("date") or entry.get("timestampGMT")
+        if not at:
+            continue
+        at = local_timestamp(at)
+        weight = entry.get("weight")
+        triples += [
+            ("weight_kg", at, None if weight is None else weight / 1000),
+            ("body_fat_pct", at, entry.get("bodyFat")),
+            ("bmi", at, entry.get("bmi")),
+        ]
+    return triples
+
+
+def extract_blood_pressure(payload):
+    triples = []
+    for summary in (payload or {}).get("measurementSummaries") or []:
+        for entry in summary.get("measurements") or []:
+            at = entry.get("measurementTimestampLocal")
+            if not at:
+                continue
+            at = at[:19]
+            triples += [
+                ("bp_systolic", at, entry.get("systolic")),
+                ("bp_diastolic", at, entry.get("diastolic")),
+                ("pulse", at, entry.get("pulse")),
+            ]
+    return triples
+
+
+def activity_row(activity):
+    started = (activity.get("startTimeLocal") or "")[:19].replace(" ", "T")
+    kind = (activity.get("activityType") or {}).get("typeKey")
+
+    def scaled(key, factor):
+        value = activity.get(key)
+        return None if value is None else value / factor
+
+    return {
+        "id": str(activity["activityId"]),
+        "day": started[:10],
+        "started_at": started,
+        "type": kind,
+        "name": activity.get("activityName"),
+        "duration_min": scaled("duration", 60),
+        "distance_km": scaled("distance", 1000),
+        "avg_hr": activity.get("averageHR"),
+        "max_hr": activity.get("maxHR"),
+        "calories": activity.get("calories"),
+        "aerobic_te": activity.get("aerobicTrainingEffect"),
+        "anaerobic_te": activity.get("anaerobicTrainingEffect"),
+        "training_load": activity.get("activityTrainingLoad"),
+    }
+
+
+def store_activity(connection, row):
+    columns = ", ".join(row)
+    placeholders = ", ".join("?" for _ in row)
+    connection.execute(
+        f"INSERT OR REPLACE INTO activities ({columns}) VALUES ({placeholders})",
+        tuple(row.values()),
+    )
+
+
+def store_raw(connection, kind, day, payload):
+    connection.execute(
+        "INSERT OR REPLACE INTO raw (source, kind, day, fetched_at, body) VALUES ('garmin', ?, ?, ?, ?)",
+        (kind, day, now_local().isoformat(), json.dumps(payload, separators=(",", ":"))),
+    )
+
+
+def store_triples(connection, triples):
+    count = 0
+    for name, at, value in triples:
+        if value is not None:
+            record(connection, name, at, value, "garmin")
+            count += 1
+    return count
+
+
+# Per day endpoints: (kind, client method, extractor). Everything else is fetched
+# once for the whole range.
+DAILY_ENDPOINTS = (
+    ("summary", "get_user_summary", extract_summary),
+    ("sleep", "get_sleep_data", extract_sleep),
+    ("hrv", "get_hrv_data", extract_hrv),
+    ("readiness", "get_training_readiness", extract_readiness),
+)
+RANGE_ENDPOINTS = (
+    ("max_metrics", "get_max_metrics_range", extract_max_metrics),
+    ("body_composition", "get_body_composition", extract_body_composition),
+    ("blood_pressure", "get_blood_pressure", extract_blood_pressure),
+)
+
+
+def days_between(start, end):
+    return [start + timedelta(days=offset) for offset in range((end - start).days + 1)]
+
+
+def sync_range(connection, requested_days, today):
+    """Which days to fetch. Always the last two, since today is unfinished and
+    last night's sleep and HRV settle after waking. Otherwise from where the
+    previous sync stopped, or a backfill on the first run."""
+    if requested_days:
+        return today - timedelta(days=requested_days - 1), today
+    last = get_meta(connection, "garmin_last_day")
+    if last:
+        return min(date.fromisoformat(last), today) - timedelta(days=1), today
+    return today - timedelta(days=DEFAULT_BACKFILL_DAYS - 1), today
+
+
+def call_garmin(client, method, *args):
+    """One polite request. A day with nothing recorded is not an error."""
+    garminconnect = import_garmin()
+    time.sleep(REQUEST_PAUSE_SECONDS)
+    try:
+        return getattr(client, method)(*args)
+    except garminconnect.GarminConnectNotFoundError:
+        return None
+    except garminconnect.GarminConnectTooManyRequestsError as error:
+        raise HealthError("Garmin is rate limiting this account. Stop and try again in an hour.") from error
+    except garminconnect.GarminConnectAuthenticationError as error:
+        raise HealthError("Garmin rejected the saved login. Run `health login` again.") from error
+    except garminconnect.GarminConnectConnectionError as error:
+        # The daily summary raises this, rather than returning nothing, for a
+        # day the watch has not reported yet.
+        if "No data received" in str(error):
+            return None
+        # Writes skip the library's error mapping, so a rate limit on one
+        # arrives as a plain connection error.
+        if "429" in str(error):
+            raise HealthError("Garmin is rate limiting this account. Stop and try again in an hour.") from error
+        raise HealthError(f"Garmin request {method} failed: {error}") from error
+
+
+def sync(requested_days=None, today=None):
+    with garmin_lock():
+        synchronise(garmin_client(), requested_days, today)
+
+
+def synchronise(client, requested_days, today):
+    today = today or date.today()
+    connection = connect()
+    start, end = sync_range(connection, requested_days, today)
+    counts = {"observations": 0, "activities": 0}
+    with connection:
+        for day in days_between(start, end):
+            day_text = day.isoformat()
+            for kind, method, extractor in DAILY_ENDPOINTS:
+                payload = call_garmin(client, method, day_text)
+                if not payload:
+                    continue
+                store_raw(connection, kind, day_text, payload)
+                counts["observations"] += store_triples(connection, extractor(payload, day_text))
+            # Commit a day at a time so an interrupted backfill keeps its progress.
+            set_meta(connection, "garmin_last_day", day_text)
+            connection.commit()
+
+        first, last = start.isoformat(), end.isoformat()
+        for kind, method, extractor in RANGE_ENDPOINTS:
+            payload = call_garmin(client, method, first, last)
+            if payload:
+                store_raw(connection, kind, last, payload)
+                counts["observations"] += store_triples(connection, extractor(payload))
+
+        activities = call_garmin(client, "get_activities_by_date", first, last) or []
+        for activity in activities:
+            if activity.get("activityId"):
+                store_activity(connection, activity_row(activity))
+                counts["activities"] += 1
+        set_meta(connection, "garmin_synced_at", now_local().isoformat())
+    print(
+        f"Synced {first} to {last}: {counts['observations']} values, "
+        f"{counts['activities']} activities."
+    )
+
+
+# Analysis
+
+
+class Level:
+    """How much a finding matters, most urgent first."""
+
+    ALERT = "alert"
+    WARN = "warn"
+    INFO = "info"
+    GOOD = "good"
+    ORDER = (ALERT, WARN, INFO, GOOD)
+
+
+Finding = namedtuple("Finding", "level topic text")
+Baseline = namedtuple("Baseline", "mean stdev count")
+
+
+def baseline(connection, name, day):
+    """The owner's normal for a metric: the 28 days before `day`."""
+    values = list(daily_series(connection, name, day - timedelta(days=BASELINE_DAYS), day - timedelta(days=1)).values())
+    if len(values) < 7:
+        return None
+    return Baseline(statistics.fmean(values), statistics.pstdev(values), len(values))
+
+
+def deviation(value, normal):
+    """How unusual a value is, in standard deviations from the owner's normal.
+    A perfectly flat baseline says nothing about spread, so it gives no signal."""
+    if value is None or normal is None or normal.stdev == 0:
+        return None
+    return (value - normal.mean) / normal.stdev
+
+
+def value_on(connection, name, day):
+    return daily_series(connection, name, day, day).get(day)
+
+
+def window_mean(connection, name, start, end):
+    values = list(daily_series(connection, name, start, end).values())
+    return statistics.fmean(values) if values else None
+
+
+def compare(connection, name, day):
+    value = value_on(connection, name, day)
+    normal = baseline(connection, name, day)
+    return value, normal, deviation(value, normal)
+
+
+def describe(value, unit, normal, z):
+    """'48 ms, usual 55' plus a word when it is outside the normal band."""
+    text = format_number(value) + (f" {unit}" if unit else "")
+    if normal:
+        text += f", usual {format_number(normal.mean)}"
+    if z is not None and abs(z) >= 1:
+        text += " (high)" if z > 0 else " (low)"
+    return text
+
+
+def format_number(value):
+    if value is None:
+        return "n/a"
+    if abs(value) >= 100 or float(value).is_integer():
+        return f"{value:.0f}"
+    return f"{value:.1f}"
+
+
+def training_load_ratio(connection, day):
+    """Acute to chronic workload: the last 7 days against the average week of
+    the last 28. Uses Garmin's training load where it exists and minutes where it
+    does not, so a manual gym log still counts."""
+
+    def load(start, end):
+        row = connection.execute(
+            "SELECT SUM(COALESCE(training_load, duration_min)) AS load, COUNT(*) AS sessions "
+            "FROM activities WHERE day BETWEEN ? AND ?",
+            (start.isoformat(), end.isoformat()),
+        ).fetchone()
+        return row["load"] or 0, row["sessions"]
+
+    acute, sessions = load(day - timedelta(days=RECENT_DAYS - 1), day)
+    chronic, chronic_sessions = load(day - timedelta(days=BASELINE_DAYS - 1), day)
+    if chronic_sessions < 4 or chronic == 0:
+        return None, sessions
+    return acute / (chronic / 4), sessions
+
+
+def active_days(connection, start, end):
+    rows = connection.execute(
+        "SELECT COUNT(DISTINCT day) AS days FROM activities WHERE day BETWEEN ? AND ?",
+        (start.isoformat(), end.isoformat()),
+    ).fetchone()
+    return rows["days"]
+
+
+def recovery_findings(connection, day):
+    hrv, hrv_normal, hrv_z = compare(connection, "hrv_night", day)
+    rhr, rhr_normal, rhr_z = compare(connection, "resting_hr", day)
+    readiness = value_on(connection, "training_readiness", day)
+    strained = []
+    if hrv_z is not None and hrv_z <= -1:
+        strained.append(f"HRV {format_number(hrv)} ms vs usual {format_number(hrv_normal.mean)}")
+    if rhr_z is not None and rhr_z >= 1:
+        strained.append(f"resting HR {format_number(rhr)} vs usual {format_number(rhr_normal.mean)}")
+    if readiness is not None and readiness < 40:
+        strained.append(f"readiness {format_number(readiness)}")
+    if len(strained) >= 2:
+        return [Finding(Level.WARN, "recovery", "Recovery is clearly down (" + ", ".join(strained)
+                        + "). Keep today easy, a walk or mobility, and look at sleep, alcohol, illness or stress.")]
+    if strained:
+        return [Finding(Level.INFO, "recovery", "One recovery marker is off (" + strained[0]
+                        + "). Fine to train, but go by feel and skip max efforts.")]
+    if hrv_z is not None and hrv_z >= 0.5 and (readiness is None or readiness >= 70):
+        return [Finding(Level.GOOD, "recovery", "Recovery looks strong. A good day for a hard or long session.")]
+    return []
+
+
+def sleep_findings(connection, day):
+    findings = []
+    last_night = value_on(connection, "sleep_hours", day)
+    week = window_mean(connection, "sleep_hours", day - timedelta(days=RECENT_DAYS - 1), day)
+    if last_night is not None and last_night < 6:
+        findings.append(Finding(Level.WARN, "sleep", f"Only {format_number(last_night)} h of sleep last night. "
+                                "Expect lower focus and go lighter on training."))
+    if week is not None and week < 7:
+        debt = (7 - week) * RECENT_DAYS
+        findings.append(Finding(Level.WARN, "sleep", f"Averaging {format_number(week)} h a night this week, about "
+                                f"{format_number(debt)} h short of 7 a night. An earlier, fixed bedtime is the lever."))
+    return findings
+
+
+def stress_findings(connection, day):
+    week = window_mean(connection, "stress_avg", day - timedelta(days=RECENT_DAYS - 1), day)
+    normal = baseline(connection, "stress_avg", day - timedelta(days=RECENT_DAYS - 1))
+    z = deviation(week, normal)
+    if week is not None and (week >= 50 or (z is not None and z >= 1)):
+        return [Finding(Level.INFO, "stress", f"Stress has run high this week, averaging {format_number(week)}. "
+                        "Short breathing breaks and a lighter evening help body battery recharge.")]
+    return []
+
+
+def energy_findings(connection, day):
+    peak = value_on(connection, "body_battery_high", day)
+    if peak is not None and peak < 50:
+        return [Finding(Level.INFO, "energy", f"Body battery only reached {format_number(peak)} today. "
+                        "Low reserves, so pace the day.")]
+    return []
+
+
+def activity_findings(connection, day):
+    findings = []
+    start = day - timedelta(days=RECENT_DAYS - 1)
+    minutes = daily_series(connection, "intensity_minutes", start, day)
+    if len(minutes) >= 5:
+        total = sum(minutes.values())
+        if total < 150:
+            findings.append(Finding(Level.INFO, "activity", f"{format_number(total)} of the 150 weekly intensity "
+                                    "minutes the WHO recommends. A brisk 30 minute walk closes that gap fast."))
+    steps = window_mean(connection, "steps", start, day)
+    if steps is not None and steps < 5000:
+        findings.append(Finding(Level.INFO, "activity", f"Averaging {format_number(steps)} steps a day this week, "
+                                "which is sedentary territory."))
+    ratio, sessions = training_load_ratio(connection, day)
+    if ratio is not None and ratio > 1.5:
+        findings.append(Finding(Level.WARN, "training", f"Training load this week is {ratio:.1f}x your usual week. "
+                                "Spikes like that are when injuries happen, so add a rest day."))
+    elif ratio is not None and ratio < 0.6:
+        findings.append(Finding(Level.INFO, "training", f"Training load is down to {ratio:.1f}x your usual week."))
+    if sessions and active_days(connection, start, day) >= RECENT_DAYS:
+        findings.append(Finding(Level.INFO, "training", "No rest day in the last 7. Schedule one."))
+    return findings
+
+
+def blood_pressure_findings(connection, day):
+    """ACC/AHA 2017 categories on the last week's average, since one reading
+    says little. A single crisis-level reading is flagged on its own."""
+    start = day - timedelta(days=RECENT_DAYS - 1)
+    latest = connection.execute(
+        "SELECT s.value AS systolic, d.value AS diastolic, s.at AS at FROM observations s "
+        "JOIN observations d ON d.metric = 'bp_diastolic' AND d.at = s.at AND d.source = s.source "
+        "WHERE s.metric = 'bp_systolic' AND s.day BETWEEN ? AND ? ORDER BY s.at DESC LIMIT 1",
+        (start.isoformat(), day.isoformat()),
+    ).fetchone()
+    if not latest:
+        return []
+    if latest["systolic"] >= 180 or latest["diastolic"] >= 120:
+        return [Finding(Level.ALERT, "blood pressure", f"A reading of {latest['systolic']:.0f}/{latest['diastolic']:.0f} "
+                        "is in the hypertensive crisis range. Rest 5 minutes and measure again, and get medical "
+                        "help now if it stays there or comes with chest pain, breathlessness or headache.")]
+    systolic = window_mean(connection, "bp_systolic", start, day)
+    diastolic = window_mean(connection, "bp_diastolic", start, day)
+    reading = f"{systolic:.0f}/{diastolic:.0f}"
+    if systolic >= 140 or diastolic >= 90:
+        return [Finding(Level.WARN, "blood pressure", f"Blood pressure is averaging {reading}, stage 2 "
+                        "hypertension. Worth booking a doctor's appointment.")]
+    if systolic >= 130 or diastolic >= 80:
+        return [Finding(Level.WARN, "blood pressure", f"Blood pressure is averaging {reading}, stage 1 "
+                        "hypertension. Salt, alcohol, sleep and cardio all move this. Mention it at your next checkup.")]
+    if systolic >= 120:
+        return [Finding(Level.INFO, "blood pressure", f"Blood pressure is averaging {reading}, slightly elevated.")]
+    return []
+
+
+def vitals_findings(connection, day):
+    findings = []
+    spo2 = window_mean(connection, "spo2_sleep", day - timedelta(days=2), day)
+    if spo2 is not None and spo2 < 92:
+        findings.append(Finding(Level.WARN, "SpO2", f"Overnight SpO2 has averaged {format_number(spo2)}% the last "
+                                "3 nights. Wrist readings are noisy, but if it persists it is worth checking for "
+                                "sleep apnea."))
+    rhr = value_on(connection, "resting_hr", day)
+    if rhr is not None and rhr > 100:
+        findings.append(Finding(Level.WARN, "heart rate", f"Resting heart rate of {format_number(rhr)} is above "
+                                "100. Worth a doctor's look if it is not illness or caffeine."))
+    temperature = value_on(connection, "body_temp_c", day)
+    if temperature is not None and temperature >= 38:
+        findings.append(Finding(Level.WARN, "temperature", f"Temperature of {format_number(temperature)} C is a "
+                                "fever. Rest and skip training."))
+    return findings
+
+
+def weight_findings(connection, day):
+    recent = window_mean(connection, "weight_kg", day - timedelta(days=RECENT_DAYS - 1), day)
+    earlier = window_mean(connection, "weight_kg", day - timedelta(days=BASELINE_DAYS + RECENT_DAYS),
+                          day - timedelta(days=BASELINE_DAYS))
+    if recent is None or earlier is None:
+        return []
+    change = (recent - earlier) / earlier * 100
+    if abs(change) >= 2:
+        direction = "up" if change > 0 else "down"
+        return [Finding(Level.INFO, "weight", f"Weight is {direction} {abs(recent - earlier):.1f} kg "
+                        f"({abs(change):.1f}%) over the last month.")]
+    return []
+
+
+def freshness_findings(connection, day):
+    synced = get_meta(connection, "garmin_synced_at")
+    if not synced:
+        return []
+    last = connection.execute(
+        "SELECT MAX(day) AS day FROM observations WHERE source = 'garmin' AND metric = 'steps' AND value > 0"
+    ).fetchone()["day"]
+    if last and (day - date.fromisoformat(last)).days >= 2:
+        return [Finding(Level.INFO, "data", f"No watch data since {last}. Open Garmin Connect on the phone so the "
+                        "watch syncs.")]
+    return []
+
+
+RULES = (
+    blood_pressure_findings,
+    vitals_findings,
+    recovery_findings,
+    sleep_findings,
+    stress_findings,
+    energy_findings,
+    activity_findings,
+    weight_findings,
+    freshness_findings,
+)
+
+
+def recommendations(connection, day):
+    findings = [finding for rule in RULES for finding in rule(connection, day)]
+    return sorted(findings, key=lambda finding: Level.ORDER.index(finding.level))
+
+
+# What the brief shows, in order. Each is shown only when it has a value.
+BRIEF_METRICS = (
+    "sleep_hours",
+    "sleep_score",
+    "hrv_night",
+    "resting_hr",
+    "training_readiness",
+    "body_battery_high",
+    "stress_avg",
+    "steps",
+    "intensity_minutes",
+    "spo2_sleep",
+    "weight_kg",
+    "bp_systolic",
+    "bp_diastolic",
+)
+
+
+def brief_data(connection, day):
+    metrics = {}
+    for name in BRIEF_METRICS:
+        value, normal, z = compare(connection, name, day)
+        if value is None:
+            continue
+        metrics[name] = {
+            "value": round(value, 2),
+            "usual": None if normal is None else round(normal.mean, 2),
+            "deviation": None if z is None else round(z, 2),
+        }
+    activities = [
+        dict(row)
+        for row in connection.execute(
+            "SELECT started_at, type, name, duration_min, distance_km, avg_hr, training_load "
+            "FROM activities WHERE day = ? ORDER BY started_at",
+            (day.isoformat(),),
+        )
+    ]
+    return {
+        "day": day.isoformat(),
+        "synced_at": get_meta(connection, "garmin_synced_at"),
+        "metrics": metrics,
+        "activities": activities,
+        "recommendations": [finding._asdict() for finding in recommendations(connection, day)],
+    }
+
+
+def print_brief(data):
+    print(f"{data['day']}, last Garmin sync {data['synced_at'] or 'never'}")
+    if not data["metrics"] and not data["activities"]:
+        print("No data for this day.")
+    for name, entry in data["metrics"].items():
+        info = METRICS[name]
+        normal = None if entry["usual"] is None else Baseline(entry["usual"], 0, 0)
+        print(f"{info.label}: {describe(entry['value'], info.unit, normal, entry['deviation'])}")
+    for activity in data["activities"]:
+        parts = [activity["type"] or "activity", f"{format_number(activity['duration_min'])} min"]
+        if activity["distance_km"]:
+            parts.append(f"{activity['distance_km']:.1f} km")
+        if activity["avg_hr"]:
+            parts.append(f"avg HR {activity['avg_hr']:.0f}")
+        print("activity: " + ", ".join(parts))
+    if data["recommendations"]:
+        print("recommendations:")
+        for finding in data["recommendations"]:
+            print(f"[{finding['level']}] {finding['topic']}: {finding['text']}")
+
+
+def trend_rows(connection, day, names=None):
+    """Last 7 days against the 28 before them, for every metric with data."""
+    recent_start = day - timedelta(days=RECENT_DAYS - 1)
+    before_end = recent_start - timedelta(days=1)
+    before_start = before_end - timedelta(days=BASELINE_DAYS - 1)
+    if names:
+        for name in names:
+            metric(name)
+    else:
+        names = [row["metric"] for row in connection.execute("SELECT DISTINCT metric FROM observations")]
+        names = [name for name in METRICS if name in names]
+    rows = []
+    for name in names:
+        recent = window_mean(connection, name, recent_start, day)
+        before = window_mean(connection, name, before_start, before_end)
+        if recent is None:
+            continue
+        change = None if before in (None, 0) else (recent - before) / abs(before) * 100
+        better = METRICS[name].better
+        verdict = "new" if change is None else "steady"
+        if change is not None and abs(change) >= 5:
+            if better == 0:
+                verdict = "up" if change > 0 else "down"
+            else:
+                verdict = "improving" if change * better > 0 else "worsening"
+        rows.append({
+            "metric": name,
+            "recent": round(recent, 2),
+            "before": None if before is None else round(before, 2),
+            "change_pct": None if change is None else round(change, 1),
+            "verdict": verdict,
+        })
+    return rows
+
+
+def print_trends(rows):
+    if not rows:
+        print("No data yet. Run `health sync` or log something first.")
+        return
+    for row in rows:
+        info = METRICS[row["metric"]]
+        unit = f" {info.unit}" if info.unit else ""
+        recent = f"{info.label}: {format_number(row['recent'])}{unit}"
+        if row["change_pct"] is None:
+            print(f"{recent}, nothing earlier to compare")
+        else:
+            print(f"{recent} vs {format_number(row['before'])} ({row['change_pct']:+.0f}%) {row['verdict']}")
+
+
+def print_history(connection, name, days, today):
+    metric(name)
+    series = daily_series(connection, name, today - timedelta(days=days - 1), today)
+    if not series:
+        print(f"No {name} recorded in the last {days} days.")
+        return
+    for day, value in series.items():
+        print(f"{day.isoformat()} {format_number(value)}")
+
+
+# Garmin login
+
+
+def garmin_client():
+    garminconnect = import_garmin()
+    if not token_dir().exists():
+        raise HealthError("Not logged in to Garmin. Run `health login` first.")
+    client = garminconnect.Garmin()
+    try:
+        client.login(str(token_dir()))
+    except (garminconnect.GarminConnectAuthenticationError, FileNotFoundError) as error:
+        raise HealthError("The saved Garmin login no longer works. Run `health login` again.") from error
+    return client
+
+
+@contextmanager
+def garmin_lock():
+    """One Garmin session at a time. Garmin rotates the refresh token on use, so
+    two processes refreshing the same saved login would log each other out."""
+    ensure_runtime_root()
+    with (runtime_root() / "garmin.lock").open("w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+# Garmin's MFA handshake lives in the memory of the process that started it and
+# a second login invalidates the emailed code. The agent, though, only gets the
+# code a chat message later, in a new process. So `login` starts a detached
+# worker that holds the handshake open, and the two talk through small files:
+# the worker reports progress in the state file, and `login --mfa` drops the
+# code into the code file.
+
+
+def read_json(path):
+    try:
+        with path.open(encoding="utf-8") as handle:
+            return json.load(handle)
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def process_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def login_state():
+    """The worker's last report, or None when no login is under way."""
+    state = read_json(login_state_path())
+    if not state:
+        return None
+    if state.get("state") in ("starting", "waiting-for-code") and not process_alive(state.get("pid") or 0):
+        return dict(state, state="failed", message="The login worker stopped. Run `health login` again.")
+    return state
+
+
+def wait_for_login(done, seconds):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        state = login_state()
+        if state and done(state):
+            return state
+        time.sleep(0.5)
+    raise HealthError("Garmin did not answer in time. Check `health status` in a minute.")
+
+
+def report_login(state):
+    if state["state"] == "done":
+        print(state["message"])
+        return
+    if state["state"] == "waiting-for-code":
+        print(f"{state['message']} Ask the owner for it, then run `health login --mfa CODE` within "
+              f"{MFA_WAIT_SECONDS // 60} minutes.")
+        return
+    raise HealthError(state.get("message") or "Garmin login failed.")
+
+
+def login(mfa_code=None):
+    if mfa_code:
+        submit_code(mfa_code)
+        return
+    missing = [name for name in (EMAIL_SECRET, PASSWORD_SECRET) if not stored_secret(name)]
+    if missing:
+        raise HealthError(f"Missing {' and '.join(missing)}. Ask the owner for them with request_secret.")
+    state = login_state()
+    if state and state["state"] in ("starting", "waiting-for-code"):
+        raise HealthError("A Garmin login is already waiting. Finish it with `health login --mfa CODE`, "
+                          "or run `health logout` to start over.")
+    import_garmin()
+    ensure_runtime_root()
+    for path in (login_state_path(), login_code_path()):
+        if path.exists():
+            path.unlink()
+    with (runtime_root() / "garmin-login.log").open("a") as log:
+        worker = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "login-worker"],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+        )
+    # The worker writes the state file itself, so this cannot race its first report.
+    started = time.monotonic()
+    while login_state() is None:
+        if worker.poll() is not None or time.monotonic() - started > 10:
+            raise HealthError(f"The login worker did not start. See {runtime_root() / 'garmin-login.log'}.")
+        time.sleep(0.2)
+    report_login(wait_for_login(lambda state: state["state"] != "starting", LOGIN_WAIT_SECONDS))
+
+
+def submit_code(code):
+    state = login_state()
+    if not state or state["state"] != "waiting-for-code":
+        raise HealthError("No Garmin login is waiting for a code. Run `health login` first.")
+    attempt = f"{time.time():.6f}"
+    write_private(login_code_path(), json.dumps({"code": code.strip(), "id": attempt}))
+    report_login(wait_for_login(lambda state: state.get("answered") == attempt, LOGIN_WAIT_SECONDS))
+
+
+def next_code(deadline, answered):
+    """Block until `login --mfa` leaves a code this worker has not tried yet."""
+    while time.monotonic() < deadline:
+        entry = read_json(login_code_path())
+        if entry and entry.get("id") != answered:
+            return entry["id"], entry["code"]
+        time.sleep(0.5)
+    return None
+
+
+def login_worker():
+    garminconnect = import_garmin()
+    answered = None
+
+    def update(state, message=""):
+        write_private(login_state_path(), json.dumps(
+            {"state": state, "message": message, "pid": os.getpid(), "answered": answered}
+        ))
+
+    update("starting")
+    try:
+        client = garminconnect.Garmin(stored_secret(EMAIL_SECRET), stored_secret(PASSWORD_SECRET),
+                                      return_on_mfa=True)
+        result, pending = client.login()
+        if result == "needs_mfa":
+            update("waiting-for-code", "Garmin sent a verification code to the owner's email.")
+            deadline = time.monotonic() + MFA_WAIT_SECONDS
+            while True:
+                attempt = next_code(deadline, answered)
+                if attempt is None:
+                    update("failed", "No code arrived in time. Run `health login` again.")
+                    return
+                answered, code = attempt
+                try:
+                    client.resume_login(pending, code)
+                    break
+                except garminconnect.GarminConnectAuthenticationError:
+                    # The pending handshake survives a wrong code, so the owner
+                    # can just send it again.
+                    update("waiting-for-code", "Garmin rejected that code.")
+        with garmin_lock():
+            client.client.dump(str(token_dir()))
+            name = garmin_client().get_full_name()
+        update("done", f"Logged in to Garmin as {name or 'the owner'}.")
+    except HealthError as error:
+        update("failed", str(error))
+    except garminconnect.GarminConnectAuthenticationError as error:
+        update("failed", f"Garmin rejected the email or password: {error}")
+    except Exception as error:
+        update("failed", f"Garmin login failed: {error}")
+    finally:
+        if login_code_path().exists():
+            login_code_path().unlink()
+
+
+def logout():
+    state = login_state()
+    if state and state["state"] in ("starting", "waiting-for-code"):
+        with suppress(ProcessLookupError):
+            os.kill(state["pid"], 15)
+    removed = False
+    for path in (token_dir(), login_state_path(), login_code_path()):
+        if path.is_dir():
+            shutil.rmtree(path)
+            removed = True
+        elif path.exists():
+            path.unlink()
+            removed = True
+    print("Logged out of Garmin." if removed else "Was not logged in to Garmin.")
+
+
+# Manual entries
+
+
+def parse_entries(pairs):
+    entries = []
+    for pair in pairs:
+        name, separator, raw = pair.partition("=")
+        if not separator:
+            raise HealthError(f"Expected metric=value, got {pair!r}")
+        metric(name)
+        try:
+            entries.append((name, float(raw)))
+        except ValueError:
+            raise HealthError(f"{name} needs a number, got {raw!r}") from None
+    return entries
+
+
+def parse_at(text):
+    if not text:
+        return now_local()
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        raise HealthError(f"Cannot read {text!r} as a time. Use 2026-09-23T07:30.") from None
+
+
+def log_entries(pairs, at_text=None, to_garmin=False):
+    entries = parse_entries(pairs)
+    at = parse_at(at_text)
+    connection = connect()
+    with connection:
+        for name, value in entries:
+            record(connection, name, at, value, "manual")
+    print(f"Logged {', '.join(f'{name} {format_number(value)}' for name, value in entries)} at {at.isoformat()}.")
+    if to_garmin:
+        push_to_garmin(dict(entries), at)
+
+
+def push_to_garmin(values, at):
+    """Send weight and blood pressure to Garmin Connect too, so the watch and
+    the app see a reading taken with some other device."""
+    with garmin_lock():
+        pushed = send_to_garmin(values, at)
+    print(f"Sent {' and '.join(pushed)} to Garmin Connect.")
+
+
+def send_to_garmin(values, at):
+    client = None
+    pushed = []
+    if "weight_kg" in values:
+        client = client or garmin_client()
+        call_garmin(client, "add_weigh_in", values["weight_kg"], "kg", at.isoformat(timespec="seconds"))
+        pushed.append("weight")
+    if "bp_systolic" in values and "bp_diastolic" in values:
+        client = client or garmin_client()
+        pulse = values.get("pulse") or values.get("heart_rate")
+        pulse = None if pulse is None else int(pulse)
+        call_garmin(client, "set_blood_pressure", int(values["bp_systolic"]), int(values["bp_diastolic"]),
+                    pulse, at.isoformat(timespec="seconds"))
+        pushed.append("blood pressure")
+    if not pushed:
+        raise HealthError("Only weight_kg and a bp_systolic/bp_diastolic pair can go to Garmin.")
+    return pushed
+
+
+# Bluetooth
+#
+# Only the standard Bluetooth SIG health profiles, because those are the ones a
+# device documents and keeps stable: heart rate straps and watches broadcasting
+# heart rate, weight scales, blood pressure cuffs, thermometers and pulse
+# oximeters. Proprietary scales that hide readings in advertisements are out.
+
+
+def ble_uuid(short):
+    return f"0000{short:04x}-0000-1000-8000-00805f9b34fb"
+
+
+def sfloat(raw):
+    """IEEE 11073 16 bit SFLOAT, a 4 bit exponent over a 12 bit mantissa."""
+    if raw in (0x07FF, 0x0800, 0x07FE, 0x0802, 0x0801):
+        return None
+    mantissa, exponent = raw & 0x0FFF, raw >> 12
+    if mantissa >= 0x0800:
+        mantissa -= 0x1000
+    if exponent >= 0x8:
+        exponent -= 0x10
+    return round(mantissa * 10.0**exponent, 6)
+
+
+def float32(raw):
+    """IEEE 11073 32 bit FLOAT, an 8 bit exponent over a 24 bit mantissa."""
+    if raw in (0x007FFFFF, 0x00800000, 0x007FFFFE, 0x00800002, 0x00800001):
+        return None
+    mantissa, exponent = raw & 0xFFFFFF, raw >> 24
+    if mantissa >= 0x800000:
+        mantissa -= 0x1000000
+    if exponent >= 0x80:
+        exponent -= 0x100
+    return round(mantissa * 10.0**exponent, 6)
+
+
+class Reader:
+    """Walks a characteristic value left to right, the way every SIG format is laid out."""
+
+    def __init__(self, data):
+        self.data = bytes(data)
+        self.offset = 0
+
+    def take(self, size):
+        if self.offset + size > len(self.data):
+            raise HealthError(f"Bluetooth payload is truncated: {self.data.hex()}")
+        chunk = self.data[self.offset:self.offset + size]
+        self.offset += size
+        return int.from_bytes(chunk, "little")
+
+    def remaining(self):
+        return len(self.data) - self.offset
+
+    def sfloat(self):
+        return sfloat(self.take(2))
+
+    def float32(self):
+        return float32(self.take(4))
+
+    def timestamp(self):
+        year, month, day = self.take(2), self.take(1), self.take(1)
+        hour, minute, second = self.take(1), self.take(1), self.take(1)
+        if not year or not month or not day:
+            return None
+        return datetime(year, month, day, hour, minute, second)
+
+
+def decode_heart_rate(data):
+    """Heart Rate Measurement, 0x2A37. RR intervals arrive in 1/1024 s."""
+    reader = Reader(data)
+    flags = reader.take(1)
+    values = {"heart_rate": reader.take(2 if flags & 0x01 else 1)}
+    if flags & 0x08:
+        reader.take(2)  # energy expended, unused
+    rr = []
+    if flags & 0x10:
+        while reader.remaining() >= 2:
+            rr.append(reader.take(2) * 1000 / 1024)
+    return values, None, rr
+
+
+def decode_weight(data):
+    """Weight Measurement, 0x2A9D."""
+    reader = Reader(data)
+    flags = reader.take(1)
+    imperial = flags & 0x01
+    raw = reader.take(2)
+    if raw == 0xFFFF:
+        return {}, None, []
+    weight = raw * 0.01 * 0.45359237 if imperial else raw * 0.005
+    at = reader.timestamp() if flags & 0x02 else None
+    if flags & 0x04:
+        reader.take(1)  # user index
+    values = {"weight_kg": round(weight, 3)}
+    if flags & 0x08:
+        values["bmi"] = reader.take(2) * 0.1
+    return values, at, []
+
+
+def decode_blood_pressure(data):
+    """Blood Pressure Measurement, 0x2A35."""
+    reader = Reader(data)
+    flags = reader.take(1)
+    kpa = flags & 0x01
+    systolic, diastolic, _mean = reader.sfloat(), reader.sfloat(), reader.sfloat()
+    if kpa:
+        systolic = None if systolic is None else systolic * 7.50062
+        diastolic = None if diastolic is None else diastolic * 7.50062
+    at = reader.timestamp() if flags & 0x02 else None
+    values = {"bp_systolic": systolic, "bp_diastolic": diastolic}
+    if flags & 0x04:
+        values["pulse"] = reader.sfloat()
+    return {key: round(value, 1) for key, value in values.items() if value is not None}, at, []
+
+
+def decode_temperature(data):
+    """Temperature Measurement, 0x2A1C."""
+    reader = Reader(data)
+    flags = reader.take(1)
+    value = reader.float32()
+    if value is not None and flags & 0x01:
+        value = (value - 32) * 5 / 9
+    at = reader.timestamp() if flags & 0x02 else None
+    return ({} if value is None else {"body_temp_c": round(value, 2)}), at, []
+
+
+def decode_spot_check(data):
+    """PLX Spot-Check Measurement, 0x2A5E."""
+    reader = Reader(data)
+    flags = reader.take(1)
+    spo2, pulse = reader.sfloat(), reader.sfloat()
+    at = reader.timestamp() if flags & 0x01 else None
+    values = {"spo2": spo2, "pulse": pulse}
+    return {key: value for key, value in values.items() if value is not None}, at, []
+
+
+def decode_continuous(data):
+    """PLX Continuous Measurement, 0x2A5F. Only the normal reading, not the fast or slow ones."""
+    reader = Reader(data)
+    reader.take(1)
+    spo2, pulse = reader.sfloat(), reader.sfloat()
+    values = {"spo2": spo2, "pulse": pulse}
+    return {key: value for key, value in values.items() if value is not None}, None, []
+
+
+# kind: (service, characteristic, decoder, streams). A streaming profile sends a
+# value every second and is summarised over a window. The others send one
+# measurement, sometimes a backlog of stored ones, and each is kept.
+Profile = namedtuple("Profile", "service characteristic decode streams")
+
+PROFILES = {
+    "hr": Profile(ble_uuid(0x180D), ble_uuid(0x2A37), decode_heart_rate, True),
+    "weight": Profile(ble_uuid(0x181D), ble_uuid(0x2A9D), decode_weight, False),
+    "bp": Profile(ble_uuid(0x1810), ble_uuid(0x2A35), decode_blood_pressure, False),
+    "temp": Profile(ble_uuid(0x1809), ble_uuid(0x2A1C), decode_temperature, False),
+    "spo2": Profile(ble_uuid(0x1822), ble_uuid(0x2A5E), decode_spot_check, False),
+    "spo2-live": Profile(ble_uuid(0x1822), ble_uuid(0x2A5F), decode_continuous, True),
+}
+
+
+def kinds_for(service_uuids):
+    services = {uuid.lower() for uuid in service_uuids}
+    return [kind for kind, profile in PROFILES.items() if profile.service in services]
+
+
+def rmssd(intervals):
+    """Root mean square of successive RR differences, the standard short term HRV."""
+    if len(intervals) < 20:
+        return None
+    differences = [later - earlier for earlier, later in zip(intervals, intervals[1:])]
+    return math.sqrt(statistics.fmean(difference * difference for difference in differences))
+
+
+def summarise_stream(samples, rr):
+    """Collapse a streaming session into one reading per metric."""
+    values = {}
+    for name in {name for sample in samples for name in sample}:
+        series = [sample[name] for sample in samples if name in sample]
+        values[name] = round(statistics.fmean(series), 1)
+    # Beats outside 300 to 2000 ms are artefacts or missed beats, and a single
+    # one wrecks RMSSD.
+    clean = [interval for interval in rr if 300 <= interval <= 2000]
+    variability = rmssd(clean)
+    if variability is not None:
+        values["hrv_rmssd"] = round(variability, 1)
+    return values
+
+
+async def scan_devices(seconds, show_all):
+    bleak = import_bleak()
+    found = await bleak.BleakScanner.discover(timeout=seconds, return_adv=True)
+    devices = []
+    for device, advertisement in found.values():
+        kinds = kinds_for(advertisement.service_uuids or [])
+        if kinds or show_all:
+            name = advertisement.local_name or device.name or "unnamed"
+            devices.append((device.address, name, advertisement.rssi, kinds))
+    return sorted(devices, key=lambda entry: -entry[2])
+
+
+def ble_scan(seconds, show_all):
+    devices = asyncio.run(scan_devices(seconds, show_all))
+    if not devices:
+        print(f"No health devices advertising in {seconds:g} s. Wake the device, or for a Garmin watch turn on "
+              "heart rate broadcast.")
+        return
+    for address, name, rssi, kinds in devices:
+        print(f"{address} {name} rssi {rssi} {'/'.join(kinds) or '-'}")
+
+
+async def find_device(kind, seconds):
+    for address, name, _rssi, kinds in await scan_devices(seconds, False):
+        if kind in kinds:
+            return address, name
+    raise HealthError(f"No {kind} device found in {seconds:g} s. Wake it up and run this again.")
+
+
+async def collect(kind, address, seconds):
+    """Subscribe to one profile's measurements until the window closes, or for a
+    one-shot device until it stops sending."""
+    bleak = import_bleak()
+    profile = PROFILES[kind]
+    name = address
+    if not address:
+        address, name = await find_device(kind, 10)
+    measurements, rr = [], []
+    got_one = asyncio.Event()
+
+    def on_value(_characteristic, data):
+        values, at, intervals = profile.decode(data)
+        if values:
+            measurements.append((values, at))
+            rr.extend(intervals)
+            got_one.set()
+
+    async with bleak.BleakClient(address, timeout=20) as client:
+        await client.start_notify(profile.characteristic, on_value)
+        if profile.streams:
+            await asyncio.sleep(seconds)
+        else:
+            try:
+                await asyncio.wait_for(got_one.wait(), seconds)
+                # Cuffs and scales often follow the first reading with stored
+                # ones. Give them a moment to finish.
+                await asyncio.sleep(3)
+            except asyncio.TimeoutError:
+                pass
+        await client.stop_notify(profile.characteristic)
+    return name, measurements, rr
+
+
+def ble_read(kind, address, seconds, to_garmin=False):
+    name, measurements, rr = asyncio.run(collect(kind, address, seconds))
+    if not measurements:
+        raise HealthError(f"Connected to {name} but got no {kind} reading in {seconds:g} s.")
+    started = now_local()
+    if PROFILES[kind].streams:
+        readings = [(summarise_stream([values for values, _ in measurements], rr), started)]
+    else:
+        readings = [(values, at or started) for values, at in measurements]
+    connection = connect()
+    with connection:
+        for values, at in readings:
+            for metric_name, value in values.items():
+                record(connection, metric_name, at, value, "ble", device=name)
+    for values, at in readings:
+        shown = ", ".join(f"{metric_name} {format_number(value)}" for metric_name, value in values.items())
+        print(f"{at.isoformat(timespec='seconds')} {shown}")
+    if to_garmin:
+        values, at = readings[-1]
+        push_to_garmin(values, at)
+
+
+# Status
+
+
+def status():
+    credentials = stored_secret(EMAIL_SECRET) and stored_secret(PASSWORD_SECRET)
+    state = login_state()
+    if state and state["state"] != "done":
+        garmin_login = state["state"]
+    else:
+        garmin_login = "complete" if token_dir().exists() else "missing"
+    print(f"dependencies: {'installed' if venv_python().exists() else 'missing'}")
+    print(f"garmin-credentials: {'stored' if credentials else 'missing'}")
+    print(f"garmin-login: {garmin_login}")
+    if state and state["state"] == "failed":
+        print(f"garmin-login-error: {state['message']}")
+    if not database_path().exists():
+        print("database: empty")
+        return
+    connection = connect()
+    row = connection.execute("SELECT COUNT(*) AS count, MIN(day) AS first, MAX(day) AS last FROM observations").fetchone()
+    activities = connection.execute("SELECT COUNT(*) AS count FROM activities").fetchone()["count"]
+    print(f"database: {row['count']} values from {row['first'] or '-'} to {row['last'] or '-'}, {activities} activities")
+    print(f"last-sync: {get_meta(connection, 'garmin_synced_at') or 'never'}")
+
+
+# Command line
+
+NEEDS_PACKAGES = {"login", "login-worker", "sync", "ble"}
+
+
+def parse_day(text):
+    if not text:
+        return date.today()
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        raise HealthError(f"Cannot read {text!r} as a day. Use 2026-09-23.") from None
+
+
+def parser():
+    root = argparse.ArgumentParser(prog="health", description="Garmin and Bluetooth health tracking.")
+    commands = root.add_subparsers(dest="command", required=True)
+
+    commands.add_parser("status", help="what is set up and how much data is stored")
+    commands.add_parser("setup", help="install the Garmin and Bluetooth packages")
+
+    login_parser = commands.add_parser("login", help="log in to Garmin Connect")
+    login_parser.add_argument("--mfa", metavar="CODE", help="finish a login that asked for a code")
+    commands.add_parser("logout", help="forget the Garmin login")
+    # Started by `login`, not meant to be run by hand.
+    commands.add_parser("login-worker")
+
+    sync_parser = commands.add_parser("sync", help="pull recent Garmin data")
+    sync_parser.add_argument("--days", type=int, help="fetch this many days back instead of catching up")
+
+    brief_parser = commands.add_parser("brief", help="one day with baselines and recommendations")
+    brief_parser.add_argument("--date", help="default today")
+    brief_parser.add_argument("--json", action="store_true")
+
+    trends_parser = commands.add_parser("trends", help="last 7 days against the 28 before")
+    trends_parser.add_argument("metrics", nargs="*")
+    trends_parser.add_argument("--date", help="default today")
+    trends_parser.add_argument("--json", action="store_true")
+
+    history_parser = commands.add_parser("history", help="daily values of one metric")
+    history_parser.add_argument("metric")
+    history_parser.add_argument("--days", type=int, default=30)
+
+    log_parser = commands.add_parser("log", help="record readings by hand, e.g. weight_kg=72.4")
+    log_parser.add_argument("entries", nargs="+", metavar="metric=value")
+    log_parser.add_argument("--at", help="when it was taken, default now")
+    log_parser.add_argument("--garmin", action="store_true", help="also send weight or blood pressure to Garmin")
+
+    commands.add_parser("metrics", help="list known metric names")
+
+    ble = commands.add_parser("ble", help="Bluetooth health devices")
+    ble_commands = ble.add_subparsers(dest="ble_command", required=True)
+    scan_parser = ble_commands.add_parser("scan", help="list nearby health devices")
+    scan_parser.add_argument("--seconds", type=float, default=10)
+    scan_parser.add_argument("--all", action="store_true", help="include devices without a health profile")
+    read_parser = ble_commands.add_parser("read", help="take a reading and store it")
+    read_parser.add_argument("kind", choices=sorted(PROFILES))
+    read_parser.add_argument("--address", help="device address from scan, default the first found")
+    read_parser.add_argument("--seconds", type=float, default=60,
+                             help="how long to record heart rate, or wait for a one-shot reading")
+    read_parser.add_argument("--garmin", action="store_true", help="also send weight or blood pressure to Garmin")
+    return root
+
+
+def run(arguments):
+    command = arguments.command
+    if command == "status":
+        status()
+    elif command == "setup":
+        setup()
+    elif command == "login":
+        login(arguments.mfa)
+    elif command == "login-worker":
+        login_worker()
+    elif command == "logout":
+        logout()
+    elif command == "sync":
+        sync(arguments.days)
+    elif command == "brief":
+        data = brief_data(connect(), parse_day(arguments.date))
+        print(json.dumps(data, indent=2)) if arguments.json else print_brief(data)
+    elif command == "trends":
+        rows = trend_rows(connect(), parse_day(arguments.date), arguments.metrics)
+        print(json.dumps(rows, indent=2)) if arguments.json else print_trends(rows)
+    elif command == "history":
+        print_history(connect(), arguments.metric, arguments.days, date.today())
+    elif command == "log":
+        log_entries(arguments.entries, arguments.at, arguments.garmin)
+    elif command == "metrics":
+        for name, info in METRICS.items():
+            print(f"{name} {info.unit or '-'} {info.label}")
+    elif arguments.ble_command == "scan":
+        ble_scan(arguments.seconds, arguments.all)
+    else:
+        ble_read(arguments.kind, arguments.address, arguments.seconds, arguments.garmin)
+
+
+def main():
+    arguments = parser().parse_args()
+    needs_packages = arguments.command in NEEDS_PACKAGES or getattr(arguments, "garmin", False)
+    if needs_packages:
+        reexec_in_venv()
+    try:
+        run(arguments)
+    except HealthError as error:
+        print(f"health: {error}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
