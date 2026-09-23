@@ -696,8 +696,9 @@ def sleep_findings(connection, day):
                                 "Expect lower focus and go lighter on training."))
     if week is not None and week < 7:
         debt = (7 - week) * RECENT_DAYS
-        findings.append(Finding(Level.WARN, "sleep", f"Averaging {format_number(week)} h a night this week, about "
-                                f"{format_number(debt)} h short of 7 a night. An earlier, fixed bedtime is the lever."))
+        findings.append(Finding(Level.WARN, "sleep", f"Averaging {format_number(week)} h a night this week, "
+                                f"{format_number(debt)} h less than 7 a night would give. "
+                                "An earlier, fixed bedtime is the lever."))
     return findings
 
 
