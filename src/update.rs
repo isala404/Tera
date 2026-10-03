@@ -110,11 +110,14 @@ impl Drop for PreparedUpdate {
 
 pub fn run(config: &Config, component: Component, force: bool) -> Result<UpdateOutcome> {
     fs::create_dir_all(updates_dir(config))?;
+    // Once the new binary is renamed over this one, Linux reports the running
+    // executable as "<path> (deleted)", so resolve it while it still exists.
+    let executable = current_executable()?;
 
     // Validate the Tera release before touching Codex. A missing or malformed
     // release must leave both installed programs exactly as they were.
     let prepared = if component.tera() {
-        prepare_tera_update(force)?
+        prepare_tera_update(&executable, force)?
     } else {
         None
     };
@@ -135,7 +138,7 @@ pub fn run(config: &Config, component: Component, force: bool) -> Result<UpdateO
                 phase: Phase::Prepared,
                 previous: current.clone(),
                 next: current.clone(),
-                target: current_executable()?,
+                target: executable.clone(),
                 backup: None,
                 codex_before: Some(update.before.clone()),
                 codex_after: Some(update.after.clone()),
@@ -159,7 +162,7 @@ pub fn run(config: &Config, component: Component, force: bool) -> Result<UpdateO
                 phase: Phase::Installed,
                 previous: current,
                 next: installed.clone(),
-                target: current_executable()?,
+                target: executable.clone(),
                 backup: None,
                 codex_before,
                 codex_after: codex_after.clone(),
@@ -173,9 +176,8 @@ pub fn run(config: &Config, component: Component, force: bool) -> Result<UpdateO
         }
     }
 
-    let binary_target = current_executable()?;
     let restart_scheduled = if changed {
-        schedule_daemon_restart(config, &binary_target)?
+        schedule_daemon_restart(config, &executable)?
     } else {
         false
     };
@@ -187,8 +189,8 @@ pub fn run(config: &Config, component: Component, force: bool) -> Result<UpdateO
     })
 }
 
-fn prepare_tera_update(force: bool) -> Result<Option<PreparedUpdate>> {
-    let target = current_executable()?;
+fn prepare_tera_update(target: &Path, force: bool) -> Result<Option<PreparedUpdate>> {
+    let target = target.to_path_buf();
     let target_dir = target
         .parent()
         .ok_or_else(|| anyhow!("running executable has no parent: {target:?}"))?;
