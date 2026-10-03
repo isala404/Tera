@@ -303,10 +303,7 @@ fn log_item(method: &str, params: &Value, secrets: &SecretStore) {
             let tool = text_of(item, "tool").unwrap_or_default();
             if finished {
                 let ms = num_of(item, "durationMs");
-                match item
-                    .get("error")
-                    .and_then(|e| if e.is_null() { None } else { Some(e) })
-                {
+                match item.get("error").filter(|e| !e.is_null()) {
                     Some(err) => {
                         warn!(target: "codex::mcp", "{server}.{tool} failed in {ms}ms: {}", truncate(&secrets.redact(&err.to_string()), 400))
                     }
