@@ -44,7 +44,6 @@ Use SQLite for what the flat files cannot answer. This includes full text search
 - `conversation_events`. `seq`, `id`, `occurred_at_ms`, `kind` (`message`|`reaction`), `actor`, `text`, `reply_to_id`, `turn_id`, `reaction_target_id`, `reaction_emoji`. Append only.
 - `attachments`. `event_id`, `position`, `media_type`, `relative_path`, `mime_type`, `original_name`.
 - `provider_refs`. Event id ↔ WhatsApp message id, plus `chat_jid` and `from_me`. What `react` resolves through.
-- `delivery_events`. Transport state for each event.
 - `conversation_fts`. FTS5 over event text, kept current by a trigger.
 
 ```bash
