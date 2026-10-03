@@ -440,6 +440,8 @@ mod tests {
     #[test]
     fn test_phoenix_recovery_stays_inside_the_interrupted_turn() {
         assert!(PHOENIX_RECOVERY_PROMPT.contains("complete scope"));
+        assert!(PHOENIX_RECOVERY_PROMPT.contains("{{RECENT_CONVERSATION}}"));
+        assert!(PHOENIX_RECOVERY_PROMPT.contains("Never repeat a message"));
         assert!(PHOENIX_RECOVERY_PROMPT.contains("Do not revive older work"));
         assert!(PHOENIX_RECOVERY_PROMPT.contains("Do not rebuild, deploy, update"));
         assert!(PHOENIX_RECOVERY_PROMPT.contains("Never announce that you're back"));

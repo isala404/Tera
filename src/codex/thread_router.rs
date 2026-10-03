@@ -52,9 +52,15 @@ impl ThreadRouter {
     /// the agent to read `HORIZON.md` and `INDEX.md` itself, and it reads them
     /// better than we can summarize them.
     pub fn build_bootstrap_context(config: &Config) -> String {
-        let mut context = String::from(
-            "This is a fresh conversation thread; the earlier context is not in \
-             your window. Before answering, read these:\n",
+        let mut context = format!(
+            "This is a fresh thread, so your earlier context is gone but the conversation \
+             is not. Before replying, read the recent conversation below the way a person \
+             rejoining a chat would. Work out what {owner} is after, what was already done \
+             and what you already told them, then answer the newest message from where \
+             things actually stand. Never repeat something you already said, redo finished \
+             work or reopen a settled topic. Follow the conversation, not a checklist.\n\n\
+             Then read these:\n",
+            owner = config.owner_name
         );
 
         context.push_str(&format!("- {}\n", config.root_agents_path().display()));
@@ -75,7 +81,7 @@ impl ThreadRouter {
             .unwrap_or(false)
         {
             context.push_str(&format!(
-                "\nRecent conversation, if you need it: `cat {}/*.jsonl | tail -20 | jq -c .`\n",
+                "\nIf the recent conversation doesn't show where things stand, look further back with `cat {}/*.jsonl | tail -60 | jq -c .`\n",
                 jsonl.display()
             ));
         }

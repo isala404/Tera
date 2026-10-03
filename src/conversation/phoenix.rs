@@ -31,6 +31,10 @@ const WORKER_ID: &str = "phoenix";
 /// a lost notification must not hold startup forever.
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(16 * 60);
 
+/// How much of the chat recovery sees, so it knows what was already done and
+/// said before the restart instead of repeating it.
+const RECENT_CONVERSATION_MESSAGES: usize = 20;
+
 pub struct Phoenix {
     config: Config,
     history_db: HistoryDb,
@@ -197,6 +201,14 @@ impl Phoenix {
     ) -> Result<()> {
         let pending_request = self.render_requests(recoverable)?;
         let abandoned_request = self.render_requests(abandoned)?;
+        let recent = self
+            .history_db
+            .recent_messages(RECENT_CONVERSATION_MESSAGES)?;
+        let recent_conversation = if recent.is_empty() {
+            "Nothing yet.".to_string()
+        } else {
+            InputRenderer::render_history("", &recent, &HashMap::new())
+        };
 
         let prompt = data::render(
             data::PHOENIX_RECOVERY_PROMPT,
@@ -205,6 +217,7 @@ impl Phoenix {
                 ("STARTUP_FACTS", facts),
                 ("PENDING_REQUEST", &pending_request),
                 ("ABANDONED_REQUEST", &abandoned_request),
+                ("RECENT_CONVERSATION", &recent_conversation),
             ],
         );
 

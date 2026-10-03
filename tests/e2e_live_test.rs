@@ -430,6 +430,95 @@ async fn e2e_a_person_mentioned_in_passing_lands_in_memory() {
 
 #[tokio::test]
 #[ignore = "spawns a real codex app-server and consumes account tokens"]
+async fn e2e_a_fresh_thread_picks_up_where_the_chat_is() {
+    use chrono::{Duration as Days, Local, TimeZone};
+    let daemon = Daemon::start().await;
+    daemon.session.set_chat(CHAT);
+
+    // A reminder already set, then a scheduled task's news, then "ok". The
+    // fresh thread has to know what "it" is and that the news was told.
+    let tomorrow = Local::now().date_naive() + Days::days(1);
+    let at = |hour| {
+        Local
+            .from_local_datetime(&tomorrow.and_hms_opt(hour, 0, 0).unwrap())
+            .unwrap()
+            .timestamp_millis()
+    };
+    SchedulerDb::create_schedule(
+        &daemon.runtime_db,
+        "Call the dentist",
+        "Remind Isala to call the dentist.",
+        &ScheduleTiming::Once { at_ms: at(10) },
+        "tasks/call-the-dentist",
+    )
+    .unwrap();
+    let now = Utc::now().timestamp_millis();
+    let chat = [
+        (40, "user", "remind me to call the dentist tomorrow at 10"),
+        (39, "assistant", "done, I'll ping you tomorrow at 10 to call the dentist"),
+        (20, "assistant", "heads up, bitwarden on polaris has been throwing 503s for two days, every secret still syncs though"),
+        (18, "user", "ok"),
+    ];
+    for (i, (minutes_ago, actor, text)) in chat.iter().enumerate() {
+        daemon
+            .history_db
+            .insert_event(tera::history::db::ConversationEvent::message(
+                format!("msg_seed_{i}"),
+                now - minutes_ago * 60_000,
+                *actor,
+                Some(text.to_string()),
+                None,
+                Some(format!("turn_seed_{i}")),
+                vec![],
+            ))
+            .unwrap();
+    }
+
+    let said = "actually push it an hour later";
+    daemon.send(said);
+    let stamps = Watch::new(&daemon).until_settled(&daemon).await;
+    print("fresh thread", said, &stamps, &daemon.reactions());
+
+    let schedules: Vec<_> = SchedulerDb::list_schedules(&daemon.runtime_db)
+        .unwrap()
+        .into_iter()
+        .filter(|s| s.status == tera::scheduler::db::ScheduleStatus::Active)
+        .collect();
+    println!(
+        "  schedules {:?}",
+        schedules
+            .iter()
+            .map(|s| (
+                &s.name,
+                s.next_run_at_ms
+                    .map(|ms| Local.timestamp_millis_opt(ms).unwrap().to_string())
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        schedules.iter().any(|s| s.next_run_at_ms == Some(at(11))),
+        "the dentist reminder did not move to 11"
+    );
+    assert!(
+        !schedules.iter().any(|s| s.next_run_at_ms == Some(at(10))),
+        "the 10 o'clock reminder is still set"
+    );
+    for (_, text) in &stamps {
+        let lower = text.to_lowercase();
+        assert!(
+            !lower.contains("bitwarden") && !lower.contains("503"),
+            "repeated news already told: {text}"
+        );
+    }
+    assert!(
+        !stamps.is_empty() || !daemon.reactions().is_empty(),
+        "no reply"
+    );
+    no_markdown(&stamps);
+}
+
+#[tokio::test]
+#[ignore = "spawns a real codex app-server and consumes account tokens"]
 async fn e2e_the_nightly_pass_learns_the_day_and_compacts_memory() {
     let daemon = Daemon::start().await;
     daemon.session.set_chat(CHAT);
@@ -542,7 +631,7 @@ async fn e2e_the_nightly_pass_learns_the_day_and_compacts_memory() {
     }
     let all = tree
         .iter()
-        .map(|(_, text)| text.to_lowercase())
+        .map(|(name, text)| format!("{name}\n{text}").to_lowercase())
         .collect::<Vec<_>>()
         .join("\n");
 
