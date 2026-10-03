@@ -1,7 +1,7 @@
 [
   {
     "name": "send_message",
-    "description": "Send a WhatsApp message to {{OWNER}}. This is the ONLY way to reach them. Text you return at the end of a turn is a fallback inside a conversation, and nothing at all from a scheduled task. Plain text, no markdown: no headings, bold, bullet lists or tables. Prefer separate short messages for separate thoughts, usually under 40 words total across the reply. Follow the workspace Voice rules. Use 2 or 3 messages when easier to read than one dense paragraph. Keep simple answers in one message. Splitting should not add words. Give more detail only when requested or needed for a complete, accurate answer. Do not repeat information already sent. Every line in the transcript is prefixed with its message id, so pass one as reply_to when you are answering something specific and a bare message would be ambiguous; skip it in ordinary back-and-forth, where a quoted reply is just noise. To send a credential you cannot see, write ${NAME} where the value belongs, e.g. client_id=${SPOTIFY_CLIENT_ID}, and Tera substitutes it on the way out, so {{OWNER}} gets a working link while history keeps only the placeholder.",
+    "description": "Send {{OWNER}} a WhatsApp message. The only way to reach them. Returned text is just a fallback in the chat and goes nowhere from a scheduled task. Plain text, no markdown. Text like a friend, short, separate thoughts in separate messages, and don't repeat what you already sent. Transcript lines carry message ids, so pass one as reply_to only when a bare message would be ambiguous. To include a credential you can't see, write ${NAME} where it belongs, e.g. client_id=${SPOTIFY_CLIENT_ID}, and Tera fills it in on the way out while history keeps the placeholder.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -17,7 +17,7 @@
   },
   {
     "name": "react",
-    "description": "React to a message with an emoji. Often the right answer instead of a message: acknowledging something, agreeing, or when the emoji is the whole reply. Costs them nothing to read.",
+    "description": "React to a message with an emoji. Often the whole reply, for acknowledging or agreeing. Use a reaction or a message to acknowledge, not both.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -29,15 +29,15 @@
   },
   {
     "name": "schedule",
-    "description": "Schedule a one-shot or recurring background task. Use this for anything time-based; never install a cron job or launchd plist. All times are this machine's local time. The run happens on a fresh thread in its own task directory with no memory of this conversation, so write `prompt` as standalone instructions: what to do, where to look, and what is worth messaging {{OWNER}} about. The response echoes back the resolved first run. Check it says what you meant.",
+    "description": "Schedule a one-off or recurring background task. Use this for anything time-based, never cron or launchd. Times are this machine's local time. The run starts on a fresh thread that sees only your prompt and the recent chat, so write `prompt` as standalone instructions: what to do, where to look, and when it's worth messaging {{OWNER}}. If the timing depends on when something actually happens, schedule a single run from that event and reschedule when it happens again, instead of a fixed recurring clock. The response echoes the first run, check it's what you meant.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "name": { "type": "string", "description": "Short descriptive name, e.g. 'Morning brief'" },
-        "prompt": { "type": "string", "description": "Standalone instructions for the worker. It has no conversation context. Say what to do, where the inputs are, and when to message {{OWNER}} versus finish silently." },
+        "prompt": { "type": "string", "description": "Standalone instructions for the worker. It sees only this and the last few chat messages. Say what to do, where the inputs are, and when to message {{OWNER}} versus finish silently." },
         "timing": {
           "type": "object",
-          "description": "When to run. One-shot: {\"type\":\"once\",\"at\":\"2026-08-18T07:30:00+05:30\"}, RFC3339 with an offset, and it must be in the future. Recurring: {\"type\":\"recurring\",\"rrule\":\"...\"} where rrule is either a cron expression evaluated in local time or a fixed interval EVERY_15M / EVERY_2H / EVERY_3D. Cron is ordinary 5-field crontab: \"30 7 * * *\" is 07:30 daily, \"0 9 * * MON\" is 09:00 Mondays, \"0 18 * * MON-FRI\" is weekday evenings. Day-of-week numbers follow crontab (0 and 7 are Sunday), but prefer the three-letter names, they cannot be misread. An unparseable rrule is rejected, not silently turned into something else.",
+          "description": "When to run. One-off: {\"type\":\"once\",\"at\":\"2026-08-18T07:30:00+05:30\"}, RFC3339 with an offset, in the future. Recurring: {\"type\":\"recurring\",\"rrule\":\"...\"} where rrule is a 5-field cron expression in local time or a fixed interval EVERY_15M / EVERY_2H / EVERY_3D. \"30 7 * * *\" is 07:30 daily, \"0 18 * * MON-FRI\" is weekday evenings. Prefer three-letter day names. A cron that restricts both day-of-month and day-of-week is refused, make two schedules. Anything unparseable is rejected.",
           "properties": {
             "type": { "type": "string", "enum": ["once", "recurring"] },
             "at": { "type": "string", "description": "One-shot only. RFC3339 with a UTC offset. Must be in the future." },
@@ -51,12 +51,12 @@
   },
   {
     "name": "list_schedules",
-    "description": "List active schedules with their next run in local time. Use it before creating something that may already exist, and to check that a schedule you just made fires when you intended.",
+    "description": "List active schedules with their next run in local time. Check it before creating something that may already exist, and when something {{OWNER}} says affects a schedule.",
     "inputSchema": { "type": "object" }
   },
   {
     "name": "cancel_schedule",
-    "description": "Cancel an active schedule. A recurring task that has stopped being useful is clutter someone will eventually have to ask about, so cancel it rather than leaving it running.",
+    "description": "Cancel an active schedule. Cancel ones that stopped being useful, and cancel and recreate one whose timing changed.",
     "inputSchema": {
       "type": "object",
       "properties": {

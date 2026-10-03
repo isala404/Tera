@@ -202,22 +202,16 @@ impl WhatsAppWebTransport {
     /// `is_from_me = false` with a device-suffixed JID like `...:26@lid`.
     /// Comparing the sender's user part against our own LID and phone-number
     /// JIDs recognises the owner from any of their devices.
-    fn is_own_account(ctx: &MessageContext) -> bool {
-        Self::is_own_source(&ctx.client, &ctx.info.source)
+    fn is_own_source(client: &Client, source: &MessageSource) -> bool {
+        source.is_from_me || Self::is_own_jid(client, &source.sender.to_string())
     }
 
-    fn is_own_source(client: &Client, source: &MessageSource) -> bool {
-        if source.is_from_me {
-            return true;
-        }
-
-        let sender = source.sender.to_string();
-        let sender_user = jid_user(&sender);
-
+    fn is_own_jid(client: &Client, jid: &str) -> bool {
+        let user = jid_user(jid);
         [client.lid(), client.pn()]
             .iter()
             .flatten()
-            .any(|own| jid_user(&own.to_string()) == sender_user)
+            .any(|own| jid_user(&own.to_string()) == user)
     }
 
     /// Download and decrypt any media attached to an inbound message.
@@ -349,8 +343,16 @@ impl WhatsAppWebTransport {
                 let policy = owner_policy.clone();
                 async move {
                     let sender = ctx.info.source.sender.to_string();
-                    let from_own_account = Self::is_own_account(&ctx);
+                    let from_own_account = Self::is_own_source(&ctx.client, &ctx.info.source);
                     let is_group = ctx.info.source.is_group;
+                    let chat_jid = ctx.info.source.chat.to_non_ad_string();
+
+                    // Paired to the owner's own account, every message they send
+                    // anyone arrives here. Only the chat with themselves is
+                    // addressed to the assistant.
+                    if from_own_account && !Self::is_own_jid(&ctx.client, &chat_jid) {
+                        return;
+                    }
 
                     if !policy
                         .evaluate_sender(&sender, from_own_account, is_group)
@@ -380,7 +382,7 @@ impl WhatsAppWebTransport {
                         reply_to_provider_msg_id: quoted_message_provider_id(&ctx.message),
                         media_attachment,
                         media_error,
-                        chat_jid: ctx.info.source.chat.to_non_ad_string(),
+                        chat_jid,
                         from_own_account,
                         is_group,
                     };

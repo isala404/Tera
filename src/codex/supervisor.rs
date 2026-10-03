@@ -15,14 +15,24 @@ use crate::codex::thread_router::{ThreadDecision, ThreadRouter};
 use crate::codex::CodexProcessManager;
 use crate::config::Config;
 use crate::conversation::renderer::InputRenderer;
-use crate::history::db::HistoryDb;
+use crate::history::db::{ConversationEvent, HistoryDb};
 use crate::runtime::{MainThreadState, RuntimeDb};
+use crate::scheduler::db::SchedulerDb;
 use anyhow::Result;
 use chrono::Utc;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 use tracing::{error, info, warn};
+
+/// How much of the conversation a fresh thread is handed, and the most a warm
+/// one is shown of what it missed.
+const RECENT_HISTORY_MESSAGES: usize = 30;
+
+/// The newest history `seq` the main thread has been given, so the next turn
+/// can show it what arrived from elsewhere after that.
+const MAIN_SEEN_THROUGH_KEY: &str = "main_thread_seen_through_seq";
 
 #[derive(Clone)]
 pub struct CodexSupervisor {
@@ -98,15 +108,14 @@ impl CodexSupervisor {
         Ok(mgr.subscribe_login_completed())
     }
 
-    /// The live app-server, spawning and attaching the main thread if needed.
+    /// The live app-server, spawning it if needed.
     ///
     /// CODEX_HOME points at the workspace so Codex loads the workspace
-    /// `config.toml` plus Tera's process overrides (which register the MCP server) and the
-    /// bootstrap `AGENTS.md`; cwd roots the thread in the workspace so
-    /// `memories/`, `history/`, `projects/` and `tasks/` resolve.
+    /// `config.toml` plus Tera's process overrides (which register the MCP
+    /// server) and the bootstrap `AGENTS.md`.
     ///
     /// A manager whose process has exited is discarded and replaced rather than
-    /// handed out again, the conversation outlives the process.
+    /// handed out again. The main thread is attached by the next main turn.
     pub async fn ensure(&self) -> Result<Arc<CodexProcessManager>> {
         let mut lock = self.mgr.lock().await;
 
@@ -114,35 +123,11 @@ impl CodexSupervisor {
             if !mgr.is_dead() {
                 return Ok(mgr.clone());
             }
-            warn!("Codex app-server has exited; restarting it and reattaching the conversation");
+            warn!("Codex app-server has exited; restarting it");
             *lock = None;
         }
 
         let mgr = Arc::new(CodexProcessManager::spawn_for(&self.config).await?);
-
-        let persisted = self.runtime_db.get_main_thread()?;
-        let opts = ThreadOptions::new(&self.config.workspace_dir);
-        let info = mgr
-            .ensure_thread(persisted.as_ref().map(|s| s.thread_id.as_str()), &opts)
-            .await?;
-
-        let now_ms = Utc::now().timestamp_millis();
-        let existing = persisted.as_ref().filter(|p| p.thread_id == info.id);
-        let started_at_ms = existing.map(|p| p.started_at_ms).unwrap_or(now_ms);
-        let last_activity_at_ms = existing.map(|p| p.last_activity_at_ms).unwrap_or(now_ms);
-        let estimated_cache_warm_until_ms = existing
-            .map(|p| p.estimated_cache_warm_until_ms)
-            .unwrap_or(now_ms + crate::codex::CACHE_TTL_MS);
-
-        self.runtime_db.save_main_thread(&MainThreadState {
-            thread_id: info.id.clone(),
-            turn_id: None,
-            started_at_ms,
-            last_activity_at_ms,
-            estimated_cache_warm_until_ms,
-            model_id: info.model.clone(),
-        })?;
-
         *lock = Some(mgr.clone());
         Ok(mgr)
     }
@@ -191,71 +176,131 @@ impl CodexSupervisor {
 
     /// Run a turn on the main conversation thread.
     ///
-    /// Before starting, decide whether the existing thread is still the right
-    /// place: a thread whose prompt cache has gone cold, or one started under a
-    /// different model, is rotated out for a fresh one.
+    /// A thread that starts empty does not know who it is talking to. It is
+    /// pointed at the workspace files rather than handed a summary of them, then
+    /// given the recent conversation verbatim so the rotation does not read as
+    /// amnesia to the person on the other end. A thread that carries on is
+    /// shown what was said in the chat from outside it since its last turn,
+    /// which is how it learns what a scheduled task told the owner.
     pub async fn run_main_turn(&self, inputs: &[TurnInput]) -> Result<String> {
         let mgr = self.ensure().await?;
-        let started_fresh = self.rotate_main_thread_if_stale(&mgr).await?;
+        let started_fresh = self.attach_main_thread(&mgr).await?;
+        let seen_through = self.history_db.latest_seq()?;
 
-        // A thread that starts empty does not know who it is talking to. It is
-        // pointed at the workspace files rather than handed a summary of them
-        //, then given the last few messages verbatim so the
-        // rotation does not read as amnesia to the person on the other end.
-        if started_fresh {
-            let mut with_bootstrap = vec![TurnInput::Text(ThreadRouter::build_bootstrap_context(
+        let context = if started_fresh {
+            let mut context = vec![TurnInput::Text(ThreadRouter::build_bootstrap_context(
                 &self.config,
             ))];
-            let recent = self.history_db.recent_messages(10)?;
+            let recent = self.history_db.recent_messages(RECENT_HISTORY_MESSAGES)?;
             if !recent.is_empty() {
-                with_bootstrap.push(TurnInput::Text(InputRenderer::render_history(&recent)));
+                context.push(TurnInput::Text(InputRenderer::render_history(
+                    "Recent conversation from history",
+                    &recent,
+                    &self.outside_sources(&recent)?,
+                )));
             }
-            with_bootstrap.extend_from_slice(inputs);
-            return mgr.run_turn_inputs(&with_bootstrap).await;
-        }
+            context
+        } else {
+            self.unseen_messages()?
+                .map(TurnInput::Text)
+                .into_iter()
+                .collect()
+        };
 
-        mgr.run_turn_inputs(inputs).await
+        self.runtime_db
+            .set_state_value(MAIN_SEEN_THROUGH_KEY, &seen_through.to_string())?;
+        let with_context: Vec<TurnInput> =
+            context.into_iter().chain(inputs.iter().cloned()).collect();
+        mgr.run_turn_inputs(&with_context).await
     }
 
-    /// Apply the thread-selection policy to the main conversation.
-    ///
-    /// Returns whether the conversation is now on a thread with no prior context.
-    async fn rotate_main_thread_if_stale(&self, mgr: &Arc<CodexProcessManager>) -> Result<bool> {
-        let live_thread = mgr.active_thread().await;
-        let model_id = self
+    /// Messages sent into the chat from outside the main thread since its last
+    /// turn, rendered for it, or `None` when there are none.
+    fn unseen_messages(&self) -> Result<Option<String>> {
+        let Some(seen_through) = self
             .runtime_db
-            .get_main_thread()?
-            .map(|state| state.model_id)
-            .unwrap_or_default();
+            .get_state_value(MAIN_SEEN_THROUGH_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+        else {
+            return Ok(None);
+        };
+        let recent = self
+            .history_db
+            .assistant_messages_after(seen_through, RECENT_HISTORY_MESSAGES)?;
+        let sources = self.outside_sources(&recent)?;
+        let unseen: Vec<ConversationEvent> = recent
+            .into_iter()
+            .filter(|event| sources.contains_key(&event.id))
+            .collect();
+        if unseen.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(InputRenderer::render_history(
+            "Sent in this chat since your last turn, from outside this thread",
+            &unseen,
+            &sources,
+        )))
+    }
 
-        match ThreadRouter::decide(&self.runtime_db, &model_id)? {
+    /// Where each assistant message that did not come from the main thread was
+    /// sent from, keyed by event id. Messages the main thread sent itself, and
+    /// every user message, are absent.
+    fn outside_sources(&self, events: &[ConversationEvent]) -> Result<HashMap<String, String>> {
+        let mut sources = HashMap::new();
+        for event in events.iter().filter(|event| event.actor == "assistant") {
+            let source = match event.turn_id() {
+                Some(turn_id) if self.runtime_db.get_turn(turn_id)?.is_some() => continue,
+                Some(turn_id) => SchedulerDb::get_run(&self.runtime_db, turn_id)?
+                    .map(|run| SchedulerDb::get_schedule(&self.runtime_db, &run.schedule_id))
+                    .transpose()?
+                    .flatten()
+                    .map(|schedule| {
+                        format!("scheduled task \"{}\" ({})", schedule.name, schedule.id)
+                    }),
+                None => None,
+            };
+            sources.insert(
+                event.id.clone(),
+                source.unwrap_or_else(|| "outside this thread".to_string()),
+            );
+        }
+        Ok(sources)
+    }
+
+    /// Put the right thread under the main conversation. Returns whether it
+    /// has no prior context.
+    async fn attach_main_thread(&self, mgr: &Arc<CodexProcessManager>) -> Result<bool> {
+        let persisted = self.runtime_db.get_main_thread()?;
+        let now_ms = Utc::now().timestamp_millis();
+        let opts = ThreadOptions::new(&self.config.workspace_dir);
+
+        let info = match ThreadRouter::decide(persisted.as_ref(), now_ms) {
             ThreadDecision::Continue { thread_id } => {
-                if live_thread.as_deref() != Some(thread_id.as_str()) {
-                    // Persisted but not loaded in this process yet. If the resume
-                    // fails, `ensure_thread` starts a new one, which needs the
-                    // bootstrap, so report what actually happened.
-                    let opts = ThreadOptions::new(&self.config.workspace_dir);
-                    let info = mgr.ensure_thread(Some(&thread_id), &opts).await?;
-                    return Ok(info.origin == ThreadOrigin::Created);
+                if mgr.active_thread().await.as_deref() == Some(thread_id.as_str()) {
+                    return Ok(false);
                 }
-                Ok(false)
+                // Persisted but not loaded in this process yet. If the resume
+                // fails, `ensure_thread` starts a new one.
+                let info = mgr.ensure_thread(Some(&thread_id), &opts).await?;
+                if info.origin == ThreadOrigin::Resumed {
+                    return Ok(false);
+                }
+                info
             }
             ThreadDecision::Rotate { reason } => {
-                info!("Rotating the main conversation onto a fresh thread: {reason}");
-                let opts = ThreadOptions::new(&self.config.workspace_dir);
-                let info = mgr.start_thread(&opts).await?;
-                let now_ms = Utc::now().timestamp_millis();
-                self.runtime_db.save_main_thread(&MainThreadState {
-                    thread_id: info.id,
-                    turn_id: None,
-                    started_at_ms: now_ms,
-                    last_activity_at_ms: now_ms,
-                    estimated_cache_warm_until_ms: now_ms + crate::codex::CACHE_TTL_MS,
-                    model_id: info.model,
-                })?;
-                Ok(true)
+                info!("Starting a fresh main conversation thread: {reason}");
+                mgr.start_thread(&opts).await?
             }
-        }
+        };
+
+        self.runtime_db.save_main_thread(&MainThreadState {
+            thread_id: info.id,
+            started_at_ms: now_ms,
+            last_activity_at_ms: now_ms,
+            estimated_cache_warm_until_ms: now_ms + crate::codex::CACHE_TTL_MS,
+            model_id: info.model,
+        })?;
+        Ok(true)
     }
 
     /// Record activity so the cache-warm estimate slides forward.
@@ -270,85 +315,34 @@ impl CodexSupervisor {
         }
     }
 
-    /// A fresh thread rooted at `cwd`, not attached to the conversation.
-    ///
-    /// Returned as an id rather than run-and-forget so the caller can track
-    /// and manage the isolated thread lifecycle.
-    pub async fn start_isolated_thread(&self, cwd: &Path) -> Result<String> {
-        self.start_isolated_thread_with_worker(cwd, None).await
-    }
-
-    pub async fn start_isolated_thread_with_worker(
-        &self,
-        cwd: &Path,
-        worker_id: Option<&str>,
-    ) -> Result<String> {
-        let mgr = self.ensure().await?;
-        let opts = match worker_id {
-            Some(id) => ThreadOptions::with_worker(cwd, id),
-            None => ThreadOptions::new(cwd),
-        };
-        let info = mgr.create_thread(&opts).await?;
+    /// A fresh thread rooted at `cwd`, separate from the conversation. Tool
+    /// calls made on it are attributed to `worker_id`.
+    pub async fn start_task_thread(&self, cwd: &Path, worker_id: &str) -> Result<String> {
+        let info = self
+            .ensure()
+            .await?
+            .create_thread(&ThreadOptions::with_worker(cwd, worker_id))
+            .await?;
         info!(
-            "NEW isolated thread {} (model {}, worker {:?}) in {:?}. Separate from the conversation",
-            info.id, info.model, worker_id, cwd
+            "NEW isolated thread {} (model {}, worker {worker_id}) in {:?}",
+            info.id, info.model, cwd
         );
         Ok(info.id)
     }
 
-    pub async fn run_turn_on_thread(&self, thread_id: &str, prompt: &str) -> Result<String> {
-        self.ensure()
-            .await?
-            .run_turn_on(thread_id, &[TurnInput::Text(prompt.to_string())])
-            .await
-    }
-
-    /// Run a one-off turn on a fresh thread rooted at `cwd`.
+    /// Run the one turn a task thread exists for, then archive it.
     ///
-    /// Returns the agent's final text, which for a scheduled task is a summary
-    /// for the log, anything the user should see is sent by the agent itself
-    /// through the `send_message` tool.
-    pub async fn run_task_turn(&self, cwd: &Path, prompt: &str) -> Result<String> {
-        self.run_task_turn_with_worker(cwd, prompt, None).await
-    }
-
-    pub async fn run_task_turn_with_worker(
-        &self,
-        cwd: &Path,
-        prompt: &str,
-        worker_id: Option<&str>,
-    ) -> Result<String> {
-        let thread_id = self
-            .start_isolated_thread_with_worker(cwd, worker_id)
-            .await?;
-        let result = self.run_turn_on_thread(&thread_id, prompt).await;
-        if let Err(error) = self.archive_thread(&thread_id).await {
+    /// Returns the agent's final text, which for a task is a summary for the
+    /// log. Anything the user should see is sent by the agent itself through
+    /// the `send_message` tool.
+    pub async fn run_task_turn(&self, thread_id: &str, prompt: &str) -> Result<String> {
+        let mgr = self.ensure().await?;
+        let result = mgr
+            .run_turn_on(thread_id, &[TurnInput::Text(prompt.to_string())])
+            .await;
+        if let Err(error) = mgr.archive_thread(thread_id).await {
             warn!("Could not archive isolated thread {thread_id}: {error:?}");
         }
         result
-    }
-
-    /// Ask the app-server which models it offers.
-    pub async fn list_models(&self) -> Result<serde_json::Value> {
-        self.ensure().await?.list_models().await
-    }
-
-    /// Interrupt whatever is running on a thread.
-    pub async fn interrupt_thread(&self, thread_id: &str) -> Result<()> {
-        let lock = self.mgr.lock().await;
-        match lock.as_ref() {
-            Some(mgr) if !mgr.is_dead() => mgr.interrupt(thread_id).await,
-            _ => Ok(()),
-        }
-    }
-
-    /// Release a completed isolated thread without touching the main
-    /// conversation thread.
-    pub async fn archive_thread(&self, thread_id: &str) -> Result<()> {
-        let lock = self.mgr.lock().await;
-        match lock.as_ref() {
-            Some(mgr) if !mgr.is_dead() => mgr.archive_thread(thread_id).await,
-            _ => Ok(()),
-        }
     }
 }

@@ -18,11 +18,18 @@ use crate::update::UpdateNotice;
 use crate::version::BuildInfo;
 use anyhow::{bail, Result};
 use serde_json::json;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 const MAX_TURN_ATTEMPTS: i64 = 2;
 const MAX_CONSECUTIVE_CRASHES: u32 = 2;
+const WORKER_ID: &str = "phoenix";
+/// Codex expires a device code after fifteen minutes and should report it, but
+/// a lost notification must not hold startup forever.
+const PAIRING_TIMEOUT: Duration = Duration::from_secs(16 * 60);
 
 pub struct Phoenix {
     config: Config,
@@ -32,6 +39,7 @@ pub struct Phoenix {
     codex: CodexSupervisor,
     session: ConversationSession,
     secrets: SecretStore,
+    attempts_counted: OnceLock<()>,
 }
 
 impl Phoenix {
@@ -52,6 +60,7 @@ impl Phoenix {
             codex,
             session,
             secrets,
+            attempts_counted: OnceLock::new(),
         }
     }
 
@@ -62,7 +71,16 @@ impl Phoenix {
         crashed: Option<CrashMark>,
         update: Option<UpdateNotice>,
     ) -> Result<()> {
-        let pending = self.runtime_db.unfinished_turns()?;
+        let mut pending = self.runtime_db.unfinished_turns()?;
+        // Counted before the model runs and once per start: a recovery that
+        // takes the daemon down never gets back here to count itself, and the
+        // caller's in-process retries are for a transport still connecting.
+        if self.attempts_counted.set(()).is_ok() {
+            for turn in &pending {
+                self.runtime_db.record_turn_attempt(&turn.turn_id)?;
+            }
+            pending = self.runtime_db.unfinished_turns()?;
+        }
         let Some(chat_jid) = self.chat_to_speak_into(&pending)? else {
             info!("Startup assistant has no previous conversation yet");
             return Ok(());
@@ -80,7 +98,7 @@ impl Phoenix {
             .is_some_and(|mark| mark.consecutive >= MAX_CONSECUTIVE_CRASHES);
         let (recoverable, abandoned): (Vec<_>, Vec<_>) = pending
             .into_iter()
-            .partition(|turn| !over_budget && turn.attempts < MAX_TURN_ATTEMPTS);
+            .partition(|turn| !over_budget && turn.attempts <= MAX_TURN_ATTEMPTS);
 
         self.recover(
             &chat_jid,
@@ -92,9 +110,6 @@ impl Phoenix {
         )
         .await?;
 
-        for turn in recoverable.iter().chain(&abandoned) {
-            self.runtime_db.record_turn_attempt(&turn.turn_id)?;
-        }
         for turn in &recoverable {
             self.runtime_db
                 .finish_turn(&turn.turn_id, TurnState::Completed)?;
@@ -138,17 +153,18 @@ impl Phoenix {
         );
         self.transport.send_text(chat_jid, &msg, None).await?;
 
-        let outcome = completions.recv().await;
+        let outcome = tokio::time::timeout(PAIRING_TIMEOUT, completions.recv()).await;
         // Spent either way: a retry has to be able to ask for a fresh code.
         self.codex.clear_active_login().await;
 
         match outcome {
-            Ok(true) => {
+            Ok(Ok(true)) => {
                 info!("Paired with Codex; continuing the startup report");
                 Ok(())
             }
-            Ok(false) => bail!("device pairing was refused or expired"),
-            Err(e) => bail!("Codex stopped before pairing resolved: {e}"),
+            Ok(Ok(false)) => bail!("device pairing was refused or expired"),
+            Ok(Err(e)) => bail!("Codex stopped before pairing resolved: {e}"),
+            Err(_) => bail!("device pairing did not resolve in time"),
         }
     }
 
@@ -191,65 +207,79 @@ impl Phoenix {
             ],
         );
 
-        let worker_id = "phoenix";
-        let sends_before = self.session.count_for(Some(worker_id));
+        // Its own turn id rather than the recovered turn's, so the main thread
+        // sees these messages as sent from outside it and is shown them.
+        let turn_id = format!("phoenix_{}", Uuid::new_v4().simple());
+        let sends_before = self.session.sends(WORKER_ID);
         self.session.set_chat(chat_jid);
-        self.session.set_turn_for(
-            worker_id,
-            recoverable.first().map(|turn| turn.turn_id.as_str()),
-        );
+        self.session.set_turn(WORKER_ID, Some(&turn_id));
         let result = self
-            .codex
-            .run_task_turn_with_worker(&self.config.workspace_dir, &prompt, Some(worker_id))
+            .deliver(
+                chat_jid,
+                &turn_id,
+                &prompt,
+                sends_before,
+                recoverable,
+                abandoned,
+            )
             .await;
-        let summary = match result {
-            Ok(s) => s,
-            Err(e) => {
-                self.session.clear_worker(worker_id);
-                return Err(e);
-            }
-        };
+        self.session.set_turn(WORKER_ID, None);
+        result
+    }
+
+    async fn deliver(
+        &self,
+        chat_jid: &str,
+        turn_id: &str,
+        prompt: &str,
+        sends_before: u64,
+        recoverable: &[ConversationTurn],
+        abandoned: &[ConversationTurn],
+    ) -> Result<()> {
+        let thread_id = self
+            .codex
+            .start_task_thread(&self.config.workspace_dir, WORKER_ID)
+            .await?;
+        let summary = self.codex.run_task_turn(&thread_id, prompt).await?;
         let authored = self.secrets.redact(&summary);
         info!("Startup assistant finished: {authored}");
 
-        let sends_made = self.session.sends_since_for(Some(worker_id), sends_before);
-        if sends_made == 0 {
-            if authored.trim().is_empty() {
-                self.session.clear_worker(worker_id);
-                bail!("startup assistant produced no user-visible message for {chat_jid}");
-            }
-            let reply_to = recoverable.last().or_else(|| abandoned.last()).map(|turn| {
-                let stored_ref = self
-                    .history_db
-                    .lookup_provider_ref_by_provider_id(&turn.last_provider_msg_id, "whatsapp")
-                    .ok()
-                    .flatten();
-                MessageRef {
-                    provider_msg_id: turn.last_provider_msg_id.clone(),
-                    chat_jid: stored_ref
-                        .as_ref()
-                        .filter(|r| !r.chat_jid.is_empty())
-                        .map(|r| r.chat_jid.clone())
-                        .unwrap_or_else(|| chat_jid.to_string()),
-                    from_me: stored_ref.as_ref().map(|r| r.from_me).unwrap_or(false),
-                    text: self.quoted_text(&turn.last_provider_msg_id),
-                }
-            });
-            let outgoing = self.secrets.expand(&authored);
-            let provider_msg_id = self
-                .transport
-                .send_text(chat_jid, &outgoing, reply_to.as_ref())
-                .await?;
-            record_assistant_message(
-                &self.history_db,
-                chat_jid,
-                &provider_msg_id,
-                &authored,
-                recoverable.first().map(|turn| turn.turn_id.clone()),
-                None,
-            )?;
+        if self.session.sends(WORKER_ID) > sends_before {
+            return Ok(());
         }
-        self.session.clear_worker(worker_id);
+        if authored.trim().is_empty() {
+            bail!("startup assistant produced no user-visible message for {chat_jid}");
+        }
+        let reply_to = recoverable.last().or_else(|| abandoned.last()).map(|turn| {
+            let stored_ref = self
+                .history_db
+                .lookup_provider_ref_by_provider_id(&turn.last_provider_msg_id, "whatsapp")
+                .ok()
+                .flatten();
+            MessageRef {
+                provider_msg_id: turn.last_provider_msg_id.clone(),
+                chat_jid: stored_ref
+                    .as_ref()
+                    .filter(|r| !r.chat_jid.is_empty())
+                    .map(|r| r.chat_jid.clone())
+                    .unwrap_or_else(|| chat_jid.to_string()),
+                from_me: stored_ref.as_ref().map(|r| r.from_me).unwrap_or(false),
+                text: self.quoted_text(&turn.last_provider_msg_id),
+            }
+        });
+        let outgoing = self.secrets.expand(&authored);
+        let provider_msg_id = self
+            .transport
+            .send_text(chat_jid, &outgoing, reply_to.as_ref())
+            .await?;
+        record_assistant_message(
+            &self.history_db,
+            chat_jid,
+            &provider_msg_id,
+            &authored,
+            Some(turn_id.to_string()),
+            None,
+        )?;
         Ok(())
     }
 
@@ -263,7 +293,14 @@ impl Phoenix {
                     .filter(|event| event.actor == "user"),
             );
         }
-        Ok(InputRenderer::render_history(&events))
+        if events.is_empty() {
+            return Ok("None.".to_string());
+        }
+        Ok(InputRenderer::render_history(
+            "Messages from the owner",
+            &events,
+            &HashMap::new(),
+        ))
     }
 
     fn quoted_text(&self, provider_msg_id: &str) -> Option<String> {

@@ -21,12 +21,10 @@ impl JsonRpcRequest {
     }
 }
 
-/// `codex app-server` omits the `jsonrpc` member on responses and notifications
-/// (verified against codex-cli 0.147.0), so it must not be required to parse.
+/// No `jsonrpc` member: `codex app-server` omits it on responses and
+/// notifications (verified against codex-cli 0.147.0).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcResponse {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub jsonrpc: Option<String>,
     pub id: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
@@ -67,7 +65,6 @@ mod tests {
         let line = r#"{"id":1,"result":{"codexHome":"/home/ada/.codex"}}"#;
         let resp: JsonRpcResponse = serde_json::from_str(line).unwrap();
         assert_eq!(resp.id, 1);
-        assert!(resp.jsonrpc.is_none());
         assert_eq!(resp.result.unwrap()["codexHome"], "/home/ada/.codex");
     }
 
@@ -85,9 +82,8 @@ mod tests {
         assert!(parsed.result.is_none() && parsed.error.is_none());
     }
 
-    /// The reader tries a response first and falls back to raw JSON, so a
-    /// notification must not parse as a response. Otherwise every event would be
-    /// swallowed as a reply to a request nobody made.
+    /// A notification must not parse as a response, or it would be taken for
+    /// a reply to a request nobody made.
     #[test]
     fn test_notification_is_not_parsed_as_response() {
         let line = r#"{"method":"turn/completed","params":{"threadId":"t1"},"emittedAtMs":1}"#;

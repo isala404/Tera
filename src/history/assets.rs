@@ -1,6 +1,6 @@
 use crate::config::Config;
 use anyhow::{Context, Result};
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::DateTime;
 use std::fs;
 use std::path::PathBuf;
 
@@ -14,7 +14,8 @@ impl AssetStorage {
         filename: &str,
         data: &[u8],
     ) -> Result<(PathBuf, String)> {
-        let dt: DateTime<Utc> = Utc.timestamp_millis_opt(occurred_at_ms).unwrap();
+        let dt = DateTime::from_timestamp_millis(occurred_at_ms)
+            .with_context(|| format!("attachment timestamp {occurred_at_ms} is out of range"))?;
         let year_str = dt.format("%Y").to_string();
         let month_str = dt.format("%m").to_string();
 

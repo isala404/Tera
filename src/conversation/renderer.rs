@@ -1,5 +1,5 @@
 use crate::history::db::ConversationEvent;
-use chrono::{DateTime, Local, TimeZone};
+use chrono::{Local, TimeZone};
 use std::collections::HashMap;
 
 pub struct InputRenderer;
@@ -12,39 +12,10 @@ impl InputRenderer {
         events: &[ConversationEvent],
         reply_targets: &HashMap<String, ConversationEvent>,
     ) -> String {
-        Self::render_events(events, None, reply_targets)
-    }
-
-    /// Render history for a fresh or recovering thread. Each message carries its
-    /// full local timestamp and speaker so a relative request survives thread
-    /// rotation with the temporal context that produced it.
-    pub fn render_history(events: &[ConversationEvent]) -> String {
-        Self::render_events(
-            events,
-            Some("Recent conversation context from canonical history"),
-            &HashMap::new(),
-        )
-    }
-
-    fn render_events(
-        events: &[ConversationEvent],
-        heading: Option<&str>,
-        reply_targets: &HashMap<String, ConversationEvent>,
-    ) -> String {
-        let mut rendered = String::new();
-
         // The agent has no clock of its own. Without the date and UTC offset it
         // cannot convert "in five minutes" into a timestamp, and scheduling
         // silently lands in the past, which fires every task immediately.
-        rendered.push_str(&format!(
-            "[Current time: {}]\n\n",
-            Local::now().format("%Y-%m-%d %H:%M:%S %:z (%Z)")
-        ));
-
-        if let Some(heading) = heading {
-            rendered.push_str(heading);
-            rendered.push_str("\n\n");
-        }
+        let mut rendered = format!("[Current time: {}]\n\n", now_stamp());
 
         for event in events {
             if let Some(reply_to) = event.reply_to_id() {
@@ -53,7 +24,7 @@ impl InputRenderer {
                     event.id
                 ));
                 if let Some(target) = reply_targets.get(reply_to) {
-                    Self::render_event(&mut rendered, target);
+                    Self::render_event(&mut rendered, target, None);
                 } else {
                     rendered.push_str(&format!(
                         "The quoted message {reply_to} is not available in local history.\n"
@@ -62,15 +33,30 @@ impl InputRenderer {
                 rendered.push_str("[/Quoted message]\n\n");
             }
 
-            Self::render_event(&mut rendered, event);
+            Self::render_event(&mut rendered, event, None);
         }
 
         rendered.trim().to_string()
     }
 
-    fn render_event(rendered: &mut String, event: &ConversationEvent) {
-        let dt: DateTime<Local> = Local.timestamp_millis_opt(event.occurred_at_ms).unwrap();
-        let t_str = dt.format("%Y-%m-%d %H:%M:%S %:z").to_string();
+    /// Render past messages under a heading. Each carries its full local
+    /// timestamp and speaker so a relative request survives thread rotation.
+    /// `sources` names who sent an assistant message when it was not this
+    /// thread, so the agent does not mistake a scheduled task's words for its own.
+    pub fn render_history(
+        heading: &str,
+        events: &[ConversationEvent],
+        sources: &HashMap<String, String>,
+    ) -> String {
+        let mut rendered = format!("{heading}\n\n");
+        for event in events {
+            Self::render_event(&mut rendered, event, sources.get(&event.id));
+        }
+        rendered.trim().to_string()
+    }
+
+    fn render_event(rendered: &mut String, event: &ConversationEvent, source: Option<&String>) {
+        let t_str = stamp(event.occurred_at_ms);
         let speaker = match event.actor.as_str() {
             "assistant" => "Assistant",
             "user" => "User",
@@ -81,6 +67,9 @@ impl InputRenderer {
         // Without it in the transcript the agent can see that something was
         // replied to but has no way to name anything itself.
         rendered.push_str(&format!("[{}] {} {}", t_str, speaker, event.id));
+        if let Some(source) = source {
+            rendered.push_str(&format!(", from {source}"));
+        }
 
         if let Some(reply_to) = event.reply_to_id() {
             rendered.push_str(&format!(" (replying to {})", reply_to));
@@ -102,6 +91,19 @@ impl InputRenderer {
         }
 
         rendered.push('\n');
+    }
+}
+
+fn now_stamp() -> String {
+    Local::now()
+        .format("%Y-%m-%d %H:%M:%S %:z (%Z)")
+        .to_string()
+}
+
+fn stamp(ms: i64) -> String {
+    match Local.timestamp_millis_opt(ms).earliest() {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S %:z").to_string(),
+        None => format!("unknown time ({ms})"),
     }
 }
 
@@ -151,7 +153,17 @@ mod tests {
             ),
         ];
 
-        let rendered = InputRenderer::render_history(&events);
+        let sources = HashMap::from([(
+            "m_assistant".to_string(),
+            "scheduled task \"x\" (sched_1)".to_string(),
+        )]);
+        let rendered = InputRenderer::render_history("Recent", &events, &sources);
+        assert!(rendered.starts_with("Recent\n\n"), "{rendered}");
+        assert!(!rendered.contains("[Current time"), "{rendered}");
+        assert!(
+            rendered.contains("Assistant m_assistant, from scheduled task \"x\" (sched_1):"),
+            "{rendered}"
+        );
         let user_stamp = Local
             .timestamp_millis_opt(user_at)
             .single()

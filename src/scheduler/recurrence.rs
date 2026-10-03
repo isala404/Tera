@@ -19,41 +19,36 @@
 use anyhow::{anyhow, Result};
 use chrono::{Local, TimeZone};
 use cron::Schedule as CronSchedule;
+use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
-/// A validated `timing` argument from the `schedule` tool.
+/// When a schedule fires: once at an instant, or on a rule.
 ///
 /// Parsed and checked in one place so the failure modes are explicit: the
 /// original code stored whatever arrived, so a one-shot in the past was accepted
 /// and then fired on the very next tick, "every minute for five minutes"
 /// delivered five messages at once.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ScheduleTiming {
     Once { at_ms: i64 },
-    Recurring { rrule: String, first_run_ms: i64 },
+    Recurring { rrule: String },
 }
 
 impl ScheduleTiming {
+    /// Validate a `timing` tool argument. Anything accepted here has a next run
+    /// after `now_ms`.
     pub fn parse(timing: &serde_json::Value, now_ms: i64) -> Result<Self> {
-        let schedule_type = timing["type"].as_str().unwrap_or("once");
-        let rrule = timing["rrule"].as_str();
-
-        let one_shot_at_ms = match timing["at"].as_str() {
-            Some(at) => Some(
-                chrono::DateTime::parse_from_rfc3339(at)
+        match timing["type"].as_str().unwrap_or("once") {
+            "once" => {
+                let at = timing["at"].as_str().ok_or_else(|| {
+                    anyhow!("a one-shot schedule requires timing.at as an RFC3339 timestamp")
+                })?;
+                let at_ms = chrono::DateTime::parse_from_rfc3339(at)
                     .map_err(|e| {
                         anyhow!("timing.at must be RFC3339 with a UTC offset, got {at:?}: {e}")
                     })?
-                    .timestamp_millis(),
-            ),
-            None => None,
-        };
-
-        match schedule_type {
-            "once" => {
-                let at_ms = one_shot_at_ms.ok_or_else(|| {
-                    anyhow!("a one-shot schedule requires timing.at as an RFC3339 timestamp")
-                })?;
+                    .timestamp_millis();
                 if at_ms <= now_ms {
                     return Err(anyhow!(
                         "timing.at is in the past ({} <= now {}). Recompute from the current time and retry.",
@@ -64,18 +59,14 @@ impl ScheduleTiming {
                 Ok(Self::Once { at_ms })
             }
             "recurring" => {
-                let rule = rrule.ok_or_else(|| {
+                let rule = timing["rrule"].as_str().ok_or_else(|| {
                     anyhow!("a recurring schedule requires timing.rrule (a cron expression in local time, or EVERY_<n>M / EVERY_<n>H / EVERY_<n>D)")
                 })?;
-                Recurrence::parse(rule)?;
-                let first_run_ms =
-                    RecurrenceEngine::compute_next_run("recurring", None, Some(rule), now_ms)?
-                        .ok_or_else(|| {
-                            anyhow!("could not derive a first run time from the given timing")
-                        })?;
+                if Recurrence::parse(rule)?.next_after(now_ms).is_none() {
+                    return Err(anyhow!("timing.rrule {rule:?} never fires after now"));
+                }
                 Ok(Self::Recurring {
                     rrule: rule.to_string(),
-                    first_run_ms,
                 })
             }
             other => Err(anyhow!(
@@ -84,31 +75,26 @@ impl ScheduleTiming {
         }
     }
 
-    pub fn first_run_ms(&self) -> i64 {
+    /// The first time this fires strictly after `from_ms`, or `None` once it
+    /// never will again.
+    pub fn next_run(&self, from_ms: i64) -> Result<Option<i64>> {
         match self {
-            Self::Once { at_ms } => *at_ms,
-            Self::Recurring { first_run_ms, .. } => *first_run_ms,
+            Self::Once { at_ms } => Ok(Some(*at_ms).filter(|at| *at > from_ms)),
+            Self::Recurring { rrule } => Ok(Recurrence::parse(rrule)?.next_after(from_ms)),
         }
     }
 
-    pub fn schedule_type(&self) -> &'static str {
+    pub fn kind(&self) -> &'static str {
         match self {
             Self::Once { .. } => "once",
             Self::Recurring { .. } => "recurring",
         }
     }
 
-    pub fn one_shot_at_ms(&self) -> Option<i64> {
-        match self {
-            Self::Once { at_ms } => Some(*at_ms),
-            Self::Recurring { .. } => None,
-        }
-    }
-
     pub fn rrule(&self) -> Option<&str> {
         match self {
             Self::Once { .. } => None,
-            Self::Recurring { rrule, .. } => Some(rrule),
+            Self::Recurring { rrule } => Some(rrule),
         }
     }
 }
@@ -130,64 +116,82 @@ pub fn local_time(ms: i64) -> String {
 /// Translate the five-field crontab everyone actually writes into the dialect the
 /// `cron` crate speaks.
 ///
-/// Two incompatibilities, both silent:
+/// Three incompatibilities, all silent:
 ///
 /// * the crate wants seconds as the first field, so `"30 7 * * *"`, the form in
-///   every crontab, and the form a model will produce. Does not parse at all;
+///   every crontab and the form a model will produce, does not parse at all;
 /// * its day-of-week is 1=Sunday..7=Saturday, where crontab is 0=Sunday..6=Saturday
 ///   (with 7 also Sunday). So `"0 9 * * 1"` for "Monday morning" fired on **Sunday**,
-///   and `"0 9 * * 0"` for Sunday was rejected as invalid.
+///   and `"0 9 * * 0"` for Sunday was rejected as invalid;
+/// * with both day fields restricted, crontab fires when *either* matches and the
+///   crate only when *both* do. That one is refused rather than translated.
 ///
 /// Only five-field input is translated. Six fields is the crate's own form, so its
 /// author meant the crate's numbering and gets it untouched.
-fn normalize_cron(rule: &str) -> String {
+fn normalize_cron(rule: &str) -> Result<String> {
     let fields: Vec<&str> = rule.split_whitespace().collect();
     if fields.len() != 5 {
-        return rule.to_string();
+        return Ok(rule.to_string());
     }
-    format!(
+    let unrestricted = |field: &str| field == "*" || field == "?";
+    if !unrestricted(fields[2]) && !unrestricted(fields[4]) {
+        return Err(anyhow!(
+            "timing.rrule {rule:?} restricts both day-of-month and day-of-week, which crontab \
+             treats as either-or. Create one schedule for each instead."
+        ));
+    }
+    Ok(format!(
         "0 {} {} {} {} {}",
         fields[0],
         fields[1],
         fields[2],
         fields[3],
         shift_day_of_week(fields[4])
-    )
+    ))
 }
 
-/// Remap crontab day numbers to the crate's, leaving names, wildcards and step
-/// values alone.
+/// Remap crontab day numbers to the crate's, leaving names and wildcards alone.
 ///
-/// The digits after a `/` are a step (`*/2` is "every second day"), not a day, so
-/// they must survive unchanged, remapping them would quietly change the interval.
+/// Numeric ranges are expanded to a list: crontab's `5-7` (Friday to Sunday)
+/// wraps past the end of the crate's week, so it has no range form there.
 fn shift_day_of_week(field: &str) -> String {
-    let mut out = String::with_capacity(field.len() + 2);
-    let mut digits = String::new();
-    let mut after_slash = false;
-
-    for ch in field.chars() {
-        if ch.is_ascii_digit() {
-            digits.push(ch);
-            continue;
-        }
-        flush_day(&mut out, &mut digits, after_slash);
-        after_slash = ch == '/';
-        out.push(ch);
-    }
-    flush_day(&mut out, &mut digits, after_slash);
-    out
+    field
+        .split(',')
+        .map(shift_day_item)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
-fn flush_day(out: &mut String, digits: &mut String, is_step: bool) {
-    if digits.is_empty() {
-        return;
-    }
-    match (is_step, digits.parse::<u32>()) {
-        // 0 and 7 both mean Sunday in crontab, and the crate calls it 1.
-        (false, Ok(day)) if day <= 7 => out.push_str(&((day % 7) + 1).to_string()),
-        _ => out.push_str(digits),
-    }
-    digits.clear();
+fn shift_day_item(item: &str) -> String {
+    let (base, step) = match item.split_once('/') {
+        Some((base, step)) => (base, Some(step)),
+        None => (item, None),
+    };
+    let bounds = match base.split_once('-') {
+        Some((start, end)) => start.parse::<u32>().ok().zip(end.parse::<u32>().ok()),
+        // `n/step` runs from n to the end of the week.
+        None => base
+            .parse::<u32>()
+            .ok()
+            .map(|day| (day, if step.is_some() { 6 } else { day })),
+    };
+    let step = match step.map(str::parse::<usize>) {
+        None => 1,
+        Some(Ok(step)) if step > 0 => step,
+        Some(_) => return item.to_string(),
+    };
+    let Some((start, end)) = bounds.filter(|(start, end)| start <= end && *end <= 7) else {
+        return item.to_string();
+    };
+
+    // 0 and 7 both mean Sunday in crontab, and the crate calls it 1.
+    let mut days: Vec<u32> = (start..=end).step_by(step).map(|day| day % 7 + 1).collect();
+    days.sort_unstable();
+    days.dedup();
+    days.iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// A recurrence rule that parsed. Either form, resolved once.
@@ -204,7 +208,7 @@ impl Recurrence {
         if let Some(spec) = rule.strip_prefix("EVERY_") {
             return Self::parse_interval(rule, spec);
         }
-        CronSchedule::from_str(&normalize_cron(rule))
+        CronSchedule::from_str(&normalize_cron(rule)?)
             .map(|schedule| Recurrence::Cron(Box::new(schedule)))
             .map_err(|e| {
                 anyhow!(
@@ -258,31 +262,17 @@ impl Recurrence {
     }
 }
 
-pub struct RecurrenceEngine;
-
-impl RecurrenceEngine {
-    pub fn compute_next_run(
-        schedule_type: &str,
-        one_shot_at_ms: Option<i64>,
-        rrule: Option<&str>,
-        from_ms: i64,
-    ) -> Result<Option<i64>> {
-        match schedule_type {
-            "once" => Ok(one_shot_at_ms.filter(|ts| *ts > from_ms)),
-            "recurring" => match rrule {
-                Some(rule) => Ok(Recurrence::parse(rule)?.next_after(from_ms)),
-                None => Ok(None),
-            },
-            _ => Ok(None),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::{Datelike, Timelike, Weekday};
     use serde_json::json;
+
+    fn recurring(rrule: &str) -> ScheduleTiming {
+        ScheduleTiming::Recurring {
+            rrule: rrule.to_string(),
+        }
+    }
 
     #[test]
     fn test_recurrence_once() {
@@ -291,11 +281,13 @@ mod tests {
         let now = 1500000000000;
 
         assert_eq!(
-            RecurrenceEngine::compute_next_run("once", Some(future), None, now).unwrap(),
+            ScheduleTiming::Once { at_ms: future }
+                .next_run(now)
+                .unwrap(),
             Some(future)
         );
         assert_eq!(
-            RecurrenceEngine::compute_next_run("once", Some(past), None, now).unwrap(),
+            ScheduleTiming::Once { at_ms: past }.next_run(now).unwrap(),
             None
         );
     }
@@ -303,17 +295,14 @@ mod tests {
     #[test]
     fn test_recurrence_interval() {
         let now = 1000000;
-        let next =
-            RecurrenceEngine::compute_next_run("recurring", None, Some("EVERY_10M"), now).unwrap();
+        let next = recurring("EVERY_10M").next_run(now).unwrap();
         assert_eq!(next, Some(now + 600000));
     }
 
     #[test]
     fn test_day_intervals_are_supported() {
         let now = 1_700_000_000_000;
-        let next = RecurrenceEngine::compute_next_run("recurring", None, Some("EVERY_3D"), now)
-            .unwrap()
-            .unwrap();
+        let next = recurring("EVERY_3D").next_run(now).unwrap().unwrap();
         assert_eq!(next - now, 3 * 86_400_000);
     }
 
@@ -328,7 +317,8 @@ mod tests {
             .expect("unambiguous local instant")
             .timestamp_millis();
 
-        let next = RecurrenceEngine::compute_next_run("recurring", None, Some("30 7 * * *"), now)
+        let next = recurring("30 7 * * *")
+            .next_run(now)
             .unwrap()
             .expect("a daily rule always has a next run");
 
@@ -354,8 +344,8 @@ mod tests {
         let future_ms = now + 300_000;
         let timing = json!({"type": "once", "at": rfc3339(future_ms)});
         let parsed = ScheduleTiming::parse(&timing, now).unwrap();
-        assert_eq!(parsed.first_run_ms(), future_ms);
-        assert_eq!(parsed.one_shot_at_ms(), Some(future_ms));
+        assert_eq!(parsed, ScheduleTiming::Once { at_ms: future_ms });
+        assert_eq!(parsed.next_run(now).unwrap(), Some(future_ms));
     }
 
     /// Regression: a recurring schedule stored next_run_at_ms = None, and the
@@ -365,7 +355,7 @@ mod tests {
         let now = 1_700_000_000_000;
         let timing = json!({"type": "recurring", "rrule": "EVERY_1M"});
         let parsed = ScheduleTiming::parse(&timing, now).unwrap();
-        assert_eq!(parsed.first_run_ms(), now + 60_000);
+        assert_eq!(parsed.next_run(now).unwrap(), Some(now + 60_000));
     }
 
     #[test]
@@ -399,10 +389,7 @@ mod tests {
             "EVERY_-5M",
         ] {
             let timing = json!({"type": "recurring", "rrule": bad});
-            let err = ScheduleTiming::parse(&timing, now)
-                .map(|t| t.first_run_ms())
-                .unwrap_err()
-                .to_string();
+            let err = ScheduleTiming::parse(&timing, now).unwrap_err().to_string();
             assert!(
                 err.contains("EVERY_") || err.contains("cron"),
                 "{bad:?} gave an unhelpful error: {err}"
@@ -448,7 +435,8 @@ mod tests {
         ];
 
         for (rule, day) in expected {
-            let next = RecurrenceEngine::compute_next_run("recurring", None, Some(rule), now)
+            let next = recurring(rule)
+                .next_run(now)
                 .unwrap()
                 .unwrap_or_else(|| panic!("{rule:?} produced no next run"));
             let fired = Local.timestamp_millis_opt(next).single().unwrap();
@@ -461,7 +449,7 @@ mod tests {
     /// crate's numbering and must get it unchanged.
     #[test]
     fn test_six_field_cron_day_numbering_is_left_alone() {
-        assert_eq!(normalize_cron("0 0 9 * * 1"), "0 0 9 * * 1");
+        assert_eq!(normalize_cron("0 0 9 * * 1").unwrap(), "0 0 9 * * 1");
     }
 
     /// The digits after a slash are a step, not a day. Remapping them would change
@@ -471,10 +459,37 @@ mod tests {
         assert_eq!(shift_day_of_week("*/2"), "*/2");
         assert_eq!(shift_day_of_week("*"), "*");
         assert_eq!(shift_day_of_week("MON-FRI"), "MON-FRI");
-        // 1-5 (Mon-Fri in crontab) becomes 2-6 in the crate's numbering.
-        assert_eq!(shift_day_of_week("1-5"), "2-6");
+        // 1-5 (Mon-Fri in crontab) is 2..6 in the crate's numbering.
+        assert_eq!(shift_day_of_week("1-5"), "2,3,4,5,6");
         assert_eq!(shift_day_of_week("1,3,5"), "2,4,6");
-        // Range with a step: endpoints shift, the step does not.
-        assert_eq!(shift_day_of_week("1-5/2"), "2-6/2");
+        assert_eq!(shift_day_of_week("1-5/2"), "2,4,6");
+    }
+
+    /// A range ending in 7 wraps past the end of the crate's week: `5-7` is
+    /// Friday to Sunday, and `0-7` every day.
+    #[test]
+    fn test_day_ranges_ending_on_sunday_keep_every_day() {
+        assert_eq!(shift_day_of_week("5-7"), "1,6,7");
+        assert_eq!(shift_day_of_week("6-7"), "1,7");
+        assert_eq!(shift_day_of_week("0-7"), "1,2,3,4,5,6,7");
+
+        let now = Local
+            .with_ymd_and_hms(2026, 8, 18, 3, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let next = recurring("0 9 * * 5-7").next_run(now).unwrap().unwrap();
+        let fired = Local.timestamp_millis_opt(next).single().unwrap();
+        assert_eq!(fired.weekday(), Weekday::Fri, "fired on {fired}");
+    }
+
+    /// Crontab fires when either day field matches; the crate would need both.
+    #[test]
+    fn test_both_day_fields_restricted_is_refused() {
+        let timing = json!({"type": "recurring", "rrule": "0 9 1 * 1"});
+        let err = ScheduleTiming::parse(&timing, 1_700_000_000_000)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("either-or"), "{err}");
     }
 }

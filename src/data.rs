@@ -39,23 +39,23 @@ pub const MEMORY_INDEX_SEED: &str = include_str!("../data/workspace/memory/INDEX
 pub const MEMORY_HORIZON_SEED: &str = include_str!("../data/workspace/memory/HORIZON.md");
 pub const MEMORY_USER_SEED: &str = include_str!("../data/workspace/memory/USER.md");
 
-/// A built-in skill package. Skill files are embedded so a released tera can
-/// initialize a workspace without depending on the source tree being present.
-pub struct BuiltinSkill {
+/// A skill package. Skill files are embedded so a released tera can initialize a
+/// workspace without depending on the source tree being present.
+pub struct Skill {
     pub name: &'static str,
-    pub files: &'static [BuiltinSkillFile],
+    pub files: &'static [SkillFile],
 }
 
-pub struct BuiltinSkillFile {
+pub struct SkillFile {
     pub relative_path: &'static str,
     pub contents: &'static [u8],
     pub executable: bool,
 }
 
-// The build script discovers every direct child of data/skills and generates
-// this manifest. Adding a built-in skill is therefore a data change, not a Rust
-// change.
-include!(concat!(env!("OUT_DIR"), "/builtin_skills.rs"));
+// The build script generates BUILTIN_SKILLS from data/skills, which every
+// workspace gets, and CONTRIB_SKILLS from data/contrib, which the owner installs
+// by asking. Adding either is a data change, not a Rust change.
+include!(concat!(env!("OUT_DIR"), "/skills.rs"));
 
 // Prompts sent to a model.
 pub const SCHEDULED_TASK_PROMPT: &str = include_str!("../data/prompts/scheduled-task.md");
@@ -158,20 +158,13 @@ mod tests {
     /// Every placeholder some call site actually fills in.
     const SUPPLIED: &[&str] = &[
         "WORKSPACE",
-        "STAGING",
-        "MEMORIES",
-        "HISTORY",
-        "JSONL",
-        "SQLITE",
-        "ASSETS",
-        "SCHEMA",
-        "EVENTS",
         "TASK_NAME",
         "SCHEDULE_ID",
         "NOW",
         "TASK_DIR",
         "LATE",
         "TASK_PROMPT",
+        "RECENT_CONVERSATION",
         "OWNER",
         "STARTUP_FACTS",
         "PENDING_REQUEST",

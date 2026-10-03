@@ -37,4 +37,4 @@ jobs:
       - name: Rust tests
         run: cargo test --all-targets --locked
       - name: Python tests
-        run: python3 -m unittest tests/audio_skill_test.py tests/model_config_skill_test.py tests/spotify_skill_test.py
+        run: python3 -m unittest tests/audio_skill_test.py tests/health_skill_test.py tests/model_config_skill_test.py tests/spotify_skill_test.py

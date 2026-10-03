@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tera::codex::CodexSupervisor;
 use tera::config::Config;
+use tera::conversation::session::FOREGROUND;
 use tera::conversation::{ConversationSession, TurnEngine};
 use tera::history::db::{ConversationEvent, HistoryDb};
 use tera::history::projection::ProjectionEngine;
@@ -924,6 +925,57 @@ async fn test_concurrent_and_restart_inbound_replay() {
     assert_eq!(proj_lines.len(), 1);
 }
 
+/// Messages arrive on concurrent tasks. Two that both found no burst each
+/// opened one, the second replacing the first, and its message was never
+/// answered. However they interleave, they must land in a single turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_messages_share_one_turn() {
+    let temp_dir = TempDir::new().unwrap();
+    let config = Config::new(temp_dir.path().to_path_buf(), true);
+    WorkspaceInit::init(&config).unwrap();
+
+    let history_db = HistoryDb::open_for(&config).unwrap();
+    let runtime_db = RuntimeDb::open(&config.runtime_db_path()).unwrap();
+    let engine = Arc::new(TurnEngine::new(
+        config.clone(),
+        history_db.clone(),
+        runtime_db.clone(),
+        Arc::new(tera::transport::MockTransport::new()),
+        ConversationSession::new(),
+        CodexSupervisor::new(config, runtime_db, history_db.clone()),
+    ));
+
+    let mut tasks = Vec::new();
+    for i in 0..5 {
+        let engine = engine.clone();
+        tasks.push(tokio::spawn(async move {
+            engine
+                .handle_inbound_message(InboundMessage {
+                    provider_msg_id: format!("concurrent_distinct_{i}"),
+                    sender: "owner@s.whatsapp.net".to_string(),
+                    text: Some(format!("part {i}")),
+                    timestamp_ms: Utc::now().timestamp_millis(),
+                    reply_to_provider_msg_id: None,
+                    media_attachment: None,
+                    media_error: None,
+                    chat_jid: "owner@s.whatsapp.net".to_string(),
+                    from_own_account: true,
+                    is_group: false,
+                })
+                .await
+                .unwrap();
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+
+    let events = history_db.list_events_all().unwrap();
+    assert_eq!(events.len(), 5);
+    let turns: std::collections::HashSet<_> = events.iter().map(|e| e.turn_id()).collect();
+    assert_eq!(turns.len(), 1, "messages split across turns: {turns:?}");
+}
+
 #[tokio::test]
 async fn test_mcp_readiness_failure_preserves_rollback_state() {
     let temp_dir = TempDir::new().unwrap();
@@ -1048,7 +1100,7 @@ async fn test_all_five_outgoing_media_kinds_recovery() {
         });
 
         let res = server
-            .execute_tool("send_message", &tool_args, None)
+            .execute_tool("send_message", &tool_args, FOREGROUND)
             .await
             .unwrap();
         assert_eq!(res["status"], "sent");
@@ -1115,76 +1167,67 @@ async fn test_worker_isolation_and_send_accounting() {
         session.clone(),
     ));
 
-    session.set_turn(Some("foreground_turn_1"));
-    let fg_before = session.count_for(None);
+    session.set_turn(FOREGROUND, Some("foreground_turn_1"));
+    let fg_before = session.sends(FOREGROUND);
 
     let sched_worker = "schedule:daily_brief";
-    session.set_turn_for(sched_worker, Some("run_sched_1"));
-    let sched_before = session.count_for(Some(sched_worker));
+    session.set_turn(sched_worker, Some("run_sched_1"));
 
     // Scheduled task worker sends a message via MCP execute_tool
     let sched_args = serde_json::json!({"text": "Scheduled task notification"});
     let sched_res = server
-        .execute_tool("send_message", &sched_args, Some(sched_worker))
+        .execute_tool("send_message", &sched_args, sched_worker)
         .await
         .unwrap();
     assert_eq!(sched_res["status"], "sent");
     let sched_msg_id = sched_res["message_id"].as_str().unwrap();
 
-    // Verify worker send counter incremented, but foreground counter was untouched
-    assert_eq!(session.sends_since_for(Some(sched_worker), sched_before), 1);
-    assert_eq!(session.sends_since(fg_before), 0);
+    // Worker send counter incremented, foreground counter untouched
+    assert_eq!(session.sends(sched_worker), 1);
+    assert_eq!(session.sends(FOREGROUND), fg_before);
 
-    // Verify history event SQLite turn_id attribution matches the worker turn
+    // History attributes the message to the worker's run
     let sched_event = history_db.get_event(sched_msg_id).unwrap().unwrap();
     assert_eq!(sched_event.turn_id(), Some("run_sched_1"));
 
-    // Foreground work sends a message via MCP execute_tool (worker_id: None)
     let fg_args = serde_json::json!({"text": "Foreground conversation reply"});
     let fg_res = server
-        .execute_tool("send_message", &fg_args, None)
+        .execute_tool("send_message", &fg_args, FOREGROUND)
         .await
         .unwrap();
     assert_eq!(fg_res["status"], "sent");
     let fg_msg_id = fg_res["message_id"].as_str().unwrap();
+    assert_eq!(session.sends(FOREGROUND), fg_before + 1);
 
-    // Foreground counter must now be 1
-    assert_eq!(session.sends_since(fg_before), 1);
-
-    // Verify history event SQLite turn_id attribution matches foreground turn
     let fg_event = history_db.get_event(fg_msg_id).unwrap().unwrap();
     assert_eq!(fg_event.turn_id(), Some("foreground_turn_1"));
 
     // Phoenix recovery uses isolated worker "phoenix"
-    let ph_before = session.count_for(Some("phoenix"));
-    session.set_turn_for("phoenix", Some("ph_turn_1"));
+    session.set_turn("phoenix", Some("ph_turn_1"));
+    assert_eq!(session.turn("phoenix").as_deref(), Some("ph_turn_1"));
     assert_eq!(
-        session.turn_for(Some("phoenix")),
-        Some("ph_turn_1".to_string())
-    );
-    assert_eq!(
-        session.turn_for(None),
-        Some("foreground_turn_1".to_string())
+        session.turn(FOREGROUND).as_deref(),
+        Some("foreground_turn_1")
     );
 
     let ph_args = serde_json::json!({"text": "Phoenix crash recovery notice"});
     let ph_res = server
-        .execute_tool("send_message", &ph_args, Some("phoenix"))
+        .execute_tool("send_message", &ph_args, "phoenix")
         .await
         .unwrap();
     let ph_msg_id = ph_res["message_id"].as_str().unwrap();
-    assert_eq!(session.sends_since_for(Some("phoenix"), ph_before), 1);
-    assert_eq!(session.sends_since(fg_before), 1);
+    assert_eq!(session.sends("phoenix"), 1);
+    assert_eq!(session.sends(FOREGROUND), fg_before + 1);
 
     let ph_event = history_db.get_event(ph_msg_id).unwrap().unwrap();
     assert_eq!(ph_event.turn_id(), Some("ph_turn_1"));
 
-    // Clearing the worker does not touch foreground state
-    session.clear_worker(sched_worker);
-    assert_eq!(session.turn_for(Some(sched_worker)), None);
+    // Clearing a worker does not touch foreground state
+    session.set_turn(sched_worker, None);
+    assert_eq!(session.turn(sched_worker), None);
     assert_eq!(
-        session.turn_for(None),
-        Some("foreground_turn_1".to_string())
+        session.turn(FOREGROUND).as_deref(),
+        Some("foreground_turn_1")
     );
 }
 
@@ -1238,11 +1281,17 @@ for line in sys.stdin:
     let history_db = HistoryDb::open_for(&config).unwrap();
     let session = ConversationSession::new();
     let codex = CodexSupervisor::new(config.clone(), runtime_db.clone(), history_db.clone());
-    let runner = SchedulerRunner::new(config.clone(), runtime_db.clone(), codex, session);
+    let runner = SchedulerRunner::new(
+        config.clone(),
+        runtime_db.clone(),
+        history_db.clone(),
+        codex,
+        session,
+    );
 
-    // Scenario 1: Exercise run_schedule() failing to persist completion via injected SQLite write failure.
-    // The run completes on disk, writes sentinel, but finish_run fails and leaves run in 'running'.
-    // Then recover_stale_runs() reconciles it to Completed and deletes sentinel.
+    // Scenario 1: the run completes and is logged, but recording completion in
+    // the database fails and leaves it 'running'. Recovery reconciles it from
+    // the task's run log.
     let at_ms1 = Utc::now().timestamp_millis() - 5000;
     let timing1 = ScheduleTiming::Once { at_ms: at_ms1 };
     let item1 = SchedulerDb::create_schedule(
@@ -1281,13 +1330,9 @@ for line in sys.stdin:
     assert_eq!(running.len(), 1);
     let run1_id = running[0].id.clone();
 
-    // Verify sentinel was written to disk by run_schedule
     let task_dir1 = config.workspace_dir.join(&item1.task_path);
-    let sentinel1 = task_dir1.join(format!(".completed_{}", run1_id));
-    assert!(
-        sentinel1.exists(),
-        "run_schedule must have left the completion sentinel on disk"
-    );
+    let run_log = fs::read_to_string(task_dir1.join("RUNS.jsonl")).unwrap();
+    assert!(run_log.contains(&run1_id) && run_log.contains("\"completed\""));
 
     // Drop the injected trigger so recovery can persist completion
     {
@@ -1298,12 +1343,6 @@ for line in sys.stdin:
 
     // Recover stale runs
     runner.recover_stale_runs().unwrap();
-
-    // Sentinel must be removed
-    assert!(
-        !sentinel1.exists(),
-        "sentinel file must be deleted upon reconciliation"
-    );
 
     // Run must be reconciled to Completed in the database
     let run1 = SchedulerDb::get_run(&runtime_db, &run1_id)
@@ -1318,7 +1357,7 @@ for line in sys.stdin:
     assert_eq!(item1_after.status, ScheduleStatus::Completed);
     assert_eq!(item1_after.next_run_at_ms, None);
 
-    // Scenario 2: Interrupted run without sentinel (process was killed mid-turn).
+    // Scenario 2: Interrupted run with nothing logged (process was killed mid-turn).
     // Run must be marked Failed, PHOENIX_RECOVERY.md written, and one-shot schedule re-queued as Active.
     let at_ms2 = Utc::now().timestamp_millis() - 5000;
     let timing2 = ScheduleTiming::Once { at_ms: at_ms2 };
@@ -1335,9 +1374,8 @@ for line in sys.stdin:
 
     let run2_id = SchedulerDb::start_run(&runtime_db, &item2.id, at_ms2).unwrap();
     // Simulate runner clearing next_run_at_ms when claiming task
-    SchedulerDb::update_next_run(&runtime_db, &item2.id, None, None).unwrap();
+    SchedulerDb::set_next_run(&runtime_db, &item2.id, None).unwrap();
 
-    // No sentinel exists. Run stale recovery.
     runner.recover_stale_runs().unwrap();
 
     // Run must be marked Failed
@@ -1367,8 +1405,51 @@ for line in sys.stdin:
         .unwrap()
         .unwrap();
     assert_eq!(item2_after.status, ScheduleStatus::Active);
-    assert!(
-        item2_after.next_run_at_ms.is_some(),
-        "interrupted one-shot schedule must be re-queued with next_run_at_ms"
+    assert_eq!(
+        item2_after.next_run_at_ms,
+        Some(at_ms2),
+        "interrupted schedule must be re-queued on its original slot"
     );
+}
+
+/// A run whose Codex thread never starts is still a finished run: failed in
+/// the database, and a one-shot is retired rather than left active forever.
+#[tokio::test]
+async fn test_a_schedule_whose_thread_cannot_start_fails_cleanly() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut config = Config::new(temp_dir.path().to_path_buf(), true);
+    config.codex_bin = temp_dir.path().join("no-such-codex");
+    WorkspaceInit::init(&config).unwrap();
+
+    let runtime_db = RuntimeDb::open(&config.runtime_db_path()).unwrap();
+    let history_db = HistoryDb::open_for(&config).unwrap();
+    let codex = CodexSupervisor::new(config.clone(), runtime_db.clone(), history_db.clone());
+    let runner = SchedulerRunner::new(
+        config.clone(),
+        runtime_db.clone(),
+        history_db,
+        codex,
+        ConversationSession::new(),
+    );
+
+    let item = SchedulerDb::create_schedule(
+        &runtime_db,
+        "Never starts",
+        "anything",
+        &ScheduleTiming::Once {
+            at_ms: Utc::now().timestamp_millis() - 5_000,
+        },
+        "tasks/never-starts",
+    )
+    .unwrap();
+
+    runner.run_schedule(&item).await.unwrap();
+
+    assert!(SchedulerDb::running_runs(&runtime_db).unwrap().is_empty());
+    let run = &SchedulerDb::recent_runs(&runtime_db, 1).unwrap()[0];
+    assert_eq!(run.state, RunState::Failed);
+    let after = SchedulerDb::get_schedule(&runtime_db, &item.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.status, ScheduleStatus::Completed);
 }

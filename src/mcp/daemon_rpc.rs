@@ -1,4 +1,6 @@
+use crate::codex::log::truncate;
 use crate::config::Config;
+use crate::conversation::session::FOREGROUND;
 use crate::conversation::ConversationSession;
 use crate::history::assets::AssetStorage;
 use crate::history::db::{Attachment, ConversationEvent, HistoryDb, ProviderRef};
@@ -19,14 +21,6 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 /// One-line JSON summary for logs; tool arguments can carry whole documents.
-fn brief(s: &str) -> String {
-    if s.chars().count() <= 300 {
-        return s.to_string();
-    }
-    let head: String = s.chars().take(300).collect();
-    format!("{head}… (+{} more chars)", s.chars().count() - 300)
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonRpcRequest {
     pub id: u64,
@@ -141,7 +135,7 @@ impl DaemonRpcServer {
             // Both sides of every tool call are logged: this is the boundary
             // where the agent acts on the outside world.
             let redacted_args = self.secrets.redact(&req.arguments.to_string());
-            let logged_args = brief(&redacted_args);
+            let logged_args = truncate(&redacted_args, 300);
             info!(
                 target: "mcp::tool",
                 "-> {}({})",
@@ -150,10 +144,7 @@ impl DaemonRpcServer {
             );
             let started = std::time::Instant::now();
 
-            let worker_id = req
-                .worker_id
-                .as_deref()
-                .or_else(|| req.arguments["worker_id"].as_str());
+            let worker_id = req.worker_id.as_deref().unwrap_or(FOREGROUND);
 
             let response = match self
                 .execute_tool(&req.tool_name, &req.arguments, worker_id)
@@ -166,7 +157,7 @@ impl DaemonRpcServer {
                         "<- {} ok in {}ms: {}",
                         req.tool_name,
                         started.elapsed().as_millis(),
-                        brief(&redacted_val)
+                        truncate(&redacted_val, 300)
                     );
                     DaemonRpcResponse {
                         id: req.id,
@@ -181,7 +172,7 @@ impl DaemonRpcServer {
                         "<- {} FAILED in {}ms: {}",
                         req.tool_name,
                         started.elapsed().as_millis(),
-                        brief(&redacted_err)
+                        truncate(&redacted_err, 300)
                     );
                     DaemonRpcResponse {
                         id: req.id,
@@ -243,12 +234,7 @@ impl DaemonRpcServer {
         }))
     }
 
-    pub async fn execute_tool(
-        &self,
-        name: &str,
-        args: &Value,
-        worker_id: Option<&str>,
-    ) -> Result<Value> {
+    pub async fn execute_tool(&self, name: &str, args: &Value, worker_id: &str) -> Result<Value> {
         match name {
             "send_message" => {
                 let recipient = self.recipient()?;
@@ -338,7 +324,7 @@ impl DaemonRpcServer {
                     "assistant",
                     authored,
                     reply_to.map(str::to_string),
-                    self.session.turn_for(worker_id),
+                    self.session.turn(worker_id),
                     attachments,
                 );
 
@@ -353,7 +339,7 @@ impl DaemonRpcServer {
 
                 // Tell the turn engine the agent already spoke, so it does not
                 // deliver the final agent text on top of this.
-                self.session.record_send_for(worker_id);
+                self.session.record_send(worker_id);
 
                 Ok(json!({
                     "status": "sent",
@@ -385,6 +371,9 @@ impl DaemonRpcServer {
                     emoji,
                 );
                 self.history_db.insert_event(event)?;
+                // A reaction is an answer too; without this the turn engine
+                // follows it with the final text, a second acknowledgement.
+                self.session.record_send(worker_id);
 
                 Ok(json!({ "status": "reacted", "target": msg_id, "emoji": emoji }))
             }
@@ -412,7 +401,7 @@ impl DaemonRpcServer {
                     "schedule_id": item.id,
                     "name": item.name,
                     "task_path": item.task_path,
-                    "first_run": recurrence::local_time(timing.first_run_ms()),
+                    "first_run": item.next_run_at_ms.map(recurrence::local_time),
                 }))
             }
 
@@ -428,8 +417,8 @@ impl DaemonRpcServer {
                         json!({
                             "schedule_id": item.id,
                             "name": item.name,
-                            "type": item.schedule_type(),
-                            "rrule": item.rrule(),
+                            "type": item.timing.kind(),
+                            "rrule": item.timing.rrule(),
                             "task_path": item.task_path,
                             "next_run": item.next_run_at_ms.map(recurrence::local_time),
                         })
@@ -461,7 +450,7 @@ impl DaemonRpcServer {
                      delete your message from this chat."
                 );
                 self.transport.send_text(&recipient, &ask, None).await?;
-                self.session.record_send();
+                self.session.record_send(worker_id);
 
                 Ok(json!({
                     "status": "requested",
@@ -617,7 +606,7 @@ mod tests {
             .execute_tool(
                 "send_message",
                 &json!({"text": "Log in: https://accounts.spotify.com/authorize?client_id=${SPOTIFY_CLIENT_ID}&state=x"}),
-                None,
+                FOREGROUND,
             )
             .await
             .unwrap();
@@ -655,7 +644,7 @@ mod tests {
             .execute_tool(
                 "send_message",
                 &json!({"text": "your id is abc123def456"}),
-                None,
+                FOREGROUND,
             )
             .await
             .unwrap();
@@ -695,7 +684,7 @@ mod tests {
             .execute_tool(
                 "send_message",
                 &json!({"text": "that one", "reply_to": incoming.id}),
-                None,
+                FOREGROUND,
             )
             .await
             .unwrap();
@@ -722,7 +711,7 @@ mod tests {
             .execute_tool(
                 "send_message",
                 &json!({"text": "hi", "reply_to": "m_nope"}),
-                None,
+                FOREGROUND,
             )
             .await
             .unwrap_err();
@@ -749,7 +738,7 @@ mod tests {
                     "image_path": image_file.to_str().unwrap(),
                     "text": "here is the picture"
                 }),
-                None,
+                FOREGROUND,
             )
             .await
             .unwrap();

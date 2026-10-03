@@ -1,11 +1,13 @@
 use crate::codex::CodexSupervisor;
 use crate::config::Config;
+use crate::conversation::renderer::InputRenderer;
+use crate::conversation::ConversationSession;
+use crate::history::db::HistoryDb;
 use crate::runtime::RuntimeDb;
 use crate::scheduler::db::{RunState, ScheduleItem, ScheduleRun, ScheduleStatus, SchedulerDb};
-use crate::scheduler::recurrence::RecurrenceEngine;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{Local, Utc};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -16,8 +18,6 @@ use tracing::{debug, error, info, warn};
 /// minute-level schedules without spinning.
 const TICK_INTERVAL: Duration = Duration::from_secs(5);
 
-use crate::conversation::ConversationSession;
-
 /// Past this much drift from its slot, a run is reported to its worker as late.
 /// Comfortably above the tick interval so ordinary scheduling jitter is not
 /// announced as an outage.
@@ -26,6 +26,10 @@ const LATE_THRESHOLD_MS: i64 = 60_000;
 /// Upper bound on counting missed occurrences. A minutely rule after a week
 /// offline has thousands, and the exact number stops mattering long before that.
 const MAX_COUNTED_MISSES: usize = 100;
+
+/// How much of the chat a scheduled worker sees. Enough to notice that the
+/// owner already said or did what the task is about to ask them.
+const RECENT_CONVERSATION_MESSAGES: usize = 20;
 
 /// How far behind its schedule a run is.
 struct Lateness {
@@ -36,6 +40,7 @@ struct Lateness {
 pub struct SchedulerRunner {
     config: Config,
     runtime_db: RuntimeDb,
+    history_db: HistoryDb,
     codex: CodexSupervisor,
     session: ConversationSession,
     /// Schedules with a run in flight. A slow task must not be started again on
@@ -47,12 +52,14 @@ impl SchedulerRunner {
     pub fn new(
         config: Config,
         runtime_db: RuntimeDb,
+        history_db: HistoryDb,
         codex: CodexSupervisor,
         session: ConversationSession,
     ) -> Self {
         Self {
             config,
             runtime_db,
+            history_db,
             codex,
             session,
             running: Arc::new(Mutex::new(HashSet::new())),
@@ -98,16 +105,15 @@ impl SchedulerRunner {
     /// A run that cannot be recovered is logged and stepped over. One unwritable
     /// task directory must not strand every other stale run behind it.
     pub fn recover_stale_runs(&self) -> Result<()> {
-        let now_ms = Utc::now().timestamp_millis();
         for run in SchedulerDb::running_runs(&self.runtime_db)? {
-            if let Err(e) = self.recover_stale_run(&run, now_ms) {
+            if let Err(e) = self.recover_stale_run(&run) {
                 error!("Could not recover stale run {}: {:?}", run.id, e);
             }
         }
         Ok(())
     }
 
-    fn recover_stale_run(&self, run: &ScheduleRun, now_ms: i64) -> Result<()> {
+    fn recover_stale_run(&self, run: &ScheduleRun) -> Result<()> {
         let Some(item) = SchedulerDb::get_schedule(&self.runtime_db, &run.schedule_id)? else {
             return SchedulerDb::finish_run(
                 &self.runtime_db,
@@ -120,25 +126,17 @@ impl SchedulerRunner {
         let task_dir = self.config.workspace_dir.join(&item.task_path);
         fs::create_dir_all(&task_dir)?;
 
-        let completion_sentinel = task_dir.join(format!(".completed_{}", run.id));
-        let already_completed =
-            completion_sentinel.exists() || self.run_log_contains(&task_dir, &run.id, "completed");
-
-        if already_completed {
+        // The run log is written before the database, so a crash between the
+        // two leaves the log as the only record that the work finished.
+        if self.run_log_contains(&task_dir, &run.id, "completed") {
             info!(
                 "Run {} on schedule '{}' was completed prior to crash; reconciling database",
                 run.id, item.name
             );
             SchedulerDb::finish_run(&self.runtime_db, &run.id, RunState::Completed, None)?;
-            if item.schedule_type() == "once" {
-                SchedulerDb::update_next_run(
-                    &self.runtime_db,
-                    &item.id,
-                    None,
-                    Some(ScheduleStatus::Completed),
-                )?;
+            if item.next_run_at_ms.is_none() {
+                SchedulerDb::complete_schedule(&self.runtime_db, &item.id)?;
             }
-            let _ = fs::remove_file(completion_sentinel);
             let _ = fs::remove_file(task_dir.join("PHOENIX_RECOVERY.md"));
             return Ok(());
         }
@@ -148,7 +146,7 @@ impl SchedulerRunner {
             format!(
                 "Phoenix recovered schedule {} at {}. The previous process crashed while this run was marked running. Read MEMORY.md, RUNS.jsonl and artifacts before acting. Tell {} you recovered the run and continue only what remains.\n",
                 item.name,
-                Local::now().to_rfc3339(),
+                readable_now(),
                 self.config.owner_name,
             ),
         )?;
@@ -160,13 +158,9 @@ impl SchedulerRunner {
             Some("Phoenix recovered this run after a daemon restart"),
         )?;
 
-        if item.status != ScheduleStatus::Cancelled && item.cancelled_at_ms.is_none() {
-            SchedulerDb::update_next_run(
-                &self.runtime_db,
-                &item.id,
-                Some(now_ms),
-                Some(ScheduleStatus::Active),
-            )?;
+        // Back on its original slot, so the retry is reported as late as it is.
+        if item.status == ScheduleStatus::Active {
+            SchedulerDb::set_next_run(&self.runtime_db, &item.id, Some(run.scheduled_for_ms))?;
             warn!("Phoenix re-queued interrupted schedule '{}'", item.name);
         }
 
@@ -187,16 +181,10 @@ impl SchedulerRunner {
 
         let now_ms = Utc::now().timestamp_millis();
 
-        // 1. Prepare schedule workspace
         let task_dir = self.config.workspace_dir.join(&item.task_path);
-        fs::create_dir_all(&task_dir)?;
+        fs::create_dir_all(task_dir.join("work"))?;
+        fs::create_dir_all(task_dir.join("artifacts"))?;
 
-        let work_dir = task_dir.join("work");
-        let artifacts_dir = task_dir.join("artifacts");
-        fs::create_dir_all(&work_dir)?;
-        fs::create_dir_all(&artifacts_dir)?;
-
-        // 2. Ensure per-schedule MEMORY.md exists
         let memory_md_path = task_dir.join("MEMORY.md");
         if !memory_md_path.exists() {
             fs::write(
@@ -204,32 +192,19 @@ impl SchedulerRunner {
                 format!(
                     "# Schedule Memory: {}\n\nInitial schedule memory created at {}.\n",
                     item.name,
-                    Local::now().to_rfc3339()
+                    readable_now()
                 ),
             )?;
         }
-
-        let task_md_path = task_dir.join("TASK.md");
         fs::write(
-            &task_md_path,
+            task_dir.join("TASK.md"),
             format!("# Task Specification\n\nPrompt: {}\n", item.prompt),
         )?;
 
-        // 3. Claim the run durably before advancing the schedule. A task that
-        //    runs for minutes must not be re-fired by the ticks that happen
-        //    while it works, and a crash in this small window must still leave
-        //    Phoenix a running row to recover.
-        //
-        //    Computing the next run from *now* rather than from the missed slot is
-        //    also what coalesces a backlog: after an outage a daily job fires once
-        //    and resumes its normal cadence, instead of replaying 40 occurrences.
-        let next_run = RecurrenceEngine::compute_next_run(
-            item.schedule_type(),
-            item.one_shot_at_ms(),
-            item.rrule(),
-            now_ms,
-        )?;
-
+        // Computing the next run from *now* rather than from the missed slot is
+        // what coalesces a backlog: after an outage a daily job fires once and
+        // resumes its normal cadence, instead of replaying 40 occurrences.
+        let next_run = item.timing.next_run(now_ms)?;
         let lateness = Self::lateness(item, now_ms);
         if let Some(late) = &lateness {
             warn!(
@@ -241,95 +216,39 @@ impl SchedulerRunner {
             );
         }
 
-        // 4. Actually run it, on a fresh Codex thread rooted in the task
-        //    directory. Anything the user should see is sent by the agent itself
-        //    via send_message; the returned text is a summary for the log.
-        let worker_id = format!("schedule:{}", item.id);
-        let _ = fs::write(task_dir.join(".worker_id"), &worker_id);
-
+        // Claim the run durably before advancing the schedule, so a crash in
+        // between still leaves Phoenix a running row to recover, and the ticks
+        // during a long run do not fire it again.
         let run_id = SchedulerDb::start_run(
             &self.runtime_db,
             &item.id,
             item.next_run_at_ms.unwrap_or(now_ms),
         )?;
+        SchedulerDb::set_next_run(&self.runtime_db, &item.id, next_run)?;
 
-        self.session.set_turn_for(&worker_id, Some(&run_id));
-        let _sends_before = self.session.count_for(Some(&worker_id));
-
-        // Advance next_run_at_ms to None so it does not fire concurrently,
-        // but keep status Active until the task run actually completes.
-        SchedulerDb::update_next_run(&self.runtime_db, &item.id, next_run, None)?;
-
-        let prompt = Self::build_task_prompt(&self.config, item, &task_dir, lateness.as_ref());
-
-        let thread_id = self
-            .codex
-            .start_isolated_thread_with_worker(&task_dir, Some(&worker_id))
-            .await?;
-        SchedulerDb::set_run_codex_thread(&self.runtime_db, &run_id, &thread_id)?;
-        info!(
-            "Schedule {} ('{}') run {} started on thread {}",
-            item.id, item.name, run_id, thread_id
-        );
-
-        let result = self.codex.run_turn_on_thread(&thread_id, &prompt).await;
-        if let Err(error) = self.codex.archive_thread(&thread_id).await {
-            warn!("Could not archive isolated thread {thread_id}: {error:?}");
+        let prompt = self.build_task_prompt(item, &task_dir, lateness.as_ref())?;
+        let worker_id = format!("schedule:{}", item.id);
+        self.session.set_turn(&worker_id, Some(&run_id));
+        let result = async {
+            let thread_id = self.codex.start_task_thread(&task_dir, &worker_id).await?;
+            SchedulerDb::set_run_codex_thread(&self.runtime_db, &run_id, &thread_id)?;
+            info!(
+                "Schedule {} ('{}') run {} started on thread {}",
+                item.id, item.name, run_id, thread_id
+            );
+            self.codex.run_task_turn(&thread_id, &prompt).await
         }
+        .await;
+        self.session.set_turn(&worker_id, None);
 
-        let outcome = match result {
+        match &result {
             Ok(summary) => {
-                self.append_run_log(&task_dir, item, &run_id, "completed", &summary);
-                let sentinel = task_dir.join(format!(".completed_{run_id}"));
-                let _ = fs::write(
-                    &sentinel,
-                    format!("completed at {}", Utc::now().to_rfc3339()),
-                );
-
-                let mut finish_err = None;
-                for attempt in 0..3 {
-                    if attempt > 0 {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                    match SchedulerDb::finish_run(
-                        &self.runtime_db,
-                        &run_id,
-                        RunState::Completed,
-                        None,
-                    ) {
-                        Ok(()) => {
-                            finish_err = None;
-                            let _ = fs::remove_file(&sentinel);
-                            break;
-                        }
-                        Err(e) => {
-                            warn!("Could not record completed state for run {run_id} (attempt {attempt}): {e}");
-                            finish_err = Some(e);
-                        }
-                    }
-                }
-
-                if let Some(e) = finish_err {
-                    return Err(e).with_context(|| {
-                        format!("Failed to record completed state for run {run_id}")
-                    });
-                }
-
-                if next_run.is_none() {
-                    SchedulerDb::update_next_run(
-                        &self.runtime_db,
-                        &item.id,
-                        None,
-                        Some(ScheduleStatus::Completed),
-                    )?;
-                }
-
-                let _ = fs::remove_file(task_dir.join("PHOENIX_RECOVERY.md"));
+                self.append_run_log(&task_dir, item, &run_id, "completed", summary);
+                SchedulerDb::finish_run(&self.runtime_db, &run_id, RunState::Completed, None)?;
                 info!(
-                    "Schedule {} ('{}') run {} on thread {} completed. Next run: {:?}",
-                    item.id, item.name, run_id, thread_id, next_run
+                    "Schedule {} ('{}') run {} completed. Next run: {:?}",
+                    item.id, item.name, run_id, next_run
                 );
-                Ok(())
             }
             Err(e) => {
                 // Loud, and recorded in the task's own run log: a scheduled task
@@ -340,19 +259,21 @@ impl SchedulerRunner {
                     &run_id,
                     RunState::Failed,
                     Some(&e.to_string()),
-                )
-                .with_context(|| format!("Failed to record failed state for run {run_id}"))?;
-                let _ = fs::remove_file(task_dir.join("PHOENIX_RECOVERY.md"));
+                )?;
                 error!(
-                    "Schedule {} ('{}') run {} on thread {} failed: {:?}",
-                    item.id, item.name, run_id, thread_id, e
+                    "Schedule {} ('{}') run {} failed: {:?}",
+                    item.id, item.name, run_id, e
                 );
-                Ok(())
             }
-        };
+        }
 
-        self.session.clear_worker(&worker_id);
-        outcome
+        // A one-shot is spent whether its run worked or not; left active with
+        // no next run it would sit in every schedule listing forever.
+        if next_run.is_none() {
+            SchedulerDb::complete_schedule(&self.runtime_db, &item.id)?;
+        }
+        let _ = fs::remove_file(task_dir.join("PHOENIX_RECOVERY.md"));
+        Ok(())
     }
 
     /// How late this run is, and how many occurrences went by unrun.
@@ -372,12 +293,7 @@ impl SchedulerRunner {
         let mut missed = 0usize;
         let mut cursor = scheduled;
         while missed < MAX_COUNTED_MISSES {
-            match RecurrenceEngine::compute_next_run(
-                item.schedule_type(),
-                item.one_shot_at_ms(),
-                item.rrule(),
-                cursor,
-            ) {
+            match item.timing.next_run(cursor) {
                 Ok(Some(next)) if next <= now_ms && next > cursor => {
                     missed += 1;
                     cursor = next;
@@ -391,38 +307,27 @@ impl SchedulerRunner {
 
     /// The prompt a scheduled worker wakes up to; text in
     /// `data/prompts/scheduled-task.md`.
-    ///
-    /// It has no conversation history, so it is told where it is, what it is for,
-    /// and that reaching the user requires the `send_message` tool, returning
-    /// text to nobody is the default failure mode otherwise.
     fn build_task_prompt(
-        config: &Config,
+        &self,
         item: &ScheduleItem,
         task_dir: &Path,
         lateness: Option<&Lateness>,
-    ) -> String {
-        let timing = match lateness {
-            Some(late) => format!(
-                "late by about {} minutes, {} occurrence(s) missed and coalesced into this run",
-                late.by_ms / 60_000,
-                late.missed
-            ),
-            None => "on time".to_string(),
+    ) -> Result<String> {
+        let recent = self
+            .history_db
+            .recent_messages(RECENT_CONVERSATION_MESSAGES)?;
+        let conversation = if recent.is_empty() {
+            "Nothing yet.".to_string()
+        } else {
+            InputRenderer::render_history("", &recent, &HashMap::new())
         };
-
-        crate::data::render(
-            crate::data::SCHEDULED_TASK_PROMPT,
-            &[
-                ("OWNER", &config.owner_name),
-                ("WORKSPACE", &config.workspace_dir.display().to_string()),
-                ("TASK_NAME", &item.name),
-                ("SCHEDULE_ID", &item.id),
-                ("NOW", &Local::now().to_rfc3339()),
-                ("TASK_DIR", &task_dir.display().to_string()),
-                ("LATE", &timing),
-                ("TASK_PROMPT", &item.prompt),
-            ],
-        )
+        Ok(render_task_prompt(
+            &self.config,
+            item,
+            task_dir,
+            lateness,
+            &conversation,
+        ))
     }
 
     /// Append one line per run to the task's own `RUNS.jsonl`.
@@ -472,10 +377,47 @@ impl SchedulerRunner {
     }
 }
 
+fn render_task_prompt(
+    config: &Config,
+    item: &ScheduleItem,
+    task_dir: &Path,
+    lateness: Option<&Lateness>,
+    conversation: &str,
+) -> String {
+    let timing = match lateness {
+        Some(late) => format!(
+            "late by about {} minutes, {} occurrence(s) missed and coalesced into this run",
+            late.by_ms / 60_000,
+            late.missed
+        ),
+        None => "on time".to_string(),
+    };
+
+    crate::data::render(
+        crate::data::SCHEDULED_TASK_PROMPT,
+        &[
+            ("OWNER", &config.owner_name),
+            ("WORKSPACE", &config.workspace_dir.display().to_string()),
+            ("TASK_NAME", &item.name),
+            ("SCHEDULE_ID", &item.id),
+            ("NOW", &readable_now()),
+            ("TASK_DIR", &task_dir.display().to_string()),
+            ("LATE", &timing),
+            ("TASK_PROMPT", &item.prompt),
+            ("RECENT_CONVERSATION", conversation),
+        ],
+    )
+}
+
+/// The weekday is what a model gets wrong from a bare ISO timestamp.
+fn readable_now() -> String {
+    Local::now().format("%A %Y-%m-%d %H:%M %:z").to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduler::db::ScheduleItemTiming;
+    use crate::scheduler::ScheduleTiming;
 
     const NOW: i64 = 1_786_962_664_000;
 
@@ -490,15 +432,12 @@ mod tests {
             id: "sched_1".to_string(),
             name: "Hourly check".to_string(),
             prompt: "check".to_string(),
-            timing: ScheduleItemTiming::Recurring {
+            timing: ScheduleTiming::Recurring {
                 rrule: "EVERY_1H".to_string(),
             },
-            timezone: "UTC".to_string(),
             task_path: "tasks/schedule-1".to_string(),
             status: ScheduleStatus::Active,
             next_run_at_ms,
-            created_at_ms: NOW,
-            cancelled_at_ms: None,
         }
     }
 
@@ -525,7 +464,7 @@ mod tests {
     #[test]
     fn test_missed_counting_is_bounded() {
         let mut minutely = hourly(Some(NOW - 30 * 24 * 3600 * 1000));
-        minutely.timing = ScheduleItemTiming::Recurring {
+        minutely.timing = ScheduleTiming::Recurring {
             rrule: "EVERY_1M".to_string(),
         };
 
@@ -541,18 +480,20 @@ mod tests {
     #[test]
     fn test_task_prompt_is_fully_rendered() {
         let item = hourly(Some(NOW));
-        let prompt = SchedulerRunner::build_task_prompt(
+        let prompt = render_task_prompt(
             &owner_config(),
             &item,
             Path::new("/ws/tasks/schedule-1"),
             None,
+            "[2026-08-18 09:00:00 +05:30] User m_1:\nsaid something",
         );
 
         assert!(prompt.contains("Hourly check"));
         assert!(prompt.contains("sched_1"));
         assert!(prompt.contains("/ws/tasks/schedule-1"));
         assert!(prompt.contains("send_message"));
-        assert!(prompt.contains("Timing on time"));
+        assert!(prompt.contains("on time"));
+        assert!(prompt.contains("said something"));
         assert!(!prompt.contains("{{"), "unfilled placeholder: {prompt}");
     }
 
@@ -565,11 +506,12 @@ mod tests {
             by_ms: 300 * 60_000,
             missed: 5,
         };
-        let prompt = SchedulerRunner::build_task_prompt(
+        let prompt = render_task_prompt(
             &owner_config(),
             &item,
             Path::new("/ws/tasks/schedule-1"),
             Some(&late),
+            "Nothing yet.",
         );
 
         assert!(prompt.contains("late by about 300 minutes"));

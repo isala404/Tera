@@ -80,8 +80,6 @@ enum Commands {
     Mcp {
         #[arg(long)]
         socket: PathBuf,
-        #[arg(long)]
-        worker_id: Option<String>,
     },
     /// Print system health and state status
     Status {
@@ -441,12 +439,12 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Mcp { socket, worker_id } => {
+        Commands::Mcp { socket } => {
             // The proxy is a child process Codex spawns, addressed only by socket:
             // it has no workspace flag. It still needs the owner's name, because the
             // tool descriptions it serves are prompt text.
             let owner = Config::new(std::path::PathBuf::from("."), false).owner_name;
-            let proxy = StdioMcpProxy::new(socket, owner, worker_id);
+            let proxy = StdioMcpProxy::new(socket, owner);
             proxy.run().await?;
         }
 
@@ -718,6 +716,7 @@ async fn main() -> Result<()> {
             let scheduler_runner = Arc::new(SchedulerRunner::new(
                 config.clone(),
                 runtime_db.clone(),
+                history_db.clone(),
                 codex.clone(),
                 session.clone(),
             ));

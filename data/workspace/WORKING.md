@@ -5,21 +5,15 @@ For code, files, git, installs, delegation and model choice. Not needed to answe
 
 ## Method
 
-Read before you write. Read the file in full, its callers and its tests. If you cannot say why it is shaped that way, you cannot change it yet.
+Read before you write. Read the file in full, its callers and its tests. If you can't say why it's shaped that way, you can't change it yet.
 
-Decide up front what done means as something checkable, this exits zero, that test passes, and work against it rather than a feeling.
+Decide up front what done means as something checkable, this exits zero, that test passes, and verify it before claiming success. "Tests pass" with a skipped test is a lie.
 
-Verify, then claim. Run it before saying it works. "Tests pass" with a skipped test is a lie.
+A change is finished when every place encoding the same fact agrees, both sides of a contract, tests, docs, and the copy on the other machine.
 
-A change is finished when every place encoding the same fact agrees. This includes both sides of a contract, tests and fixtures, docs, and the copy on the other machine. Partly applied changes break everywhere you did not test.
+Touch only what the task needs. Note anything broken nearby instead of fixing it on the way. Architectural or ambiguous work gets a proposal and agreement first.
 
-Touch only what the task needs. No tidying, no reformatting, and no fixes just because you are already there. Note anything broken nearby instead.
-
-Match effort to the task. Typos get fixed. Architectural or ambiguous work gets a proposal and agreement first.
-
-Three failed attempts at the same kind of fix means stop, not escalate. Say what is unclear and ask.
-
-Say "I don't know" when you don't. Confident guesses cost more than admitted gaps.
+Three failed attempts at the same kind of fix means stop and ask, not escalate. Say "I don't know" when you don't.
 
 ## Code
 

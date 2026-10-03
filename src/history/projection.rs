@@ -9,7 +9,7 @@
 
 use crate::history::db::{ConversationEvent, EventPayload, HistoryDb};
 use anyhow::{Context, Result};
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -70,10 +70,15 @@ pub struct JsonlReaction {
 
 pub struct ProjectionEngine;
 
+/// History refuses to store a timestamp chrono cannot represent, so every
+/// stored event has one.
+fn utc(ms: i64) -> DateTime<Utc> {
+    DateTime::from_timestamp_millis(ms).expect("history stores only representable timestamps")
+}
+
 impl ProjectionEngine {
     fn event_to_record(event: &ConversationEvent) -> JsonlRecord {
-        let dt: DateTime<Utc> = Utc.timestamp_millis_opt(event.occurred_at_ms).unwrap();
-        let t_str = dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let t_str = utc(event.occurred_at_ms).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
         match &event.payload {
             EventPayload::Reaction { target_id, emoji } => JsonlRecord::Reaction(JsonlReaction {
@@ -117,8 +122,7 @@ impl ProjectionEngine {
     }
 
     fn month_file(jsonl_dir: &Path, occurred_at_ms: i64) -> PathBuf {
-        let dt: DateTime<Utc> = Utc.timestamp_millis_opt(occurred_at_ms).unwrap();
-        jsonl_dir.join(format!("{}.jsonl", dt.format("%Y-%m")))
+        jsonl_dir.join(format!("{}.jsonl", utc(occurred_at_ms).format("%Y-%m")))
     }
 
     pub fn append_event(jsonl_dir: &Path, event: &ConversationEvent) -> Result<()> {
@@ -274,22 +278,17 @@ impl ProjectionEngine {
         let mut file_handles: HashMap<String, File> = HashMap::new();
 
         for event in events {
-            let dt: DateTime<Utc> = Utc.timestamp_millis_opt(event.occurred_at_ms).unwrap();
-            let month_key = dt.format("%Y-%m").to_string();
-            let month_filename = format!("{}.jsonl", month_key);
-
+            let month_key = utc(event.occurred_at_ms).format("%Y-%m").to_string();
             let record = Self::event_to_record(&event);
             let line = serde_json::to_string(&record)? + "\n";
 
-            let file = file_handles.entry(month_key).or_insert_with(|| {
-                let p = staging_dir.join(&month_filename);
-                OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(p)
-                    .unwrap()
-            });
+            let file = match file_handles.entry(month_key) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let path = staging_dir.join(format!("{}.jsonl", entry.key()));
+                    entry.insert(File::create(path)?)
+                }
+            };
 
             file.write_all(line.as_bytes())?;
         }

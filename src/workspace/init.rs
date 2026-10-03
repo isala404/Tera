@@ -30,7 +30,6 @@ impl WorkspaceInit {
             config.runtime_dir(),
             config.runtime_dir().join("locks"),
             config.runtime_dir().join("tmp"),
-            config.runtime_dir().join("media-cache"),
             config.memories_dir(),
             config.logs_dir(),
             config.workspace_dir.join("history"),
@@ -137,7 +136,7 @@ impl WorkspaceInit {
             }
         }
 
-        Self::seed_builtin_skills(config)?;
+        Self::seed_skills(config)?;
 
         // Model and provider settings are user configuration. Tera passes its
         // own paths and permissions as process overrides when Codex starts.
@@ -184,39 +183,36 @@ impl WorkspaceInit {
         )
     }
 
-    fn seed_builtin_skills(config: &Config) -> Result<()> {
-        // Before anything is removed, so an invalid package cannot leave the
+    fn seed_skills(config: &Config) -> Result<()> {
+        // Before anything is removed, so an invalid package cannot leave a
         // directory empty.
-        for skill in crate::data::BUILTIN_SKILLS {
-            validate_builtin_skill(skill)?;
+        for skill in data::BUILTIN_SKILLS.iter().chain(data::CONTRIB_SKILLS) {
+            validate_skill(skill)?;
         }
 
-        let root = config.builtin_skills_dir();
-        match fs::remove_dir_all(&root) {
-            Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| format!("failed to clear {root:?}"));
+        replace_skills(&config.builtin_skills_dir(), data::BUILTIN_SKILLS)?;
+        replace_skills(&config.contrib_catalog_dir(), data::CONTRIB_SKILLS)?;
+
+        // Installed optional skills are updated in place. One tera no longer
+        // ships is left alone, because removing it would undo the owner's choice.
+        for skill in data::CONTRIB_SKILLS {
+            let installed = config.contrib_skills_dir().join(skill.name);
+            if installed.exists() {
+                remove_dir_if_present(&installed)?;
+                write_skill(&installed, skill)?;
             }
         }
 
-        for skill in crate::data::BUILTIN_SKILLS {
-            let destination = root.join(skill.name);
-            fs::create_dir_all(&destination)
-                .with_context(|| format!("failed to create {destination:?}"))?;
-            write_skill_files(&destination, skill)?;
-        }
-
         info!(
-            "Wrote {} built-in skills to {:?}",
-            crate::data::BUILTIN_SKILLS.len(),
-            root
+            "Wrote {} built-in and {} optional skills",
+            data::BUILTIN_SKILLS.len(),
+            data::CONTRIB_SKILLS.len()
         );
         Ok(())
     }
 
     /// Run `codex login --device-auth` to pair this machine with Codex via device code.
-    pub fn login_codex_device_auth() -> Result<()> {
+    fn login_codex_device_auth() -> Result<()> {
         println!("\nStarting Codex device pairing (OAuth device authorization)...");
         println!("Follow the instructions displayed below to authorize this device:\n");
 
@@ -394,17 +390,14 @@ fn git_output(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn validate_builtin_skill(skill: &crate::data::BuiltinSkill) -> Result<()> {
+fn validate_skill(skill: &data::Skill) -> Result<()> {
     if !is_safe_skill_path(skill.name) {
-        bail!("invalid built-in skill name {:?}", skill.name);
-    }
-    if skill.files.is_empty() {
-        bail!("built-in skill {:?} has no files", skill.name);
+        bail!("invalid skill name {:?}", skill.name);
     }
     for file in skill.files {
         if !is_safe_skill_path(file.relative_path) {
             bail!(
-                "invalid path {:?} in built-in skill {:?}",
+                "invalid path {:?} in skill {:?}",
                 file.relative_path,
                 skill.name
             );
@@ -413,15 +406,32 @@ fn validate_builtin_skill(skill: &crate::data::BuiltinSkill) -> Result<()> {
     Ok(())
 }
 
-fn write_skill_files(staging: &Path, skill: &crate::data::BuiltinSkill) -> Result<()> {
+/// Replace everything under `root` with exactly `skills`.
+fn replace_skills(root: &Path, skills: &[data::Skill]) -> Result<()> {
+    remove_dir_if_present(root)?;
+    for skill in skills {
+        write_skill(&root.join(skill.name), skill)?;
+    }
+    Ok(())
+}
+
+fn remove_dir_if_present(dir: &Path) -> Result<()> {
+    match fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to clear {dir:?}")),
+    }
+}
+
+fn write_skill(destination: &Path, skill: &data::Skill) -> Result<()> {
     for file in skill.files {
-        let path = staging.join(file.relative_path);
+        let path = destination.join(file.relative_path);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create skill directory {parent:?}"))?;
         }
         fs::write(&path, file.contents)
-            .with_context(|| format!("failed to write built-in skill file {path:?}"))?;
+            .with_context(|| format!("failed to write skill file {path:?}"))?;
         let mode = if file.executable { 0o755 } else { 0o644 };
         fs::set_permissions(&path, fs::Permissions::from_mode(mode))
             .with_context(|| format!("failed to set permissions on {path:?}"))?;
@@ -438,9 +448,6 @@ fn is_safe_skill_path(path: &str) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
-/// Move a fully written package into place without replacing a user path.
-/// Linux has a native no-replace rename. Other supported Unix systems retain
-/// the final existence check and report an existing destination as a skip.
 /// The operator's home directory. Kept local instead of pulling in a crate for
 /// one lookup; the daemon only targets Unix.
 fn dirs_home() -> Option<std::path::PathBuf> {
@@ -680,6 +687,62 @@ mod tests {
         WorkspaceInit::init(&config).unwrap();
 
         assert_eq!(fs::read_to_string(mine.join("SKILL.md")).unwrap(), "mine\n");
+    }
+
+    #[test]
+    fn test_optional_skills_are_offered_but_not_installed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Config::new(tmp.path().to_path_buf(), true);
+        WorkspaceInit::init(&config).unwrap();
+
+        for contrib in crate::data::CONTRIB_SKILLS {
+            assert!(config
+                .contrib_catalog_dir()
+                .join(contrib.name)
+                .join("SKILL.md")
+                .exists());
+            assert!(!config.contrib_skills_dir().join(contrib.name).exists());
+        }
+        // Codex loads everything under CODEX_HOME/skills, so a catalog in
+        // there would install every optional skill for everyone.
+        assert!(!config
+            .contrib_catalog_dir()
+            .starts_with(config.codex_home_dir().join("skills")));
+        assert!(config
+            .contrib_skills_dir()
+            .starts_with(config.codex_home_dir().join("skills")));
+    }
+
+    #[test]
+    fn test_an_installed_optional_skill_is_updated_and_an_unknown_one_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Config::new(tmp.path().to_path_buf(), true);
+        let contrib = crate::data::CONTRIB_SKILLS.first().unwrap();
+        WorkspaceInit::init(&config).unwrap();
+
+        let installed = config.contrib_skills_dir().join(contrib.name);
+        fs::create_dir_all(&installed).unwrap();
+        fs::write(installed.join("SKILL.md"), "old version\n").unwrap();
+        fs::write(installed.join("leftover"), "gone\n").unwrap();
+        let unknown = config.contrib_skills_dir().join("retired");
+        fs::create_dir_all(&unknown).unwrap();
+        fs::write(unknown.join("SKILL.md"), "kept\n").unwrap();
+        WorkspaceInit::init(&config).unwrap();
+
+        let shipped = contrib
+            .files
+            .iter()
+            .find(|file| file.relative_path == "SKILL.md")
+            .unwrap();
+        assert_eq!(
+            fs::read(installed.join("SKILL.md")).unwrap(),
+            shipped.contents
+        );
+        assert!(!installed.join("leftover").exists());
+        assert_eq!(
+            fs::read_to_string(unknown.join("SKILL.md")).unwrap(),
+            "kept\n"
+        );
     }
 
     #[test]

@@ -171,13 +171,6 @@ impl ConversationEvent {
         }
     }
 
-    pub fn kind(&self) -> EventKind {
-        match &self.payload {
-            EventPayload::Message { .. } => EventKind::Message,
-            EventPayload::Reaction { .. } => EventKind::Reaction,
-        }
-    }
-
     pub fn text(&self) -> Option<&str> {
         match &self.payload {
             EventPayload::Message { text, .. } => text.as_deref(),
@@ -196,20 +189,6 @@ impl ConversationEvent {
         match &self.payload {
             EventPayload::Message { turn_id, .. } => turn_id.as_deref(),
             EventPayload::Reaction { .. } => None,
-        }
-    }
-
-    pub fn reaction_target_id(&self) -> Option<&str> {
-        match &self.payload {
-            EventPayload::Message { .. } => None,
-            EventPayload::Reaction { target_id, .. } => Some(target_id.as_str()),
-        }
-    }
-
-    pub fn reaction_emoji(&self) -> Option<&str> {
-        match &self.payload {
-            EventPayload::Message { .. } => None,
-            EventPayload::Reaction { emoji, .. } => Some(emoji.as_str()),
         }
     }
 }
@@ -351,6 +330,14 @@ impl HistoryDb {
         provider_ref: Option<&ProviderRef>,
         delivery: Option<(&str, Option<&str>)>,
     ) -> Result<Option<ConversationEvent>> {
+        // The projection files events by month, so a timestamp chrono cannot
+        // represent must never be stored.
+        anyhow::ensure!(
+            chrono::DateTime::from_timestamp_millis(event.occurred_at_ms).is_some(),
+            "event {} has an out-of-range timestamp {}",
+            event.id,
+            event.occurred_at_ms
+        );
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
@@ -571,36 +558,6 @@ impl HistoryDb {
         Ok(res)
     }
 
-    pub fn list_turn_events(&self, turn_id: &str) -> Result<Vec<ConversationEvent>> {
-        let conn = self.conn.lock().unwrap();
-        let query = format!(
-            "SELECT {EVENT_COLUMNS} FROM conversation_events WHERE turn_id = ?1 ORDER BY seq ASC"
-        );
-        let mut stmt = conn.prepare(&query)?;
-        let rows = stmt.query_map(params![turn_id], row_to_event)?;
-        let mut events = Vec::new();
-        for row in rows {
-            let mut ev = row?;
-            ev.attachments = load_attachments(&conn, &ev.id)?;
-            events.push(ev);
-        }
-        Ok(events)
-    }
-
-    pub fn record_delivery_event(
-        &self,
-        event_id: &str,
-        state: &str,
-        detail: Option<&str>,
-    ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO delivery_events (event_id, occurred_at_ms, state, detail) VALUES (?1, ?2, ?3, ?4)",
-            params![event_id, Utc::now().timestamp_millis(), state, detail],
-        )?;
-        Ok(())
-    }
-
     pub fn get_event(&self, event_id: &str) -> Result<Option<ConversationEvent>> {
         let conn = self.conn.lock().unwrap();
         let query = format!("SELECT {EVENT_COLUMNS} FROM conversation_events WHERE id = ?1");
@@ -661,6 +618,40 @@ impl HistoryDb {
 
         events.reverse();
         Ok(events)
+    }
+
+    /// The newest messages the assistant sent after `seq`, oldest first.
+    pub fn assistant_messages_after(
+        &self,
+        seq: i64,
+        limit: usize,
+    ) -> Result<Vec<ConversationEvent>> {
+        let conn = self.conn.lock().unwrap();
+        let query = format!(
+            "SELECT {EVENT_COLUMNS} FROM conversation_events
+             WHERE kind = 'message' AND actor = 'assistant' AND seq > ?1
+             ORDER BY seq DESC LIMIT ?2"
+        );
+        let mut stmt = conn.prepare(&query)?;
+        let rows = stmt.query_map(params![seq, limit as i64], row_to_event)?;
+
+        let mut events = Vec::new();
+        for row in rows {
+            let mut event = row?;
+            event.attachments = load_attachments(&conn, &event.id)?;
+            events.push(event);
+        }
+        events.reverse();
+        Ok(events)
+    }
+
+    pub fn latest_seq(&self) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM conversation_events",
+            [],
+            |r| r.get(0),
+        )?)
     }
 
     /// Return exactly the messages belonging to one logical conversation turn.

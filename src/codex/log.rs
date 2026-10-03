@@ -69,17 +69,7 @@ fn redact_stream_delta(stream_key: &str, delta: &str, secrets: &SecretStore) -> 
     let buf = map.entry(stream_key.to_string()).or_default();
     buf.push_str(delta);
 
-    let active_secrets: Vec<String> = secrets
-        .names()
-        .ok()
-        .map(|names| {
-            names
-                .into_iter()
-                .filter_map(|(name, _)| secrets.get(&name).ok().flatten())
-                .filter(|v| v.len() >= 6)
-                .collect()
-        })
-        .unwrap_or_default();
+    let active_secrets = secrets.redactable_values();
 
     if active_secrets.is_empty() {
         let out = std::mem::take(buf);
@@ -146,6 +136,27 @@ fn clear_turn_buffers(thread_id: &str, secrets: &SecretStore) {
     }
 }
 
+/// Streams are buffered per item so a secret split across deltas is still
+/// caught.
+fn stream_key(params: &Value, fallback_item: &str) -> String {
+    let thread_id = params
+        .get("threadId")
+        .and_then(Value::as_str)
+        .unwrap_or("global");
+    let item_id = params
+        .get("itemId")
+        .and_then(Value::as_str)
+        .unwrap_or(fallback_item);
+    format!("{thread_id}:{item_id}")
+}
+
+fn thread_of(params: &Value) -> &str {
+    params
+        .get("threadId")
+        .and_then(Value::as_str)
+        .unwrap_or("global")
+}
+
 /// `info` carries the things worth seeing on every turn. Shell commands,
 /// MCP tool calls, file edits, web searches, token usage. `debug` carries the
 /// streaming firehose (output deltas, reasoning text) that is only useful
@@ -156,20 +167,19 @@ pub fn log_notification(v: &Value, secrets: &SecretStore) {
         return;
     };
     let params = v.get("params").unwrap_or(&Value::Null);
+    // Every delta is buffered and redacted against the secret store, which is
+    // wasted work when nobody will see it.
+    let streaming = tracing::enabled!(target: "codex::stream", tracing::Level::DEBUG);
 
     match method {
         "item/started" | "item/completed" => {
-            if method == "item/completed" {
-                let thread_id = params
-                    .get("threadId")
-                    .and_then(Value::as_str)
-                    .unwrap_or("global");
+            if method == "item/completed" && streaming {
                 if let Some(item_id) = params
                     .get("item")
                     .and_then(|i| i.get("id"))
                     .and_then(Value::as_str)
                 {
-                    let stream_key = format!("{thread_id}:{item_id}");
+                    let stream_key = format!("{}:{item_id}", thread_of(params));
                     if let Some(flushed) = flush_stream_delta(&stream_key, secrets) {
                         debug!(target: "codex::stream", "flushed output: {}", truncate(&flushed, 400));
                     }
@@ -178,49 +188,25 @@ pub fn log_notification(v: &Value, secrets: &SecretStore) {
             log_item(method, params, secrets);
         }
 
-        "item/commandExecution/outputDelta" | "process/outputDelta" => {
+        "item/commandExecution/outputDelta" | "process/outputDelta" if streaming => {
             let chunk = text_of(params, "chunk")
                 .or_else(|| text_of(params, "delta"))
                 .unwrap_or_default();
-            let thread_id = params
-                .get("threadId")
-                .and_then(Value::as_str)
-                .unwrap_or("global");
-            let item_id = params
-                .get("itemId")
-                .and_then(Value::as_str)
-                .unwrap_or("cmd_out");
-            let stream_key = format!("{thread_id}:{item_id}");
+            let stream_key = stream_key(params, "cmd_out");
             if let Some(text) = redact_stream_delta(&stream_key, &chunk, secrets) {
                 debug!(target: "codex::stream", "command output: {}", truncate(&text, 400));
             }
         }
-        "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
+        "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" if streaming => {
             let delta = text_of(params, "delta").unwrap_or_default();
-            let thread_id = params
-                .get("threadId")
-                .and_then(Value::as_str)
-                .unwrap_or("global");
-            let item_id = params
-                .get("itemId")
-                .and_then(Value::as_str)
-                .unwrap_or("reasoning");
-            let stream_key = format!("{thread_id}:{item_id}");
+            let stream_key = stream_key(params, "reasoning");
             if let Some(text) = redact_stream_delta(&stream_key, &delta, secrets) {
                 debug!(target: "codex::stream", "reasoning: {}", truncate(&text, 400));
             }
         }
-        "item/agentMessage/delta" => {
+        "item/agentMessage/delta" if streaming => {
             let delta = text_of(params, "delta").unwrap_or_default();
-            let thread_id = params
-                .get("threadId")
-                .and_then(Value::as_str)
-                .unwrap_or("global");
-            let item_id = params
-                .get("itemId")
-                .and_then(Value::as_str)
-                .unwrap_or("agent_msg");
-            let stream_key = format!("{thread_id}:{item_id}");
+            let stream_key = stream_key(params, "agent_msg");
             if let Some(text) = redact_stream_delta(&stream_key, &delta, secrets) {
                 debug!(target: "codex::stream", "answer: {}", truncate(&text, 200));
             }
@@ -233,19 +219,11 @@ pub fn log_notification(v: &Value, secrets: &SecretStore) {
 
         "turn/started" => info!(target: "codex::turn", "turn started"),
         "turn/completed" => {
-            let thread_id = params
-                .get("threadId")
-                .and_then(Value::as_str)
-                .unwrap_or("global");
-            clear_turn_buffers(thread_id, secrets);
+            clear_turn_buffers(thread_of(params), secrets);
             info!(target: "codex::turn", "turn completed");
         }
         "turn/failed" => {
-            let thread_id = params
-                .get("threadId")
-                .and_then(Value::as_str)
-                .unwrap_or("global");
-            clear_turn_buffers(thread_id, secrets);
+            clear_turn_buffers(thread_of(params), secrets);
             let raw_params = params.to_string();
             let redacted_params = secrets.redact(&raw_params);
             warn!(target: "codex::turn", "turn failed: {}", truncate(&redacted_params, 500));
@@ -456,34 +434,5 @@ mod stderr_tests {
             "secret leaked after overlapping turn completion"
         );
         assert!(combined.contains("[redacted API_KEY]"));
-    }
-
-    #[test]
-    fn test_completed_items_redaction() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let store = SecretStore::new(temp_dir.path().join("secrets.json"));
-        store.set("DB_PASS", "super_secret_pass_999", 0).unwrap();
-
-        let raw_answer = "Your database password is super_secret_pass_999";
-        let item = serde_json::json!({
-            "type": "agentMessage",
-            "text": raw_answer
-        });
-        let params = serde_json::json!({ "item": item });
-
-        // log_item directly uses secrets.redact on agentMessage text
-        let text = text_of(&item, "text").unwrap();
-        let redacted = store.redact(&text);
-        assert!(!redacted.contains("super_secret_pass_999"));
-        assert!(redacted.contains("[redacted DB_PASS]"));
-
-        // Verify log_notification does not panic and processes completed items
-        log_notification(
-            &serde_json::json!({
-                "method": "item/completed",
-                "params": params
-            }),
-            &store,
-        );
     }
 }

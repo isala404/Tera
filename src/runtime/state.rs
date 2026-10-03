@@ -17,7 +17,6 @@ CREATE TABLE IF NOT EXISTS daemon_state (
 CREATE TABLE IF NOT EXISTS main_thread_state (
     id                            INTEGER PRIMARY KEY CHECK (id = 1),
     thread_id                     TEXT NOT NULL,
-    turn_id                       TEXT,
     started_at_ms                 INTEGER NOT NULL,
     last_activity_at_ms           INTEGER NOT NULL,
     estimated_cache_warm_until_ms INTEGER NOT NULL,
@@ -49,7 +48,6 @@ CREATE TABLE IF NOT EXISTS model_observations (
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MainThreadState {
     pub thread_id: String,
-    pub turn_id: Option<String>,
     pub started_at_ms: i64,
     pub last_activity_at_ms: i64,
     pub estimated_cache_warm_until_ms: i64,
@@ -172,11 +170,10 @@ impl RuntimeDb {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO main_thread_state (
-                id, thread_id, turn_id, started_at_ms, last_activity_at_ms, estimated_cache_warm_until_ms, model_id
-            ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
+                id, thread_id, started_at_ms, last_activity_at_ms, estimated_cache_warm_until_ms, model_id
+            ) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
             params![
                 state.thread_id,
-                state.turn_id,
                 state.started_at_ms,
                 state.last_activity_at_ms,
                 state.estimated_cache_warm_until_ms,
@@ -189,18 +186,17 @@ impl RuntimeDb {
     pub fn get_main_thread(&self) -> Result<Option<MainThreadState>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT thread_id, turn_id, started_at_ms, last_activity_at_ms, estimated_cache_warm_until_ms, model_id
+            "SELECT thread_id, started_at_ms, last_activity_at_ms, estimated_cache_warm_until_ms, model_id
              FROM main_thread_state WHERE id = 1",
         )?;
         let res = stmt
             .query_row([], |row| {
                 Ok(MainThreadState {
                     thread_id: row.get(0)?,
-                    turn_id: row.get(1)?,
-                    started_at_ms: row.get(2)?,
-                    last_activity_at_ms: row.get(3)?,
-                    estimated_cache_warm_until_ms: row.get(4)?,
-                    model_id: row.get(5)?,
+                    started_at_ms: row.get(1)?,
+                    last_activity_at_ms: row.get(2)?,
+                    estimated_cache_warm_until_ms: row.get(3)?,
+                    model_id: row.get(4)?,
                 })
             })
             .optional()?;
@@ -223,7 +219,10 @@ impl RuntimeDb {
             "INSERT INTO conversation_turns (
                 turn_id, chat_jid, last_provider_msg_id, started_at_ms, attempts, state
             ) VALUES (?1, ?2, ?3, ?4, 0, 'running')
-            ON CONFLICT(turn_id) DO UPDATE SET last_provider_msg_id = excluded.last_provider_msg_id",
+            ON CONFLICT(turn_id) DO UPDATE SET
+                last_provider_msg_id = excluded.last_provider_msg_id,
+                finished_at_ms = NULL,
+                state = 'running'",
             params![
                 turn_id,
                 chat_jid,

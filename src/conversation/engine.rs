@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::conversation::buffer::MessageBurst;
 use crate::conversation::record_assistant_message;
 use crate::conversation::renderer::InputRenderer;
-use crate::conversation::session::ConversationSession;
+use crate::conversation::session::{ConversationSession, FOREGROUND};
 use crate::conversation::typing::TypingGuard;
 use crate::history::assets::AssetStorage;
 use crate::history::db::{Attachment, ConversationEvent, HistoryDb, ProviderRef};
@@ -115,6 +115,10 @@ pub struct TurnEngine {
     runtime_db: RuntimeDb,
     transport: Arc<dyn Transport>,
     state: Arc<Mutex<ConversationState>>,
+    /// Held from routing a message until it is in its burst or turn. Messages
+    /// arrive on concurrent tasks, and two that both see no burst would each
+    /// open one, the second replacing the first.
+    ingest: Arc<Mutex<()>>,
     codex: CodexSupervisor,
     owner_policy: OwnerPolicy,
     session: ConversationSession,
@@ -139,6 +143,7 @@ impl TurnEngine {
             runtime_db,
             transport,
             state: Arc::new(Mutex::new(ConversationState::default())),
+            ingest: Arc::new(Mutex::new(())),
             codex,
             session,
             login_notifier_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -154,7 +159,7 @@ impl TurnEngine {
                 "Ignoring message from {}: {}. If this is you, set WHATSAPP_OWNER_JID={}",
                 msg.sender,
                 reason,
-                crate::transport::owner::jid_user(&msg.sender)
+                jid_user(&msg.sender)
             );
             return Ok(());
         }
@@ -229,6 +234,8 @@ impl TurnEngine {
         //    references an asset that is not on disk.
         let attachments = self.persist_media(&msg, &event_id)?;
 
+        let _ingest = self.ingest.lock().await;
+
         // 2. Decide where this message goes before recording it, because the
         //    answer determines the logical turn id it is stamped with. Without
         //    that, user messages had no `turn` in history at all and a past
@@ -282,18 +289,25 @@ impl TurnEngine {
                 from_me: msg.from_own_account,
                 text: msg.text.clone(),
             };
-            let outbound_msg_id = self
+            // Best effort: a caption that came with the failed file still
+            // deserves its turn.
+            match self
                 .transport
                 .send_text(&msg.chat_jid, &failure_reply, Some(&reply_target))
-                .await?;
-            record_assistant_message(
-                &self.history_db,
-                &msg.chat_jid,
-                &outbound_msg_id,
-                &failure_reply,
-                Some(logical_turn.clone()),
-                Some(event_id.clone()),
-            )?;
+                .await
+            {
+                Ok(outbound_msg_id) => {
+                    record_assistant_message(
+                        &self.history_db,
+                        &msg.chat_jid,
+                        &outbound_msg_id,
+                        &failure_reply,
+                        Some(logical_turn.clone()),
+                        Some(event_id.clone()),
+                    )?;
+                }
+                Err(e) => warn!("Could not report the failed attachment download: {e:?}"),
+            }
 
             // If file-only, there is no user text to answer, so the turn ends here.
             if msg.text.as_deref().is_none_or(|t| t.trim().is_empty()) {
@@ -311,7 +325,9 @@ impl TurnEngine {
                     return Ok(());
                 }
                 // The turn finished in the gap. Fall through and treat this as the
-                // start of a new one rather than dropping the message.
+                // start of a new one rather than dropping the message. It keeps
+                // the finished turn's id, which history already stamped it with,
+                // and `start_turn` reopens that row.
                 info!("Nothing to steer after all; starting a new turn for this message");
                 self.begin_burst(&sender, &msg.chat_jid, conv_ev, &msg.provider_msg_id)
                     .await;
@@ -445,6 +461,12 @@ impl TurnEngine {
     async fn route(&self, sender: &str) -> (Route, String) {
         let state = self.state.lock().await;
 
+        // A collecting burst comes first, even while a turn runs: it is
+        // waiting for that turn, and this message belongs after it.
+        if let Some(burst) = state.bursts.get(sender) {
+            return (Route::JoinBurst, burst.turn_id.clone());
+        }
+
         // Only steer when a turn is genuinely in flight on the app-server. The
         // engine's own view can lag behind a turn that just completed.
         if let Some(running) = state.running_turn.clone() {
@@ -452,19 +474,12 @@ impl TurnEngine {
             if self.codex.main_turn_is_running().await {
                 return (Route::Steer, running);
             }
-            return (
-                Route::StartBurst,
-                format!("turn_{}", Uuid::new_v4().simple()),
-            );
         }
 
-        match state.bursts.get(sender) {
-            Some(burst) => (Route::JoinBurst, burst.turn_id.clone()),
-            None => (
-                Route::StartBurst,
-                format!("turn_{}", Uuid::new_v4().simple()),
-            ),
-        }
+        (
+            Route::StartBurst,
+            format!("turn_{}", Uuid::new_v4().simple()),
+        )
     }
 
     /// Open a burst for `sender` and arm its quiet-period timer.
@@ -509,35 +524,35 @@ impl TurnEngine {
 
             // Wait out the quiet period, restarting it whenever another message
             // lands, but never past the ceiling: someone typing continuously
-            // still gets an answer.
-            loop {
-                let remaining = {
+            // still gets an answer. Then wait for any running turn, because
+            // the main thread takes one turn at a time. Taking the burst and
+            // marking the turn running happen under one lock, or a message in
+            // between would find neither and open a second turn.
+            let burst = loop {
+                let wait = {
                     let mut state = engine.state.lock().await;
                     match state.remaining_wait(&sender) {
-                        Some(remaining) => remaining,
                         // Something else already took it.
                         None => return,
+                        Some(remaining) if !remaining.is_zero() => remaining,
+                        Some(_) if state.running_turn.is_some() => PRESENCE_POLL_INTERVAL,
+                        Some(_) => {
+                            let Some(burst) = state.bursts.remove(&sender) else {
+                                return;
+                            };
+                            state.running_turn = Some(burst.turn_id.clone());
+                            break burst;
+                        }
                     }
                 };
-
-                if remaining.is_zero() {
-                    break;
-                }
-                tokio::time::sleep(remaining).await;
-            }
-
-            let burst_opt = {
-                let mut state = engine.state.lock().await;
-                state.bursts.remove(&sender)
+                tokio::time::sleep(wait).await;
             };
 
-            if let Some(burst) = burst_opt {
-                if let Err(e) = engine
-                    .process_burst(&sender, burst, &last_provider_msg_id)
-                    .await
-                {
-                    error!("Failed to process burst for {}: {:?}", sender, e);
-                }
+            if let Err(e) = engine
+                .process_burst(&sender, burst, &last_provider_msg_id)
+                .await
+            {
+                error!("Failed to process burst for {}: {:?}", sender, e);
             }
         });
     }
@@ -622,24 +637,20 @@ impl TurnEngine {
             .collect()
     }
 
-    /// Run a burst as one turn, with the "a turn is running" flag held for
-    /// exactly its duration.
+    /// Run a burst the timer has marked running as one turn, and clear the mark.
     ///
-    /// Marking and clearing live here, in one place, rather than at each exit
-    /// path inside the turn body. There are several, and one that forgot to
-    /// clear would wedge every later message into steering a turn that ended.
+    /// Clearing lives here, in one place, rather than at each exit path inside
+    /// the turn body. There are several, and one that forgot to clear would
+    /// wedge every later message into steering a turn that ended.
     async fn process_burst(
         &self,
         sender: &str,
         burst: MessageBurst,
         last_provider_msg_id: &str,
     ) -> Result<()> {
-        // Registers the conversation turn as busy for the duration.
-
         let turn_id = burst.turn_id.clone();
-        self.set_running(Some(turn_id.clone())).await;
         let outcome = self.execute_turn(sender, burst, last_provider_msg_id).await;
-        self.set_running(None).await;
+        self.state.lock().await.running_turn = None;
 
         // Closed either way. This process is still alive, so a failure here is a
         // logged failure, not something for Phoenix to resurrect at a restart
@@ -653,10 +664,6 @@ impl TurnEngine {
             warn!("Could not close turn {turn_id}: {e:?}");
         }
         outcome
-    }
-
-    async fn set_running(&self, turn: Option<String>) {
-        self.state.lock().await.running_turn = turn;
     }
 
     /// Run the turn.
@@ -676,14 +683,13 @@ impl TurnEngine {
         );
 
         // Snapshot before the turn so send_message calls made during it are visible.
-        let sends_before = self.session.count_for(Some("foreground"));
+        let sends_before = self.session.sends(FOREGROUND);
 
         // A chat, never `sender`: that is a device-suffixed JID, which is not a
         // routable address. The session was set from this message's chat before
         // the burst opened.
         let chat_jid = self.session.chat().unwrap_or_default();
-        self.session
-            .set_turn_for("foreground", Some(&burst.turn_id));
+        self.session.set_turn(FOREGROUND, Some(&burst.turn_id));
 
         let result = async {
             // Render events into a structured prompt, then hand any images and voice
@@ -765,7 +771,7 @@ impl TurnEngine {
                 Ok(reply) => reply,
                 Err(error) => {
                     error!("Codex turn failed: {error:?}");
-                    if self.session.sends_since_for(Some("foreground"), sends_before) == 0 {
+                    if self.session.sends(FOREGROUND) == sends_before {
                         match self
                             .transport
                             .send_text(&chat_jid, MODEL_FAILURE_REPLY, reply_target.as_ref())
@@ -798,7 +804,7 @@ impl TurnEngine {
             // usually does. Sending the final agent text unconditionally would then
             // deliver every answer twice. Only fall back when the turn produced no
             // user-visible message of its own.
-            if self.session.sends_since_for(Some("foreground"), sends_before) > 0 {
+            if self.session.sends(FOREGROUND) > sends_before {
                 info!("Turn replied via send_message; skipping final-text fallback");
                 return Ok(());
             }
@@ -818,18 +824,19 @@ impl TurnEngine {
                 .map(|t| t.last_provider_msg_id)
                 .unwrap_or_else(|| last_provider_msg_id.to_string());
 
+            let last_event = self
+                .history_db
+                .messages_for_turn(&burst.turn_id)
+                .ok()
+                .and_then(|events| events.into_iter().last())
+                .or_else(|| burst.events.last().cloned());
+
             let reply_target = {
                 let stored_ref = self
                     .history_db
                     .lookup_provider_ref_by_provider_id(&latest_provider_msg_id, "whatsapp")
                     .ok()
                     .flatten();
-                let last_event = self
-                    .history_db
-                    .list_turn_events(&burst.turn_id)
-                    .ok()
-                    .and_then(|events| events.into_iter().last())
-                    .or_else(|| burst.events.last().cloned());
                 Some(MessageRef {
                     provider_msg_id: latest_provider_msg_id.clone(),
                     chat_jid: stored_ref
@@ -849,13 +856,7 @@ impl TurnEngine {
                 .send_text(&chat_jid, &outgoing, reply_target.as_ref())
                 .await?;
 
-            let last_event_id = self
-                .history_db
-                .list_turn_events(&burst.turn_id)
-                .ok()
-                .and_then(|events| events.into_iter().last())
-                .map(|e| e.id)
-                .or_else(|| burst.events.last().map(|e| e.id.clone()));
+            let last_event_id = last_event.map(|e| e.id);
 
             record_assistant_message(
                 &self.history_db,
@@ -871,7 +872,7 @@ impl TurnEngine {
         }
         .await;
 
-        self.session.set_turn_for("foreground", None);
+        self.session.set_turn(FOREGROUND, None);
         result
     }
 

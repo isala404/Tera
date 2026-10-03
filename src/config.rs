@@ -54,11 +54,6 @@ impl Config {
         }
     }
 
-    pub fn with_codex_bin(mut self, bin: impl Into<PathBuf>) -> Self {
-        self.codex_bin = bin.into();
-        self
-    }
-
     pub fn runtime_dir(&self) -> PathBuf {
         self.workspace_dir.join(".runtime")
     }
@@ -140,6 +135,18 @@ impl Config {
     /// owns, so the directory can be deleted and rewritten on every start.
     pub fn builtin_skills_dir(&self) -> PathBuf {
         self.codex_home_dir().join("skills").join("tera")
+    }
+
+    /// Optional skills tera ships but does not install. Outside CODEX_HOME/skills
+    /// so Codex does not load them until the owner asks for one.
+    pub fn contrib_catalog_dir(&self) -> PathBuf {
+        self.codex_home_dir().join("contrib")
+    }
+
+    /// Where an optional skill is installed by copying it from the catalog. A
+    /// skill's presence here is the only record that the owner chose it.
+    pub fn contrib_skills_dir(&self) -> PathBuf {
+        self.codex_home_dir().join("skills").join("contrib")
     }
 
     /// Credentials the owner sent through chat, for skills to read.
@@ -271,6 +278,11 @@ mod tests {
         assert_eq!(
             cfg.builtin_skills_dir(),
             root.join(".codex-home/skills/tera")
+        );
+        assert_eq!(cfg.contrib_catalog_dir(), root.join(".codex-home/contrib"));
+        assert_eq!(
+            cfg.contrib_skills_dir(),
+            root.join(".codex-home/skills/contrib")
         );
         assert_eq!(cfg.secrets_path(), root.join(".runtime/secrets.json"));
         assert_eq!(cfg.memories_dir(), root.join("MEMORIES"));

@@ -27,7 +27,7 @@ enum TurnEvent {
 
 struct TurnListener {
     thread_id: String,
-    tx: mpsc::Sender<TurnEvent>,
+    tx: mpsc::UnboundedSender<TurnEvent>,
 }
 
 /// Session-static native Codex settings that must be stated again when an
@@ -191,7 +191,13 @@ impl CodexProcessManager {
             .and_then(|p| p.parent())
             .map(|p| p.join("secrets.json"))
             .unwrap_or_else(|| std::path::PathBuf::from("secrets.json"));
-        Self::spawn_with_overrides(codex_home, &[], SecretStore::new(secrets_path), None).await
+        Self::spawn_with_overrides(
+            codex_home,
+            &[],
+            SecretStore::new(secrets_path),
+            std::path::Path::new("codex"),
+        )
+        .await
     }
 
     pub async fn spawn_for(config: &Config) -> Result<Self> {
@@ -199,7 +205,7 @@ impl CodexProcessManager {
             Some(&config.codex_home_dir()),
             &config.codex_overrides(),
             SecretStore::new(config.secrets_path()),
-            Some(&config.codex_bin),
+            &config.codex_bin,
         )
         .await
     }
@@ -208,17 +214,13 @@ impl CodexProcessManager {
         codex_home: Option<&std::path::Path>,
         overrides: &[String],
         secrets: SecretStore,
-        codex_bin_override: Option<&std::path::Path>,
+        codex_bin: &std::path::Path,
     ) -> Result<Self> {
         info!(
             "Spawning persistent 'codex app-server' process (codex_home={:?})",
             codex_home
         );
 
-        let codex_bin = codex_bin_override
-            .map(|p| p.to_string_lossy().to_string())
-            .or_else(|| std::env::var("TERA_CODEX_BIN").ok())
-            .unwrap_or_else(|| "codex".to_string());
         let mut cmd = Command::new(codex_bin);
         for value in overrides {
             cmd.arg("-c").arg(value);
@@ -331,7 +333,8 @@ impl CodexProcessManager {
 
         // Stdout reader task
         let dead_on_eof = dead.clone();
-        let reply_tx = stdin_tx.clone();
+        // Weak, so dropping the manager closes stdin and the app-server exits.
+        let reply_tx = stdin_tx.downgrade();
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = reader.next_line().await {
@@ -355,8 +358,10 @@ impl CodexProcessManager {
                 match (v.get("method").and_then(Value::as_str), v.get("id")) {
                     (Some(method), Some(id)) => {
                         let reply = Self::answer_server_request(id, method, v.get("params"));
-                        if let Ok(line) = serde_json::to_string(&reply) {
-                            let _ = reply_tx.send(line + "\n").await;
+                        if let (Ok(line), Some(tx)) =
+                            (serde_json::to_string(&reply), reply_tx.upgrade())
+                        {
+                            let _ = tx.send(line + "\n").await;
                         }
                     }
                     (Some(method), None) => {
@@ -659,15 +664,11 @@ impl CodexProcessManager {
         self.active_thread_id.lock().await.clone()
     }
 
-    /// Ask the app-server which models it offers and which is default, so memory
-    /// regeneration can be triggered when the default changes.
+    /// Ask the app-server which models it offers and which is default.
     pub async fn list_models(&self) -> Result<Value> {
         self.send_request("model/list", Some(json!({}))).await
     }
 
-    /// Narrate what the agent is doing, so a turn is traceable from the daemon
-    /// log without attaching to Codex.
-    ///
     /// Map an app-server notification to the thread it belongs to and the event
     /// tera cares about. Returns `None` for notifications we ignore
     /// (MCP startup status, token usage, rate limits, presence, ...).
@@ -792,20 +793,6 @@ impl CodexProcessManager {
         Ok(())
     }
 
-    /// Stop the turn running on a thread.
-    pub async fn interrupt(&self, thread_id: &str) -> Result<()> {
-        let Some(turn_id) = self.active_turn_of(thread_id).await else {
-            return Ok(());
-        };
-        self.send_request(
-            "turn/interrupt",
-            Some(json!({"threadId": thread_id, "turnId": turn_id})),
-        )
-        .await?;
-        info!("Interrupted turn {turn_id} on thread {thread_id}");
-        Ok(())
-    }
-
     pub fn subscribe_login_completed(&self) -> broadcast::Receiver<bool> {
         self.login_completed_tx.subscribe()
     }
@@ -867,17 +854,7 @@ impl CodexProcessManager {
         let lock = listeners.lock().await;
         for listener in lock.values() {
             if listener.thread_id == thread_id {
-                let is_terminal = matches!(event, TurnEvent::Completed | TurnEvent::Failed(_));
-                if let Err(mpsc::error::TrySendError::Full(ev)) =
-                    listener.tx.try_send(event.clone())
-                {
-                    if is_terminal {
-                        let tx = listener.tx.clone();
-                        tokio::spawn(async move {
-                            let _ = tx.send(ev).await;
-                        });
-                    }
-                }
+                let _ = listener.tx.send(event.clone());
             }
         }
     }
@@ -885,13 +862,7 @@ impl CodexProcessManager {
     async fn fail_listeners(listeners: &Arc<Mutex<HashMap<String, TurnListener>>>, reason: &str) {
         let lock = listeners.lock().await;
         for listener in lock.values() {
-            let event = TurnEvent::Failed(reason.to_string());
-            if let Err(mpsc::error::TrySendError::Full(ev)) = listener.tx.try_send(event) {
-                let tx = listener.tx.clone();
-                tokio::spawn(async move {
-                    let _ = tx.send(ev).await;
-                });
-            }
+            let _ = listener.tx.send(TurnEvent::Failed(reason.to_string()));
         }
     }
 
@@ -977,7 +948,9 @@ impl CodexProcessManager {
         let thread_id = thread_id.to_string();
 
         // Register before turn/start so no event can be missed in the gap.
-        let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+        // Unbounded: a long answer streams more deltas than any fixed buffer,
+        // and the reader must never drop one or block on a slow turn.
+        let (tx, mut rx) = mpsc::unbounded_channel::<TurnEvent>();
         let listener_id = Uuid::new_v4().to_string();
         {
             let mut lock = self.turn_listeners.lock().await;
@@ -1035,7 +1008,7 @@ impl CodexProcessManager {
     /// item is what the app-server considers authoritative). There is no wall
     /// clock cap because a turn may be installing dependencies or waiting on a
     /// long-running tool; process death and a closed event stream still fail it.
-    async fn collect_turn(rx: &mut mpsc::Receiver<TurnEvent>) -> Result<String> {
+    async fn collect_turn(rx: &mut mpsc::UnboundedReceiver<TurnEvent>) -> Result<String> {
         let mut deltas = String::new();
         let mut final_message: Option<String> = None;
 
@@ -1201,7 +1174,7 @@ mod tests {
     }
 
     /// An unknown request still has to be answered. Silence stalls the turn until
-    /// the 300s timeout, which the agent reports as a refusal.
+    /// Codex gives up on it, which the agent reports as a refusal.
     #[test]
     fn test_an_unknown_request_gets_an_error_not_silence() {
         let reply = CodexProcessManager::answer_server_request(&json!(9), "some/newThing", None);
@@ -1275,11 +1248,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_collect_turn_prefers_final_message() {
-        let (tx, mut rx) = mpsc::channel(8);
-        tx.send(TurnEvent::Delta("po".into())).await.unwrap();
-        tx.send(TurnEvent::Delta("ng".into())).await.unwrap();
-        tx.send(TurnEvent::Message("pong".into())).await.unwrap();
-        tx.send(TurnEvent::Completed).await.unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(TurnEvent::Delta("po".into())).unwrap();
+        tx.send(TurnEvent::Delta("ng".into())).unwrap();
+        tx.send(TurnEvent::Message("pong".into())).unwrap();
+        tx.send(TurnEvent::Completed).unwrap();
         assert_eq!(
             CodexProcessManager::collect_turn(&mut rx).await.unwrap(),
             "pong"
@@ -1291,9 +1264,9 @@ mod tests {
     /// tool-based reply log as a failure.
     #[tokio::test]
     async fn test_empty_final_message_is_not_an_error() {
-        let (tx, mut rx) = mpsc::channel(8);
-        tx.send(TurnEvent::Message(String::new())).await.unwrap();
-        tx.send(TurnEvent::Completed).await.unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(TurnEvent::Message(String::new())).unwrap();
+        tx.send(TurnEvent::Completed).unwrap();
         assert_eq!(
             CodexProcessManager::collect_turn(&mut rx).await.unwrap(),
             ""
@@ -1302,9 +1275,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_collect_turn_falls_back_to_deltas() {
-        let (tx, mut rx) = mpsc::channel(8);
-        tx.send(TurnEvent::Delta("pong".into())).await.unwrap();
-        tx.send(TurnEvent::Completed).await.unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(TurnEvent::Delta("pong".into())).unwrap();
+        tx.send(TurnEvent::Completed).unwrap();
         assert_eq!(
             CodexProcessManager::collect_turn(&mut rx).await.unwrap(),
             "pong"
@@ -1373,10 +1346,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_collect_turn_surfaces_failure() {
-        let (tx, mut rx) = mpsc::channel(8);
-        tx.send(TurnEvent::Failed("model exploded".into()))
-            .await
-            .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(TurnEvent::Failed("model exploded".into())).unwrap();
         let err = CodexProcessManager::collect_turn(&mut rx)
             .await
             .unwrap_err();
@@ -1386,7 +1357,7 @@ mod tests {
     #[tokio::test]
     async fn test_process_death_fails_waiting_turn() {
         let listeners = Arc::new(Mutex::new(HashMap::new()));
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, mut rx) = mpsc::unbounded_channel();
         listeners.lock().await.insert(
             "listener".to_string(),
             TurnListener {
@@ -1402,10 +1373,12 @@ mod tests {
         assert!(error.to_string().contains("codex app-server exited"));
     }
 
+    /// A long answer streams more deltas than a bounded buffer held, and the
+    /// overflow was silently dropped from the reply.
     #[tokio::test]
-    async fn test_overflow_queue_delivers_completed() {
+    async fn test_a_flood_of_deltas_loses_nothing() {
         let listeners = Arc::new(Mutex::new(HashMap::new()));
-        let (tx, mut rx) = mpsc::channel(256);
+        let (tx, mut rx) = mpsc::unbounded_channel();
         listeners.lock().await.insert(
             "listener".to_string(),
             TurnListener {
@@ -1414,62 +1387,17 @@ mod tests {
             },
         );
 
-        let waiting = tokio::spawn(async move { CodexProcessManager::collect_turn(&mut rx).await });
-
-        // Flood the 256-event channel with 300 delta events
-        for i in 0..300 {
-            CodexProcessManager::dispatch(
-                &listeners,
-                "thread",
-                TurnEvent::Delta(format!("chunk_{i}")),
-            )
-            .await;
+        for i in 0..1000 {
+            CodexProcessManager::dispatch(&listeners, "thread", TurnEvent::Delta(format!("{i},")))
+                .await;
         }
-
-        // Terminal event must be delivered reliably despite queue full
         CodexProcessManager::dispatch(&listeners, "thread", TurnEvent::Completed).await;
 
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
-            .await
-            .expect("collect_turn should not hang when queue overflows")
-            .expect("join should succeed")
-            .expect("turn should complete");
-
-        assert!(result.contains("chunk_0"));
-    }
-
-    #[tokio::test]
-    async fn test_overflow_queue_delivers_failure() {
-        let listeners = Arc::new(Mutex::new(HashMap::new()));
-        let (tx, mut rx) = mpsc::channel(256);
-        listeners.lock().await.insert(
-            "listener".to_string(),
-            TurnListener {
-                thread_id: "thread".to_string(),
-                tx,
-            },
+        let expected: String = (0..1000).map(|i| format!("{i},")).collect();
+        assert_eq!(
+            CodexProcessManager::collect_turn(&mut rx).await.unwrap(),
+            expected
         );
-
-        let waiting = tokio::spawn(async move { CodexProcessManager::collect_turn(&mut rx).await });
-
-        for i in 0..300 {
-            CodexProcessManager::dispatch(
-                &listeners,
-                "thread",
-                TurnEvent::Delta(format!("chunk_{i}")),
-            )
-            .await;
-        }
-
-        CodexProcessManager::fail_listeners(&listeners, "process crash on overflow").await;
-
-        let err = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
-            .await
-            .expect("collect_turn should not hang when process fails on overflow")
-            .expect("join should succeed")
-            .expect_err("turn should fail");
-
-        assert!(err.to_string().contains("process crash on overflow"));
     }
 
     #[tokio::test]
@@ -1479,7 +1407,7 @@ mod tests {
         let active_turns: Arc<Mutex<HashMap<String, String>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
-        let (tx, _rx) = mpsc::channel(256);
+        let (tx, _rx) = mpsc::unbounded_channel();
         listeners.lock().await.insert(
             "test_listener".to_string(),
             TurnListener {

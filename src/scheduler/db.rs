@@ -2,6 +2,7 @@ use crate::runtime::RuntimeDb;
 use crate::scheduler::recurrence::ScheduleTiming;
 use anyhow::Result;
 use chrono::{Local, Utc};
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -43,10 +44,10 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-pub(crate) const SCHEDULE_COLUMNS: &str =
-    "id, name, prompt, schedule_type, one_shot_at_ms, dtstart_local, rrule, timezone, task_path, status, next_run_at_ms, created_at_ms, cancelled_at_ms";
+const SCHEDULE_COLUMNS: &str =
+    "id, name, prompt, schedule_type, one_shot_at_ms, rrule, task_path, status, next_run_at_ms";
 
-pub(crate) const RUN_COLUMNS: &str =
+const RUN_COLUMNS: &str =
     "id, schedule_id, scheduled_for_ms, started_at_ms, finished_at_ms, state, codex_thread_id, error";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,32 +74,19 @@ impl std::fmt::Display for ScheduleStatus {
     }
 }
 
-impl std::str::FromStr for ScheduleStatus {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "active" => Ok(Self::Active),
-            "cancelled" => Ok(Self::Cancelled),
-            "completed" => Ok(Self::Completed),
-            other => Err(anyhow::anyhow!("unknown schedule status {other:?}")),
-        }
-    }
-}
-
-impl rusqlite::types::ToSql for ScheduleStatus {
-    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+impl ToSql for ScheduleStatus {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         Ok(self.as_str().into())
     }
 }
 
-impl rusqlite::types::FromSql for ScheduleStatus {
-    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
-        let s = value.as_str()?;
-        match s {
+impl FromSql for ScheduleStatus {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value.as_str()? {
             "active" => Ok(Self::Active),
             "cancelled" => Ok(Self::Cancelled),
             "completed" => Ok(Self::Completed),
-            other => Err(rusqlite::types::FromSqlError::Other(
+            other => Err(FromSqlError::Other(
                 format!("unknown schedule status {other:?}").into(),
             )),
         }
@@ -108,7 +96,6 @@ impl rusqlite::types::FromSql for ScheduleStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunState {
-    Pending,
     Running,
     Completed,
     Failed,
@@ -117,7 +104,6 @@ pub enum RunState {
 impl RunState {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Pending => "pending",
             Self::Running => "running",
             Self::Completed => "completed",
             Self::Failed => "failed",
@@ -131,85 +117,37 @@ impl std::fmt::Display for RunState {
     }
 }
 
-impl std::str::FromStr for RunState {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "pending" => Ok(Self::Pending),
-            "running" => Ok(Self::Running),
-            "completed" => Ok(Self::Completed),
-            "failed" => Ok(Self::Failed),
-            other => Err(anyhow::anyhow!("unknown run state {other:?}")),
-        }
-    }
-}
-
-impl rusqlite::types::ToSql for RunState {
-    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+impl ToSql for RunState {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         Ok(self.as_str().into())
     }
 }
 
-impl rusqlite::types::FromSql for RunState {
-    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
-        let s = value.as_str()?;
-        match s {
-            "pending" => Ok(Self::Pending),
+impl FromSql for RunState {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value.as_str()? {
             "running" => Ok(Self::Running),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
-            other => Err(rusqlite::types::FromSqlError::Other(
+            other => Err(FromSqlError::Other(
                 format!("unknown run state {other:?}").into(),
             )),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ScheduleItemTiming {
-    Once { at_ms: i64 },
-    Recurring { rrule: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ScheduleItem {
     pub id: String,
     pub name: String,
     pub prompt: String,
-    pub timing: ScheduleItemTiming,
-    pub timezone: String,
+    pub timing: ScheduleTiming,
     pub task_path: String,
     pub status: ScheduleStatus,
     pub next_run_at_ms: Option<i64>,
-    pub created_at_ms: i64,
-    pub cancelled_at_ms: Option<i64>,
 }
 
-impl ScheduleItem {
-    pub fn schedule_type(&self) -> &'static str {
-        match &self.timing {
-            ScheduleItemTiming::Once { .. } => "once",
-            ScheduleItemTiming::Recurring { .. } => "recurring",
-        }
-    }
-
-    pub fn one_shot_at_ms(&self) -> Option<i64> {
-        match &self.timing {
-            ScheduleItemTiming::Once { at_ms } => Some(*at_ms),
-            ScheduleItemTiming::Recurring { .. } => None,
-        }
-    }
-
-    pub fn rrule(&self) -> Option<&str> {
-        match &self.timing {
-            ScheduleItemTiming::Once { .. } => None,
-            ScheduleItemTiming::Recurring { rrule } => Some(rrule.as_str()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ScheduleRun {
     pub id: String,
     pub schedule_id: String,
@@ -224,135 +162,45 @@ pub struct ScheduleRun {
 /// Every query here selects its columns in the same order, and sharing the
 /// mapper is what keeps them from drifting when a column is added.
 fn run_from_row(row: &Row) -> rusqlite::Result<ScheduleRun> {
-    let id: String = row.get(0)?;
-    let schedule_id: String = row.get(1)?;
-    let scheduled_for_ms: i64 = row.get(2)?;
-    let started_at_ms: Option<i64> = row.get(3)?;
-    let finished_at_ms: Option<i64> = row.get(4)?;
-    let state_str: String = row.get(5)?;
-    let state = match state_str.as_str() {
-        "pending" => RunState::Pending,
-        "running" => RunState::Running,
-        "completed" => RunState::Completed,
-        "failed" => RunState::Failed,
-        other => {
-            return Err(rusqlite::Error::FromSqlConversionFailure(
-                5,
-                rusqlite::types::Type::Text,
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("unknown run state {other:?}"),
-                )),
-            ));
-        }
-    };
-    let codex_thread_id: Option<String> = row.get(6)?;
-    let error: Option<String> = row.get(7)?;
-
     Ok(ScheduleRun {
-        id,
-        schedule_id,
-        scheduled_for_ms,
-        started_at_ms,
-        finished_at_ms,
-        state,
-        codex_thread_id,
-        error,
+        id: row.get(0)?,
+        schedule_id: row.get(1)?,
+        scheduled_for_ms: row.get(2)?,
+        started_at_ms: row.get(3)?,
+        finished_at_ms: row.get(4)?,
+        state: row.get(5)?,
+        codex_thread_id: row.get(6)?,
+        error: row.get(7)?,
     })
 }
 
 fn schedule_from_row(row: &Row) -> rusqlite::Result<ScheduleItem> {
-    let id: String = row.get(0)?;
-    let name: String = row.get(1)?;
-    let prompt: String = row.get(2)?;
-    let schedule_type: String = row.get(3)?;
-    let one_shot_at_ms: Option<i64> = row.get(4)?;
-    let _dtstart_local: Option<String> = row.get(5)?;
-    let rrule: Option<String> = row.get(6)?;
-    let timezone: String = row.get(7)?;
-    let task_path: String = row.get(8)?;
-    let status_str: String = row.get(9)?;
-    let status = match status_str.as_str() {
-        "active" => ScheduleStatus::Active,
-        "cancelled" => ScheduleStatus::Cancelled,
-        "completed" => ScheduleStatus::Completed,
-        other => {
-            return Err(rusqlite::Error::FromSqlConversionFailure(
-                9,
-                rusqlite::types::Type::Text,
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("unknown schedule status {other:?}"),
-                )),
-            ));
-        }
-    };
-    let next_run_at_ms: Option<i64> = row.get(10)?;
-    let created_at_ms: i64 = row.get(11)?;
-    let cancelled_at_ms: Option<i64> = row.get(12)?;
-
-    let timing = match schedule_type.as_str() {
-        "once" => {
-            let at_ms = one_shot_at_ms.ok_or_else(|| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    4,
-                    rusqlite::types::Type::Null,
-                    Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "one-shot schedule missing one_shot_at_ms",
-                    )),
-                )
-            })?;
-            ScheduleItemTiming::Once { at_ms }
-        }
-        "recurring" => {
-            let rrule = rrule.ok_or_else(|| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    6,
-                    rusqlite::types::Type::Null,
-                    Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "recurring schedule missing rrule",
-                    )),
-                )
-            })?;
-            ScheduleItemTiming::Recurring { rrule }
-        }
-        other => {
+    let kind: String = row.get(3)?;
+    let timing = match (kind.as_str(), row.get(4)?, row.get(5)?) {
+        ("once", Some(at_ms), _) => ScheduleTiming::Once { at_ms },
+        ("recurring", _, Some(rrule)) => ScheduleTiming::Recurring { rrule },
+        _ => {
             return Err(rusqlite::Error::FromSqlConversionFailure(
                 3,
                 rusqlite::types::Type::Text,
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("unknown schedule_type {other:?}"),
-                )),
-            ));
+                format!("invalid schedule timing: type {kind:?} without its time or rule").into(),
+            ))
         }
     };
-
     Ok(ScheduleItem {
-        id,
-        name,
-        prompt,
+        id: row.get(0)?,
+        name: row.get(1)?,
+        prompt: row.get(2)?,
         timing,
-        timezone,
-        task_path,
-        status,
-        next_run_at_ms,
-        created_at_ms,
-        cancelled_at_ms,
+        task_path: row.get(6)?,
+        status: row.get(7)?,
+        next_run_at_ms: row.get(8)?,
     })
 }
 
 pub struct SchedulerDb;
 
 impl SchedulerDb {
-    /// Insert a schedule from timing that has already been validated.
-    ///
-    /// Takes the parsed [`ScheduleTiming`] rather than its five fields spread out:
-    /// this used to be eleven parameters, most of them `&str` or `Option<i64>`, and
-    /// two same-typed arguments in the wrong order is exactly the bug that once
-    /// wrote `event_id = "whatsapp"` into every provider_ref row.
     pub fn create_schedule(
         runtime_db: &RuntimeDb,
         name: &str,
@@ -360,51 +208,39 @@ impl SchedulerDb {
         timing: &ScheduleTiming,
         task_path: &str,
     ) -> Result<ScheduleItem> {
-        let id = format!("sched_{}", Uuid::new_v4().simple());
         let now_ms = Utc::now().timestamp_millis();
-
-        let timing_spec = match timing {
-            ScheduleTiming::Once { at_ms } => ScheduleItemTiming::Once { at_ms: *at_ms },
-            ScheduleTiming::Recurring { rrule, .. } => ScheduleItemTiming::Recurring {
-                rrule: rrule.clone(),
-            },
-        };
-
         let item = ScheduleItem {
-            id: id.clone(),
+            id: format!("sched_{}", Uuid::new_v4().simple()),
             name: name.to_string(),
             prompt: prompt.to_string(),
-            timing: timing_spec,
-            // Cron is evaluated in the host's local time, so the only honest thing
-            // to record is the offset that was in force when it was created. The
-            // column used to hold an IANA name nothing ever read.
-            timezone: Local::now().offset().to_string(),
+            timing: timing.clone(),
             task_path: task_path.to_string(),
             status: ScheduleStatus::Active,
-            next_run_at_ms: Some(timing.first_run_ms()),
-            created_at_ms: now_ms,
-            cancelled_at_ms: None,
+            next_run_at_ms: timing.next_run(now_ms)?,
         };
 
-        // Save into SQLite
         let conn = runtime_db.conn.lock().unwrap();
+        // `timezone` is kept for old readers: cron is evaluated in the host's
+        // local time, and the offset in force at creation is all it can record.
         conn.execute(
             "INSERT INTO schedules (
-                id, name, prompt, schedule_type, one_shot_at_ms, dtstart_local, rrule, timezone, task_path, status, next_run_at_ms, created_at_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                id, name, prompt, schedule_type, one_shot_at_ms, rrule, timezone, task_path, status, next_run_at_ms, created_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 item.id,
                 item.name,
                 item.prompt,
-                item.schedule_type(),
-                item.one_shot_at_ms(),
-                None as Option<String>,
-                item.rrule(),
-                item.timezone,
+                timing.kind(),
+                match timing {
+                    ScheduleTiming::Once { at_ms } => Some(*at_ms),
+                    ScheduleTiming::Recurring { .. } => None,
+                },
+                timing.rrule(),
+                Local::now().offset().to_string(),
                 item.task_path,
-                item.status.as_str(),
+                item.status,
                 item.next_run_at_ms,
-                item.created_at_ms,
+                now_ms,
             ],
         )?;
 
@@ -506,7 +342,7 @@ impl SchedulerDb {
         let conn = runtime_db.conn.lock().unwrap();
         conn.execute(
             "UPDATE schedule_runs SET finished_at_ms = ?1, state = ?2, error = ?3 WHERE id = ?4",
-            params![Utc::now().timestamp_millis(), state.as_str(), error, run_id],
+            params![Utc::now().timestamp_millis(), state, error, run_id],
         )?;
         Ok(())
     }
@@ -543,24 +379,28 @@ impl SchedulerDb {
         }
     }
 
-    pub fn update_next_run(
+    pub fn set_next_run(
         runtime_db: &RuntimeDb,
         schedule_id: &str,
         next_run_at_ms: Option<i64>,
-        status: Option<ScheduleStatus>,
     ) -> Result<()> {
         let conn = runtime_db.conn.lock().unwrap();
-        if let Some(st) = status {
-            conn.execute(
-                "UPDATE schedules SET next_run_at_ms = ?1, status = ?2 WHERE id = ?3",
-                params![next_run_at_ms, st.as_str(), schedule_id],
-            )?;
-        } else {
-            conn.execute(
-                "UPDATE schedules SET next_run_at_ms = ?1 WHERE id = ?2",
-                params![next_run_at_ms, schedule_id],
-            )?;
-        }
+        conn.execute(
+            "UPDATE schedules SET next_run_at_ms = ?1 WHERE id = ?2",
+            params![next_run_at_ms, schedule_id],
+        )?;
+        Ok(())
+    }
+
+    /// Retire a schedule that will not fire again. A cancellation that landed
+    /// while its last run was in flight stays a cancellation.
+    pub fn complete_schedule(runtime_db: &RuntimeDb, schedule_id: &str) -> Result<()> {
+        let conn = runtime_db.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE schedules SET status = 'completed', next_run_at_ms = NULL
+             WHERE id = ?1 AND status = 'active'",
+            params![schedule_id],
+        )?;
         Ok(())
     }
 }
@@ -582,8 +422,8 @@ mod tests {
         let rdb = test_runtime_db();
         let conn = rdb.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO schedules (id, name, prompt, schedule_type, timezone, task_path, status, created_at_ms)
-             VALUES ('s1', 'name', 'prompt', 'recurring', 'UTC', 'path', 'bogus_status', 1000)",
+            "INSERT INTO schedules (id, name, prompt, schedule_type, rrule, timezone, task_path, status, created_at_ms)
+             VALUES ('s1', 'name', 'prompt', 'recurring', 'EVERY_1H', 'UTC', 'path', 'bogus_status', 1000)",
             [],
         ).unwrap();
         drop(conn);

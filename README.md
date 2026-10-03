@@ -73,6 +73,7 @@ Official release assets are `tera-x86_64-unknown-linux-gnu`, `tera-aarch64-unkno
   MEMORIES/                 memory tree, a git repository tera commits to
   .agents/skills/           skills you and the agent write, never touched by tera
   .codex-home/              private CODEX_HOME: user config, auth symlink, tera's skills
+  .codex-home/contrib/      optional skills on offer, not loaded until installed
   .runtime/                 socket, state.sqlite3, whatsapp_session.db
   history/                  history.sqlite3, jsonl/, assets/, backups/
   logs/                     daily log, pruned after 14 days
@@ -82,6 +83,8 @@ Official release assets are `tera-x86_64-unknown-linux-gnu`, `tera-aarch64-unkno
 Generated files carry an HTML comment marker and are rewritten every start, so an improved template reaches an existing workspace. Edit one by hand and Tera backs your copy up to `<file>.md.user-backup` and installs its own, so put your instructions in `PERSONA.md`, which is written once and left alone.
 
 Every package in `data/skills/` is discovered at build time, with no individual Rust registration, and installed under `<workspace>/.codex-home/skills/tera/`. Codex scans that tree because it scans CODEX_HOME, and Tera owns it outright, so the directory is deleted and rewritten on every start. That is the whole update story. Skills you write go in `.agents/skills/`, which Tera never touches, and copying one of Tera's out to that directory is how you keep a version of your own. The nightly memory pass also compacts repeated technical work into one candidate for a new or improved skill. It only suggests. Implementation waits for approval, and Codex delegates when useful.
+
+Optional skills live in `data/contrib/`. They are built in the same way but not installed. Tera writes them to `<workspace>/.codex-home/contrib/`, where Codex does not look. Ask the assistant for one in chat and it copies the skill into `.codex-home/skills/contrib/`. From then on Tera updates that copy on every start, and deleting the folder uninstalls it. The first one is `health`, which syncs Garmin Connect and Bluetooth health devices into a local database and gives briefs and trends.
 
 The audio skill uses [Aloud](https://github.com/isala404/aloud) locally for Q8 Audio8 speech recognition and synthesis. Setup verifies a pinned Aloud release under `<workspace>/.runtime/aloud/`. The exact Q8 GGUF models resolve through Aloud's Hugging Face support and remain cached for offline use. It transcribes audio or video soundtracks, creates WAV speech with the embedded voices, and can encode Ogg Opus replies that Tera sends as real WhatsApp voice notes. Nothing is billed per minute because inference stays on the machine.
 

@@ -6,58 +6,29 @@
 //! accept.
 
 use crate::config::Config;
-use crate::runtime::RuntimeDb;
-use anyhow::Result;
-use chrono::Utc;
+use crate::runtime::MainThreadState;
 use std::fs;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThreadDecision {
     /// Keep the conversation where it is; resume it first if it is not loaded.
     Continue { thread_id: String },
-    /// Start a fresh thread. The prompt cache is cold or the model changed, so
-    /// there is nothing left to reuse.
+    /// Start a fresh thread. The prompt cache is cold, so there is nothing left
+    /// to reuse.
     Rotate { reason: String },
 }
 
 pub struct ThreadRouter;
 
 impl ThreadRouter {
-    pub fn decide(runtime_db: &RuntimeDb, current_model_id: &str) -> Result<ThreadDecision> {
-        Ok(Self::decide_at(
-            runtime_db
-                .get_main_thread()?
-                .as_ref()
-                .map(|s| PersistedThread {
-                    thread_id: s.thread_id.clone(),
-                    estimated_cache_warm_until_ms: s.estimated_cache_warm_until_ms,
-                    model_id: s.model_id.clone(),
-                }),
-            current_model_id,
-            Utc::now().timestamp_millis(),
-        ))
-    }
-
-    /// The policy itself, with time and state passed in so it is testable.
-    fn decide_at(
-        persisted: Option<PersistedThread>,
-        current_model_id: &str,
-        now_ms: i64,
-    ) -> ThreadDecision {
+    /// A model change needs no rotation of its own: resuming applies the
+    /// current model to the thread and keeps its context.
+    pub fn decide(persisted: Option<&MainThreadState>, now_ms: i64) -> ThreadDecision {
         let Some(state) = persisted else {
             return ThreadDecision::Rotate {
                 reason: "no conversation thread recorded yet".to_string(),
             };
         };
-
-        if !current_model_id.is_empty() && state.model_id != current_model_id {
-            return ThreadDecision::Rotate {
-                reason: format!(
-                    "model changed from {} to {current_model_id}",
-                    state.model_id
-                ),
-            };
-        }
 
         if now_ms >= state.estimated_cache_warm_until_ms {
             return ThreadDecision::Rotate {
@@ -69,7 +40,7 @@ impl ThreadRouter {
         }
 
         ThreadDecision::Continue {
-            thread_id: state.thread_id,
+            thread_id: state.thread_id.clone(),
         }
     }
 
@@ -113,13 +84,6 @@ impl ThreadRouter {
     }
 }
 
-#[derive(Debug, Clone)]
-struct PersistedThread {
-    thread_id: String,
-    estimated_cache_warm_until_ms: i64,
-    model_id: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,25 +91,27 @@ mod tests {
     use crate::codex::CACHE_TTL_MS as TTL;
     const NOW: i64 = 1_786_962_664_000;
 
-    fn persisted(warm_until_ms: i64, model: &str) -> Option<PersistedThread> {
-        Some(PersistedThread {
+    fn persisted(warm_until_ms: i64) -> MainThreadState {
+        MainThreadState {
             thread_id: "thread_real".to_string(),
+            started_at_ms: NOW - TTL,
+            last_activity_at_ms: warm_until_ms - TTL,
             estimated_cache_warm_until_ms: warm_until_ms,
-            model_id: model.to_string(),
-        })
+            model_id: "model-a".to_string(),
+        }
     }
 
     #[test]
     fn test_first_ever_turn_starts_a_thread() {
         assert!(matches!(
-            ThreadRouter::decide_at(None, "model-a", NOW),
+            ThreadRouter::decide(None, NOW),
             ThreadDecision::Rotate { .. }
         ));
     }
 
     #[test]
     fn test_warm_persisted_thread_is_continued() {
-        let decision = ThreadRouter::decide_at(persisted(NOW + TTL, "model-a"), "model-a", NOW);
+        let decision = ThreadRouter::decide(Some(&persisted(NOW + TTL)), NOW);
         assert_eq!(
             decision,
             ThreadDecision::Continue {
@@ -159,23 +125,7 @@ mod tests {
     /// conversation the user can still see.
     #[test]
     fn test_cold_thread_is_rotated() {
-        let decision = ThreadRouter::decide_at(persisted(NOW - 1, "model-a"), "model-a", NOW);
+        let decision = ThreadRouter::decide(Some(&persisted(NOW - 1)), NOW);
         assert!(matches!(decision, ThreadDecision::Rotate { .. }));
-    }
-
-    #[test]
-    fn test_model_change_rotates_even_when_warm() {
-        let decision = ThreadRouter::decide_at(persisted(NOW + TTL, "model-a"), "model-b", NOW);
-        match decision {
-            ThreadDecision::Rotate { reason } => assert!(reason.contains("model-b"), "{reason}"),
-            other => panic!("expected rotation, got {other:?}"),
-        }
-    }
-
-    /// An unknown current model is not evidence of a change.
-    #[test]
-    fn test_unknown_model_does_not_force_rotation() {
-        let decision = ThreadRouter::decide_at(persisted(NOW + TTL, "model-a"), "", NOW);
-        assert!(matches!(decision, ThreadDecision::Continue { .. }));
     }
 }

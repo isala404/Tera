@@ -174,79 +174,27 @@ impl SecretStore {
         Ok(removed)
     }
 
-    fn pending_path(&self) -> PathBuf {
-        self.path.with_file_name("pending_secret.json")
-    }
-
     /// Claim the owner's next message as the value for `name`.
     pub fn request(&self, name: &str, now_ms: i64) -> Result<()> {
         let name = validate_name(name)?;
         let mut contents = self.load()?;
-        let req = PendingRequest {
-            name: name.clone(),
+        contents.pending = Some(PendingRequest {
+            name,
             requested_at_ms: now_ms,
-        };
-        contents.pending = Some(req.clone());
-        self.save(&contents)?;
-
-        let parent = self
-            .pending_path()
-            .parent()
-            .context("Secret store path has no parent directory")?
-            .to_path_buf();
-        fs::create_dir_all(&parent)?;
-        let mut serialized = serde_json::to_vec_pretty(&req)?;
-        serialized.push(b'\n');
-        crate::runtime::write_atomic(&self.pending_path(), &serialized, 0o600)?;
-        Ok(())
+        });
+        self.save(&contents)
     }
 
+    /// An unreadable store is an error, not "nothing pending": the next message
+    /// might be the credential, and passing it through would put it in history.
     pub fn pending(&self, now_ms: i64) -> Result<Option<PendingRequest>> {
-        let p_path = self.pending_path();
-        if p_path.exists() {
-            match fs::read_to_string(&p_path) {
-                Ok(raw) => match serde_json::from_str::<PendingRequest>(&raw) {
-                    Ok(req) => {
-                        if !req.expired(now_ms) {
-                            return Ok(Some(req));
-                        }
-                    }
-                    Err(e) => {
-                        bail!("Pending credential storage {:?} is corrupted: {e}", p_path);
-                    }
-                },
-                Err(e) => {
-                    bail!("Cannot read pending credential storage {:?}: {e}", p_path);
-                }
-            }
-        }
-
-        match self.load() {
-            Ok(contents) => Ok(contents.pending.filter(|r| !r.expired(now_ms))),
-            Err(e) => {
-                if self.path.exists() {
-                    bail!("Secret store {:?} is unreadable: {e}", self.path);
-                }
-                Ok(None)
-            }
-        }
-    }
-
-    pub fn has_pending(&self, now_ms: i64) -> bool {
-        match self.pending(now_ms) {
-            Ok(Some(_)) => true,
-            Ok(None) => false,
-            Err(_) => true,
-        }
+        Ok(self.load()?.pending.filter(|r| !r.expired(now_ms)))
     }
 
     pub fn clear_pending(&self) -> Result<()> {
-        let _ = fs::remove_file(self.pending_path());
-        if let Ok(mut contents) = self.load() {
-            if contents.pending.is_some() {
-                contents.pending = None;
-                self.save(&contents)?;
-            }
+        let mut contents = self.load()?;
+        if contents.pending.take().is_some() {
+            self.save(&contents)?;
         }
         Ok(())
     }
@@ -341,6 +289,28 @@ impl SecretStore {
         expanded
     }
 
+    /// `(value, name)` for every value long enough to redact safely.
+    fn redactable(&self) -> Vec<(String, String)> {
+        let Ok(contents) = self.load() else {
+            return Vec::new();
+        };
+        contents
+            .secrets
+            .into_iter()
+            .filter(|(_, secret)| secret.value.len() >= MIN_REDACTABLE_LEN)
+            .map(|(name, secret)| (secret.value, name))
+            .collect()
+    }
+
+    /// The values [`SecretStore::redact`] acts on, for callers that must hold
+    /// back a partial match across streamed chunks.
+    pub fn redactable_values(&self) -> Vec<String> {
+        self.redactable()
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect()
+    }
+
     /// Replace every stored value in `text` with its name.
     ///
     /// The backstop, not the mechanism. Capture keeps secrets out of the model's
@@ -350,16 +320,7 @@ impl SecretStore {
     /// Longest values first, so a secret that contains another one is not left
     /// half-rewritten.
     pub fn redact(&self, text: &str) -> String {
-        let Ok(contents) = self.load() else {
-            return text.to_string();
-        };
-
-        let mut values: Vec<(String, String)> = contents
-            .secrets
-            .into_iter()
-            .filter(|(_, secret)| secret.value.len() >= MIN_REDACTABLE_LEN)
-            .map(|(name, secret)| (secret.value, name))
-            .collect();
+        let mut values = self.redactable();
         values.sort_by_key(|(value, _)| std::cmp::Reverse(value.len()));
 
         let mut redacted = text.to_string();
@@ -681,7 +642,7 @@ mod tests {
         let store2 = SecretStore::new(dir.path().join("secrets.json"));
 
         store1.request("API_KEY", 0).unwrap();
-        assert!(store2.has_pending(0));
+        assert!(store2.pending(0).unwrap().is_some());
 
         let outcome = store2.capture("my-secret-key-12345", 100).unwrap();
         assert_eq!(
@@ -690,8 +651,8 @@ mod tests {
                 name: "API_KEY".to_string(),
             }
         );
-        assert!(!store1.has_pending(100));
-        assert!(!store2.has_pending(100));
+        assert!(store1.pending(100).unwrap().is_none());
+        assert!(store2.pending(100).unwrap().is_none());
     }
 
     #[test]
@@ -700,8 +661,7 @@ mod tests {
         let path = dir.path().join("secrets.json");
         std::fs::write(&path, "CORRUPT NOT JSON").unwrap();
 
-        // Corrupt store must fail closed: has_pending returns true, capture returns Rejected
-        assert!(store.has_pending(0));
+        assert!(store.pending(0).is_err());
         let capture = store.capture("potential-secret-leak", 0).unwrap();
         assert!(matches!(capture, Capture::Rejected { .. }));
     }
