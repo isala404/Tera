@@ -74,6 +74,12 @@ impl ConversationState {
         }
     }
 
+    /// A sent message ends composing. WhatsApp often sends no Paused after it,
+    /// which left every burst waiting out MAX_BURST_WAIT instead of the quiet period.
+    fn message_arrived(&mut self, sender: &str) {
+        self.composing_since.remove(jid_user(sender));
+    }
+
     fn remaining_wait(&mut self, sender: &str) -> Option<Duration> {
         let user = jid_user(sender);
         let composing = self
@@ -300,6 +306,7 @@ impl TurnEngine {
             }
             Route::JoinBurst => {
                 let mut state = self.state.lock().await;
+                state.message_arrived(&sender);
                 if let Some(burst) = state.bursts.get_mut(&sender) {
                     let turn_id = burst.turn_id.clone();
                     burst.push(conv_ev);
@@ -472,6 +479,7 @@ impl TurnEngine {
             {
                 warn!("Could not record turn {turn_id}; a crash now would lose it: {e:?}");
             }
+            state.message_arrived(sender);
             state
                 .bursts
                 .insert(sender.to_string(), MessageBurst::new(turn_id, event));
@@ -923,6 +931,20 @@ mod presence_tests {
 
         state.update_presence("owner@s.whatsapp.net", InboundPresenceKind::RecordingAudio);
         assert_eq!(state.remaining_wait("owner:26@lid"), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn test_a_message_ends_composing_without_waiting_for_paused() {
+        let mut state = ConversationState::default();
+        state.update_presence("owner@s.whatsapp.net", InboundPresenceKind::Typing);
+        state.message_arrived("owner:26@lid");
+        state.bursts.insert(
+            "owner:26@lid".into(),
+            MessageBurst::new("turn1".into(), event()),
+        );
+
+        let remaining = state.remaining_wait("owner:26@lid").unwrap();
+        assert!(remaining > PRESENCE_POLL_INTERVAL && remaining <= BURST_QUIET_PERIOD);
     }
 
     #[test]
