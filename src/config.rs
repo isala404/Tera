@@ -117,6 +117,8 @@ impl Config {
             "features.multi_agent=true".to_string(),
             format!("projects.{workspace}.trust_level=\"trusted\""),
             "sandbox_workspace_write.network_access=true".to_string(),
+            // The self-update skill runs from a Codex shell and needs this binary.
+            format!("shell_environment_policy.set.TERA_BIN={command}"),
             format!("mcp_servers.tera.command={command}"),
             format!("mcp_servers.tera.args={args}"),
             "mcp_servers.tera.required=true".to_string(),

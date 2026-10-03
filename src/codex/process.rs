@@ -435,16 +435,14 @@ impl CodexProcessManager {
     /// default marker is `.git`, which the workspace does not have. Without this
     /// a task thread rooted in `tasks/memory-compaction` searches that directory
     /// and stops, so the owner's own skills go missing from every scheduled run.
+    ///
+    /// The worker id goes in as a dotted key. A nested `mcp_servers.tera` table
+    /// replaces the server's command from the CLI overrides, and Codex then
+    /// refuses the thread with "invalid transport".
     fn thread_params(opts: &ThreadOptions) -> Value {
         let mut config_obj = json!({ "project_root_markers": [".codex-home"] });
         if let Some(worker_id) = &opts.worker_id {
-            config_obj["mcp_servers"] = json!({
-                "tera": {
-                    "env": {
-                        "TERA_WORKER_ID": worker_id
-                    }
-                }
-            });
+            config_obj["mcp_servers.tera.env.TERA_WORKER_ID"] = json!(worker_id);
         }
         json!({
             "cwd": opts.cwd.to_string_lossy(),
@@ -1120,6 +1118,19 @@ mod tests {
 
         assert_eq!(resumed["config"]["project_root_markers"][0], ".codex-home");
         assert_eq!(resumed["config"]["model_reasoning_effort"], "medium");
+    }
+
+    #[test]
+    fn test_a_worker_thread_names_itself_without_redefining_the_mcp_server() {
+        let params = CodexProcessManager::thread_params(&ThreadOptions::with_worker(
+            "/workspace/tasks/x",
+            "schedule:s1",
+        ));
+        assert_eq!(
+            params["config"]["mcp_servers.tera.env.TERA_WORKER_ID"],
+            "schedule:s1"
+        );
+        assert!(params["config"].get("mcp_servers").is_none());
     }
 
     #[test]

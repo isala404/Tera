@@ -2,10 +2,10 @@
 set -eu
 
 workspace=$(CDPATH= cd -- "${CODEX_HOME:-$PWD/.codex-home}/.." && pwd -P)
-tera_bin=$(sed -n '/\[mcp_servers\.tera\]/,/^\[/p' "$workspace/.codex-home/config.toml" | awk -F '"' '/^[[:space:]]*command = / { print $2; exit }')
+tera_bin=${TERA_BIN:-}
 
 if [ -z "$tera_bin" ] || [ ! -x "$tera_bin" ]; then
-    echo "Cannot find the Tera binary from $workspace/.codex-home/config.toml" >&2
+    echo "TERA_BIN does not name the Tera binary. Tera sets it for Codex shells." >&2
     exit 1
 fi
 

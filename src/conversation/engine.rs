@@ -496,16 +496,16 @@ impl TurnEngine {
             .unwrap_or_else(|| format!("turn_{}", Uuid::new_v4().simple()));
 
         // Durable before the quiet period, not after: a crash while buffering
-        // still leaves a turn Phoenix can see and answer.
-        if let Err(e) = self
-            .runtime_db
-            .start_turn(&turn_id, chat_jid, last_provider_msg_id)
-        {
-            warn!("Could not record turn {turn_id}; a crash now would lose it: {e:?}");
-        }
-
+        // still leaves a turn Phoenix can see and answer. Under the same lock as
+        // the burst, so a finishing turn with this id sees the reopen.
         {
             let mut state = self.state.lock().await;
+            if let Err(e) = self
+                .runtime_db
+                .start_turn(&turn_id, chat_jid, last_provider_msg_id)
+            {
+                warn!("Could not record turn {turn_id}; a crash now would lose it: {e:?}");
+            }
             state
                 .bursts
                 .insert(sender.to_string(), MessageBurst::new(turn_id, event));
@@ -650,7 +650,16 @@ impl TurnEngine {
     ) -> Result<()> {
         let turn_id = burst.turn_id.clone();
         let outcome = self.execute_turn(sender, burst, last_provider_msg_id).await;
-        self.state.lock().await.running_turn = None;
+        let reopened = {
+            let mut state = self.state.lock().await;
+            state.running_turn = None;
+            state.bursts.values().any(|burst| burst.turn_id == turn_id)
+        };
+        // A message that missed the steer reopened this turn and is waiting on
+        // it. Closing the row now would leave that message without a turn.
+        if reopened {
+            return outcome;
+        }
 
         // Closed either way. This process is still alive, so a failure here is a
         // logged failure, not something for Phoenix to resurrect at a restart

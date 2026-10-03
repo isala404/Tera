@@ -1,7 +1,7 @@
 [
   {
     "name": "send_message",
-    "description": "Send {{OWNER}} a WhatsApp message. The only way to reach them. Returned text is just a fallback in the chat and goes nowhere from a scheduled task. Plain text, no markdown. Text like a friend, short, separate thoughts in separate messages, and don't repeat what you already sent. Transcript lines carry message ids, so pass one as reply_to only when a bare message would be ambiguous. To include a credential you can't see, write ${NAME} where it belongs, e.g. client_id=${SPOTIFY_CLIENT_ID}, and Tera fills it in on the way out while history keeps the placeholder.",
+    "description": "Send {{OWNER}} a WhatsApp message. The only way to reach them. Returned text is just a fallback in the chat and goes nowhere from a scheduled task. Plain text, no markdown, no dash or numbered lists. Text like a friend, short, separate thoughts in separate messages, and don't repeat what you already sent. If the reply needs a web lookup or digging around, call this first with one short line saying what you're on. Transcript lines carry message ids, so pass one as reply_to only when a bare message would be ambiguous. To include a credential you can't see, write ${NAME} where it belongs, e.g. client_id=${SPOTIFY_CLIENT_ID}, and Tera fills it in on the way out while history keeps the placeholder.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -17,7 +17,7 @@
   },
   {
     "name": "react",
-    "description": "React to a message with an emoji. Often the whole reply, for acknowledging or agreeing. Use a reaction or a message to acknowledge, not both.",
+    "description": "React to a message with an emoji. Often the whole reply, for acknowledging or agreeing. A reaction is a whole reply, so never follow it with a message that says the same thing.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -29,7 +29,7 @@
   },
   {
     "name": "schedule",
-    "description": "Schedule a one-off or recurring background task. Use this for anything time-based, never cron or launchd. Times are this machine's local time. The run starts on a fresh thread that sees only your prompt and the recent chat, so write `prompt` as standalone instructions: what to do, where to look, and when it's worth messaging {{OWNER}}. If the timing depends on when something actually happens, schedule a single run from that event and reschedule when it happens again, instead of a fixed recurring clock. The response echoes the first run, check it's what you meant.",
+    "description": "Schedule a one-off or recurring background task. Use this for anything time-based, never cron or launchd. Times are this machine's local time. The run starts on a fresh thread that sees only your prompt and the recent chat, so write `prompt` as standalone instructions: what to do, where to look, and when it's worth messaging {{OWNER}}. If the timing depends on when something actually happens, schedule a single run from that event and reschedule when it happens again, instead of a fixed recurring clock. Never poll. A reminder is a single run at the exact time. The response echoes the first run, check it's what you meant.",
     "inputSchema": {
       "type": "object",
       "properties": {

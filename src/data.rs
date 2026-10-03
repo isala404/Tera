@@ -442,7 +442,7 @@ mod tests {
         assert!(PHOENIX_RECOVERY_PROMPT.contains("complete scope"));
         assert!(PHOENIX_RECOVERY_PROMPT.contains("Do not revive older work"));
         assert!(PHOENIX_RECOVERY_PROMPT.contains("Do not rebuild, deploy, update"));
-        assert!(PHOENIX_RECOVERY_PROMPT.contains("Always say that you are back"));
+        assert!(PHOENIX_RECOVERY_PROMPT.contains("Never announce that you're back"));
         assert!(PHOENIX_RECOVERY_PROMPT.contains("Do not use a canned sentence"));
     }
 
@@ -493,13 +493,12 @@ mod tests {
         // The acknowledgement is the beat that gets dropped first, because a
         // model that already knows the answer to the next step reads "speak when
         // you have an answer" as permission to stay silent until it does.
-        assert!(WORKSPACE_AGENTS.contains("before the first tool call"));
-        assert!(WORKSPACE_AGENTS.contains("a line or two"));
-        assert!(WORKSPACE_AGENTS.contains("use `send_message` while working"));
+        assert!(WORKSPACE_AGENTS.contains("before reading anything"));
+        assert!(WORKSPACE_AGENTS.contains("a lookup, browsing or digging around"));
+        assert!(WORKSPACE_AGENTS.contains("While working, message only"));
         assert!(WORKSPACE_AGENTS.contains("meaningful boundary"));
-        assert!(WORKSPACE_AGENTS.contains("Do not narrate commands"));
-        assert!(WORKSPACE_AGENTS.contains("load every detail at the front"));
-        assert!(WORKSPACE_AGENTS.contains("large final message"));
+        assert!(WORKSPACE_AGENTS.contains("Never narrate commands"));
+        assert!(WORKSPACE_AGENTS.contains("huge final message"));
     }
 
     #[test]

@@ -264,82 +264,92 @@ impl DaemonRpcServer {
                 };
                 let reply_target = reply_target.as_ref();
 
-                let (provider_msg_id, attachments, event_id, occurred_at_ms) =
-                    if let Some((media_type, media_path_str)) = attachment {
+                // Everything that can fail before the send happens before it. Once
+                // the message is out it counts as sent, whatever happens to the
+                // bookkeeping, or the agent retries and the owner gets it twice.
+                let media = match attachment {
+                    Some((media_type, media_path_str)) => {
                         let path = resolve_media_path(&self.config.workspace_dir, media_path_str)?;
-                        let provider_msg_id = self
-                            .transport
+                        let data = std::fs::read(&path)
+                            .with_context(|| format!("Failed to read media from {:?}", path))?;
+                        Some((media_type, path, data))
+                    }
+                    None => None,
+                };
+
+                let provider_msg_id = match &media {
+                    Some((media_type, path, _)) => {
+                        self.transport
                             .send_media(
                                 &recipient,
                                 media_type,
-                                &path,
+                                path,
                                 outgoing.as_deref(),
                                 reply_target,
                             )
-                            .await?;
-                        let data = std::fs::read(&path)
-                            .with_context(|| format!("Failed to read media from {:?}", path))?;
-                        let filename = path
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("attachment");
-                        let event_id = format!("m_{}", Uuid::new_v4().simple());
-                        let occurred_at_ms = Utc::now().timestamp_millis();
-                        let (_full, relative_path) = AssetStorage::save_attachment(
-                            &self.config,
-                            &event_id,
-                            occurred_at_ms,
-                            filename,
-                            &data,
-                        )?;
-                        let mime_type =
-                            Some(crate::transport::whatsapp::mime_for(media_type, &path));
-                        let att = Attachment {
-                            id: None,
-                            event_id: event_id.clone(),
-                            position: 0,
-                            media_type: media_type.to_string(),
-                            relative_path,
-                            mime_type,
-                            original_name: Some(filename.to_string()),
-                        };
-                        (provider_msg_id, vec![att], event_id, occurred_at_ms)
-                    } else {
-                        let provider_msg_id = self
-                            .transport
+                            .await?
+                    }
+                    None => {
+                        self.transport
                             .send_text(
                                 &recipient,
                                 outgoing.as_deref().unwrap_or_default(),
                                 reply_target,
                             )
-                            .await?;
-                        let event_id = format!("m_{}", Uuid::new_v4().simple());
-                        let occurred_at_ms = Utc::now().timestamp_millis();
-                        (provider_msg_id, vec![], event_id, occurred_at_ms)
-                    };
-
-                let event = ConversationEvent::message(
-                    event_id.clone(),
-                    occurred_at_ms,
-                    "assistant",
-                    authored,
-                    reply_to.map(str::to_string),
-                    self.session.turn(worker_id),
-                    attachments,
-                );
-
-                let provider_ref =
-                    ProviderRef::whatsapp(&event_id, &provider_msg_id, &recipient, true);
-
-                self.history_db.insert_event_full(
-                    event,
-                    Some(&provider_ref),
-                    Some(("sent", None)),
-                )?;
-
+                            .await?
+                    }
+                };
                 // Tell the turn engine the agent already spoke, so it does not
                 // deliver the final agent text on top of this.
                 self.session.record_send(worker_id);
+
+                let event_id = format!("m_{}", Uuid::new_v4().simple());
+                let occurred_at_ms = Utc::now().timestamp_millis();
+                let recorded = (|| -> Result<()> {
+                    let mut attachments = Vec::new();
+                    if let Some((media_type, path, data)) = &media {
+                        let filename = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("attachment");
+                        let (_full, relative_path) = AssetStorage::save_attachment(
+                            &self.config,
+                            &event_id,
+                            occurred_at_ms,
+                            filename,
+                            data,
+                        )?;
+                        attachments.push(Attachment {
+                            id: None,
+                            event_id: event_id.clone(),
+                            position: 0,
+                            media_type: media_type.to_string(),
+                            relative_path,
+                            mime_type: Some(crate::transport::whatsapp::mime_for(media_type, path)),
+                            original_name: Some(filename.to_string()),
+                        });
+                    }
+                    let event = ConversationEvent::message(
+                        event_id.clone(),
+                        occurred_at_ms,
+                        "assistant",
+                        authored,
+                        reply_to.map(str::to_string),
+                        self.session.turn(worker_id),
+                        attachments,
+                    );
+                    let provider_ref =
+                        ProviderRef::whatsapp(&event_id, &provider_msg_id, &recipient, true);
+                    self.history_db.insert_event_full(
+                        event,
+                        Some(&provider_ref),
+                        Some(("sent", None)),
+                    )?;
+                    Ok(())
+                })();
+                if let Err(error) = recorded {
+                    error!("Sent {provider_msg_id} but could not record it in history: {error:?}");
+                }
 
                 Ok(json!({
                     "status": "sent",

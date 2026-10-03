@@ -19,7 +19,7 @@ use crate::version::BuildInfo;
 use anyhow::{bail, Result};
 use serde_json::json;
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -39,7 +39,6 @@ pub struct Phoenix {
     codex: CodexSupervisor,
     session: ConversationSession,
     secrets: SecretStore,
-    attempts_counted: OnceLock<()>,
 }
 
 impl Phoenix {
@@ -60,28 +59,30 @@ impl Phoenix {
             codex,
             session,
             secrets,
-            attempts_counted: OnceLock::new(),
         }
     }
 
-    /// Run once after every start. With no prior chat there is nowhere to speak,
-    /// which is normal on a brand-new workspace.
+    /// Run once after every start, on the turns `interrupted_turns` found. A
+    /// clean restart with nothing in flight says nothing, and with no prior chat
+    /// there is nowhere to speak.
     pub async fn run(
         &self,
         crashed: Option<CrashMark>,
         update: Option<UpdateNotice>,
+        pending: &[ConversationTurn],
     ) -> Result<()> {
-        let mut pending = self.runtime_db.unfinished_turns()?;
-        // Counted before the model runs and once per start: a recovery that
-        // takes the daemon down never gets back here to count itself, and the
-        // caller's in-process retries are for a transport still connecting.
-        if self.attempts_counted.set(()).is_ok() {
-            for turn in &pending {
-                self.runtime_db.record_turn_attempt(&turn.turn_id)?;
-            }
-            pending = self.runtime_db.unfinished_turns()?;
+        let restart_context_path = self.config.runtime_dir().join("restart-context.md");
+        let restart_context = std::fs::read_to_string(&restart_context_path).ok();
+        if !worth_a_turn(
+            crashed.as_ref(),
+            update.as_ref(),
+            restart_context.as_deref(),
+            pending,
+        ) {
+            info!("Clean restart with nothing in flight; nothing to report");
+            return Ok(());
         }
-        let Some(chat_jid) = self.chat_to_speak_into(&pending)? else {
+        let Some(chat_jid) = self.chat_to_speak_into(pending)? else {
             info!("Startup assistant has no previous conversation yet");
             return Ok(());
         };
@@ -97,18 +98,20 @@ impl Phoenix {
             .as_ref()
             .is_some_and(|mark| mark.consecutive >= MAX_CONSECUTIVE_CRASHES);
         let (recoverable, abandoned): (Vec<_>, Vec<_>) = pending
-            .into_iter()
+            .iter()
+            .cloned()
             .partition(|turn| !over_budget && turn.attempts <= MAX_TURN_ATTEMPTS);
 
-        self.recover(
-            &chat_jid,
-            crashed.as_ref(),
-            update.as_ref(),
-            &recoverable,
-            &abandoned,
-            over_budget,
-        )
-        .await?;
+        let facts = serde_json::to_string_pretty(&json!({
+            "time": chrono::Local::now().to_rfc3339(),
+            "previous_exit": crashed,
+            "update": update,
+            "running_build": BuildInfo::current(),
+            "recovery_disabled_by_crash_budget": over_budget,
+            "restart_context": restart_context,
+        }))?;
+        self.recover(&chat_jid, &facts, &recoverable, &abandoned)
+            .await?;
 
         for turn in &recoverable {
             self.runtime_db
@@ -119,8 +122,7 @@ impl Phoenix {
                 .finish_turn(&turn.turn_id, TurnState::Abandoned)?;
         }
 
-        let restart_context = self.config.runtime_dir().join("restart-context.md");
-        if let Err(error) = std::fs::remove_file(&restart_context) {
+        if let Err(error) = std::fs::remove_file(&restart_context_path) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 warn!("Could not clear startup context: {error}");
             }
@@ -178,30 +180,18 @@ impl Phoenix {
     async fn recover(
         &self,
         chat_jid: &str,
-        crashed: Option<&CrashMark>,
-        update: Option<&UpdateNotice>,
+        facts: &str,
         recoverable: &[ConversationTurn],
         abandoned: &[ConversationTurn],
-        over_budget: bool,
     ) -> Result<()> {
         let pending_request = self.render_requests(recoverable)?;
         let abandoned_request = self.render_requests(abandoned)?;
-        let restart_context =
-            std::fs::read_to_string(self.config.runtime_dir().join("restart-context.md")).ok();
-        let facts = serde_json::to_string_pretty(&json!({
-            "time": chrono::Local::now().to_rfc3339(),
-            "previous_exit": crashed,
-            "update": update,
-            "running_build": BuildInfo::current(),
-            "recovery_disabled_by_crash_budget": over_budget,
-            "restart_context": restart_context,
-        }))?;
 
         let prompt = data::render(
             data::PHOENIX_RECOVERY_PROMPT,
             &[
                 ("OWNER", &self.config.owner_name),
-                ("STARTUP_FACTS", &facts),
+                ("STARTUP_FACTS", facts),
                 ("PENDING_REQUEST", &pending_request),
                 ("ABANDONED_REQUEST", &abandoned_request),
             ],
@@ -240,11 +230,18 @@ impl Phoenix {
             .codex
             .start_task_thread(&self.config.workspace_dir, WORKER_ID)
             .await?;
-        let summary = self.codex.run_task_turn(&thread_id, prompt).await?;
-        let authored = self.secrets.redact(&summary);
+        let summary = self.codex.run_task_turn(&thread_id, prompt).await;
+        // Anything already sent is delivered, even if the turn failed after it.
+        // Retrying the turn would only say it all again.
+        if self.session.sends(WORKER_ID) > sends_before {
+            return Ok(());
+        }
+        let authored = self.secrets.redact(&summary?);
         info!("Startup assistant finished: {authored}");
 
-        if self.session.sends(WORKER_ID) > sends_before {
+        // Only an interrupted request is owed an answer. Otherwise silence is a
+        // valid outcome, and the final text is the model's notes, not a message.
+        if recoverable.is_empty() && abandoned.is_empty() {
             return Ok(());
         }
         if authored.trim().is_empty() {
@@ -310,5 +307,46 @@ impl Phoenix {
             .flatten()
             .and_then(|event_id| self.history_db.get_event(&event_id).ok().flatten())
             .and_then(|event| event.text().map(str::to_string))
+    }
+}
+
+/// The turns the previous process accepted and never finished, each charged one
+/// attempt. Call it once per start and before any message is accepted, or a live
+/// turn joins the set and gets answered twice.
+pub fn interrupted_turns(runtime_db: &RuntimeDb) -> Result<Vec<ConversationTurn>> {
+    for turn in runtime_db.unfinished_turns()? {
+        runtime_db.record_turn_attempt(&turn.turn_id)?;
+    }
+    runtime_db.unfinished_turns()
+}
+
+/// A restart earns a model turn only when it left something behind: a crash, an
+/// update, a restart someone asked for, or a turn it cut off.
+fn worth_a_turn(
+    crashed: Option<&CrashMark>,
+    update: Option<&UpdateNotice>,
+    restart_context: Option<&str>,
+    pending: &[ConversationTurn],
+) -> bool {
+    crashed.is_some() || update.is_some() || restart_context.is_some() || !pending.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_a_clean_idle_restart_is_not_worth_a_turn() {
+        assert!(!worth_a_turn(None, None, None, &[]));
+    }
+
+    #[test]
+    fn test_a_requested_restart_is_worth_a_turn() {
+        assert!(worth_a_turn(
+            None,
+            None,
+            Some("owner asked to switch model"),
+            &[]
+        ));
     }
 }

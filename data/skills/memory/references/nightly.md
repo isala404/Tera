@@ -4,7 +4,7 @@ Nobody is waiting. Work directly in `MEMORIES/` and commit at the end.
 
 Read `INDEX.md` and `HORIZON.md` first. Then deduplicate durable facts, settle contradictions against raw history rather than against older memory, keep uncertainty and temporal change intact, and keep open loops.
 
-Merge tiny overlapping files, split files that are hard to retrieve from, and delete anything trivially recoverable from history. Update `INDEX.md` to match whatever the tree looks like when you finish, and keep `HORIZON.md` short.
+Move anything that doesn't fit the shape in `SKILL.md` into it, merge tiny overlapping files, split files that are hard to retrieve from, and delete anything trivially recoverable from history. Update `INDEX.md` to match whatever the tree looks like when you finish, and keep `HORIZON.md` short.
 
 Commit once with a message saying what actually changed. If nothing changed, commit nothing.
 

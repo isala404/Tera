@@ -245,7 +245,8 @@ impl Recurrence {
             _ => return Err(malformed()),
         };
 
-        Ok(Recurrence::Every(n * per_unit_ms))
+        let gap_ms = n.checked_mul(per_unit_ms).ok_or_else(malformed)?;
+        Ok(Recurrence::Every(gap_ms))
     }
 
     fn next_after(&self, from_ms: i64) -> Option<i64> {
@@ -257,7 +258,7 @@ impl Recurrence {
                 let from = Local.timestamp_millis_opt(from_ms).single()?;
                 schedule.after(&from).next().map(|dt| dt.timestamp_millis())
             }
-            Recurrence::Every(gap_ms) => Some(from_ms + gap_ms),
+            Recurrence::Every(gap_ms) => from_ms.checked_add(*gap_ms),
         }
     }
 }
@@ -304,6 +305,11 @@ mod tests {
         let now = 1_700_000_000_000;
         let next = recurring("EVERY_3D").next_run(now).unwrap().unwrap();
         assert_eq!(next - now, 3 * 86_400_000);
+    }
+
+    #[test]
+    fn test_an_interval_too_large_to_represent_is_rejected() {
+        assert!(Recurrence::parse("EVERY_999999999999999D").is_err());
     }
 
     /// The bug this module exists to fix: the tool advertised a timezone and then

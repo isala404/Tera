@@ -69,7 +69,7 @@ mod tests {
         let root = render(data::WORKSPACE_AGENTS, &config);
         let bootstrap = render(data::CODEX_HOME_AGENTS, &config);
 
-        assert!(root.contains("You start in `/tmp/my_workspace`"));
+        assert!(root.contains("relative to `/tmp/my_workspace`"));
         assert!(bootstrap.contains("/tmp/my_workspace/AGENTS.md"));
         // The old templates hardcoded /workspace, which pointed Codex at a
         // directory that does not exist under any other workspace root.

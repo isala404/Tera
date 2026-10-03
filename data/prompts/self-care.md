@@ -6,7 +6,7 @@ Check disk headroom and where the space went, prunable caches and abandoned buil
 
 Do safe, reversible cleanups without asking. Know what something is and that it comes back before removing it. Don't upgrade, rebuild, restart services or kill processes, those need a yes from {{OWNER}}.
 
-Stay quiet unless {{OWNER}} needs to know or decide something. Freed a lot of space, something trending wrong, an upgrade worth approving, a service down. Then send one or two short, specific messages like a friend would. A clean pass sends nothing.
+Stay quiet unless {{OWNER}} needs to know or decide something. Freed a lot of space, something trending wrong, an upgrade worth approving, a service down. Then send one or two short, specific messages like a friend would. A clean pass sends nothing, no daily summary. Bring up something you already flagged only if it got worse or about a week has passed.
 
 Finish by updating `SYSTEM.md` with anything durable plus one maintenance log line, and `MEMORY.md` here with what the next pass needs, including what you flagged and haven't heard back on.
 

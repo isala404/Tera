@@ -634,6 +634,7 @@ async fn main() -> Result<()> {
                 // The startup assistant writes the restart message after the
                 // transport and Codex are both usable. It retries while WhatsApp
                 // is still connecting.
+                let interrupted = tera::conversation::phoenix::interrupted_turns(&runtime_db)?;
                 let phoenix = Phoenix::new(
                     config.clone(),
                     history_db.clone(),
@@ -644,7 +645,10 @@ async fn main() -> Result<()> {
                 );
                 tokio::spawn(async move {
                     for attempt in 1..=PHOENIX_REPORT_ATTEMPTS {
-                        match phoenix.run(crashed.clone(), update_notice.clone()).await {
+                        match phoenix
+                            .run(crashed.clone(), update_notice.clone(), &interrupted)
+                            .await
+                        {
                             Ok(()) => return,
                             Err(e) => {
                                 warn!("Phoenix could not run (attempt {attempt}): {e:?}");
