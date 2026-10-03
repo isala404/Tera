@@ -2,7 +2,10 @@
 //!
 //! A fresh workspace gets a daily health pass and a nightly memory pass. Each
 //! has its own durable marker, so cancelling one is not undone on restart and
-//! adding a new one does not resurrect a cancelled old one.
+//! adding a new one does not resurrect a cancelled old one. Their prompts are
+//! rewritten from this binary on every start, so a release reaches schedules
+//! seeded long ago. Host specific checks belong in `SYSTEM.md`, which the
+//! health pass reads.
 
 use crate::runtime::RuntimeDb;
 use crate::scheduler::db::SchedulerDb;
@@ -39,7 +42,8 @@ const BUILTINS: &[Builtin] = &[
     },
 ];
 
-/// Create the built-in schedules the first time this workspace starts.
+/// Create the built-in schedules the first time this workspace starts, and
+/// bring their prompts up to this release on every start after.
 ///
 /// Errors are logged, not propagated. A workspace that cannot seed housekeeping
 /// still needs to come up and answer messages.
@@ -52,8 +56,8 @@ pub fn seed(runtime_db: &RuntimeDb) {
 }
 
 fn try_seed(runtime_db: &RuntimeDb, builtin: &Builtin) -> Result<()> {
-    if runtime_db.get_state_value(builtin.seeded_key)?.is_some() {
-        return Ok(());
+    if let Some(id) = runtime_db.get_state_value(builtin.seeded_key)? {
+        return SchedulerDb::set_prompt(runtime_db, &id, builtin.prompt);
     }
 
     let timing = ScheduleTiming::parse(
@@ -126,6 +130,27 @@ mod tests {
             SchedulerDb::list_schedules(&runtime_db).unwrap().len(),
             BUILTINS.len()
         );
+    }
+
+    #[test]
+    fn test_a_restart_brings_seeded_prompts_up_to_this_release() {
+        let runtime_db = db();
+        seed(&runtime_db);
+        for item in SchedulerDb::list_schedules(&runtime_db).unwrap() {
+            SchedulerDb::set_prompt(&runtime_db, &item.id, "an old release's text").unwrap();
+        }
+
+        seed(&runtime_db);
+        for builtin in BUILTINS {
+            let id = runtime_db
+                .get_state_value(builtin.seeded_key)
+                .unwrap()
+                .unwrap();
+            let item = SchedulerDb::get_schedule(&runtime_db, &id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(item.prompt, builtin.prompt);
+        }
     }
 
     #[test]

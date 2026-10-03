@@ -452,7 +452,7 @@ async fn test_an_empty_message_is_neither_recorded_nor_answered() {
 }
 
 #[tokio::test]
-async fn test_media_download_failure_reports_to_owner() {
+async fn test_media_download_failure_reaches_the_model_as_a_note() {
     let temp_dir = TempDir::new().unwrap();
     let config = Config::new(temp_dir.path().to_path_buf(), true);
     WorkspaceInit::init(&config).unwrap();
@@ -486,16 +486,8 @@ async fn test_media_download_failure_reports_to_owner() {
         .await
         .unwrap();
 
-    {
-        let sent = transport.sent_messages.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        assert!(sent[0]
-            .1
-            .contains("Could not download attachment: connection reset by peer"));
-    }
-
     let events = history_db.list_events_all().unwrap();
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 1);
     assert!(events[0]
         .text()
         .unwrap()
@@ -518,19 +510,13 @@ async fn test_media_download_failure_reports_to_owner() {
         .await
         .unwrap();
 
-    {
-        let sent = transport.sent_messages.lock().unwrap();
-        assert_eq!(sent.len(), 2);
-        assert!(sent[1]
-            .1
-            .contains("Could not download attachment: file corrupted"));
-    }
-
     let events = history_db.list_events_all().unwrap();
     assert!(events.iter().any(|e| e
         .text()
         .unwrap_or("")
         .contains("Summarize this invoice\n\n[Attachment download failed: file corrupted]")));
+    // The model explains the failure in its own words; nothing canned goes out.
+    assert!(transport.sent_messages.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -774,11 +760,11 @@ async fn test_injected_dependent_insert_rollback() {
 
     let history_db = HistoryDb::open_for(&config).unwrap();
 
-    // Inject constraint failure by creating a trigger on delivery_events
+    // Fail the last dependent insert, after the event and its attachment
     {
         let conn = rusqlite::Connection::open(config.history_db_path()).unwrap();
         conn.execute(
-            "CREATE TRIGGER fail_delivery BEFORE INSERT ON delivery_events BEGIN SELECT RAISE(ABORT, 'injected constraint failure'); END;",
+            "CREATE TRIGGER fail_provider_ref BEFORE INSERT ON provider_refs BEGIN SELECT RAISE(ABORT, 'injected constraint failure'); END;",
             [],
         ).unwrap();
     }
@@ -809,7 +795,7 @@ async fn test_injected_dependent_insert_rollback() {
         true,
     );
 
-    let res = history_db.insert_event_full(event, Some(&pref), Some(("sent", None)));
+    let res = history_db.insert_event_full(event, Some(&pref));
 
     assert!(res.is_err(), "insert_event_full must fail due to trigger");
 
@@ -841,15 +827,6 @@ async fn test_injected_dependent_insert_rollback() {
         )
         .unwrap();
     assert_eq!(pref_count, 0, "provider_refs should have zero rows");
-
-    let deliv_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM delivery_events WHERE event_id = ?1",
-            rusqlite::params![event_id],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(deliv_count, 0, "delivery_events should have zero rows");
 
     // Verify JSONL projection was not written
     let events = history_db.list_events_all().unwrap();
@@ -1410,6 +1387,54 @@ for line in sys.stdin:
         Some(at_ms2),
         "interrupted schedule must be re-queued on its original slot"
     );
+}
+
+/// A run that keeps taking the daemon down with it is retried on its slot a
+/// few times, then given up for the next occurrence instead of crash looping.
+#[tokio::test]
+async fn test_a_slot_that_keeps_crashing_is_skipped_after_three_tries() {
+    let temp_dir = TempDir::new().unwrap();
+    let config = Config::new(temp_dir.path().to_path_buf(), true);
+    WorkspaceInit::init(&config).unwrap();
+    let runtime_db = RuntimeDb::open(&config.runtime_db_path()).unwrap();
+    let history_db = HistoryDb::open_for(&config).unwrap();
+    let codex = CodexSupervisor::new(config.clone(), runtime_db.clone(), history_db.clone());
+    let runner = SchedulerRunner::new(
+        config.clone(),
+        runtime_db.clone(),
+        history_db,
+        codex,
+        ConversationSession::new(),
+    );
+    let item = SchedulerDb::create_schedule(
+        &runtime_db,
+        "Crashy nightly",
+        "Do something that kills the daemon",
+        &ScheduleTiming::Recurring {
+            rrule: "0 3 * * *".to_string(),
+        },
+        "tasks/crashy",
+    )
+    .unwrap();
+    let slot = Utc::now().timestamp_millis() - 5000;
+
+    for crash in 1..=3 {
+        SchedulerDb::start_run(&runtime_db, &item.id, slot).unwrap();
+        runner.recover_stale_runs().unwrap();
+        let after = SchedulerDb::get_schedule(&runtime_db, &item.id)
+            .unwrap()
+            .unwrap();
+        if crash < 3 {
+            assert_eq!(
+                after.next_run_at_ms,
+                Some(slot),
+                "crash {crash} not retried"
+            );
+        } else {
+            assert!(after.next_run_at_ms.unwrap() > Utc::now().timestamp_millis());
+            assert_eq!(after.status, ScheduleStatus::Active);
+        }
+    }
 }
 
 /// A run whose Codex thread never starts is still a finished run: failed in

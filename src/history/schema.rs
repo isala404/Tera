@@ -49,13 +49,7 @@ CREATE TABLE IF NOT EXISTS provider_refs (
     PRIMARY KEY(provider, provider_message_id)
 );
 
-CREATE TABLE IF NOT EXISTS delivery_events (
-    seq             INTEGER PRIMARY KEY AUTOINCREMENT,
-    event_id        TEXT NOT NULL,
-    occurred_at_ms  INTEGER NOT NULL,
-    state           TEXT NOT NULL,
-    detail          TEXT
-);
+DROP TABLE IF EXISTS delivery_events;
 
 CREATE VIRTUAL TABLE IF NOT EXISTS conversation_fts USING fts5(
     event_id UNINDEXED,

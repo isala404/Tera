@@ -428,6 +428,155 @@ async fn e2e_a_person_mentioned_in_passing_lands_in_memory() {
     );
 }
 
+#[tokio::test]
+#[ignore = "spawns a real codex app-server and consumes account tokens"]
+async fn e2e_the_nightly_pass_learns_the_day_and_compacts_memory() {
+    let daemon = Daemon::start().await;
+    daemon.session.set_chat(CHAT);
+    let memories = daemon.config.workspace_dir.join("MEMORIES");
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&memories)
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+
+    // Memory the way a weaker pass leaves it: headings, bold, the same fact
+    // twice, a fix story and a loop that closed weeks ago.
+    std::fs::write(
+        memories.join("USER.md"),
+        "# User Profile\n\n## Basics\n\n- **Name:** Isala\n- **Location:** Colombo, Sri Lanka\n- Isala lives in Colombo.\n\n## Preferences\n\n- **Coffee:** likes it black, no sugar\n",
+    )
+    .unwrap();
+    std::fs::write(
+        memories.join("HORIZON.md"),
+        "# Horizon\n\n## Open\n\n- **2026-10-20** dentist appointment at 4pm\n\n## Done\n\n- ~~Fix the printer driver~~ resolved on 2026-09-02 after reinstalling cups\n",
+    )
+    .unwrap();
+    std::fs::write(
+        memories.join("INFRA.md"),
+        "# Infrastructure Notes\n\n## Network\n\n- The router is a TP-Link Archer AX55.\n- **Router:** TP-Link Archer AX55 (confirmed)\n\n## Incident log\n\nOn 2026-09-14 the backups failed. I checked the logs, found the disk was full, deleted old snapshots, reran the job and it worked. Then I verified it again the next morning and it was still fine.\n",
+    )
+    .unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "Seed sloppy memory"]);
+    let words = || -> usize {
+        walkdir(&memories)
+            .iter()
+            .map(|path| {
+                std::fs::read_to_string(path)
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .count()
+            })
+            .sum()
+    };
+    let before = words();
+
+    // A day of chat the day's turns never saved anything from.
+    let now = Utc::now().timestamp_millis();
+    let day = [
+        "my colleague Kasun handles the office VPN, he only answers on Signal",
+        "convert this bank statement pdf into a csv for me",
+        "please stop using bullet lists when you text me, plain sentences only",
+        "another bank statement, same thing, pdf to csv please",
+        "and the savings account statement too, csv again",
+    ];
+    for (i, text) in day.iter().enumerate() {
+        let at = now - (day.len() - i) as i64 * 3_600_000;
+        for (actor, said) in [
+            ("user", text.to_string()),
+            ("assistant", "done".to_string()),
+        ] {
+            daemon
+                .history_db
+                .insert_event(tera::history::db::ConversationEvent::message(
+                    format!("msg_{}", uuid::Uuid::new_v4().simple()),
+                    at,
+                    actor,
+                    Some(said),
+                    None,
+                    Some(format!("turn_day_{i}")),
+                    vec![],
+                ))
+                .unwrap();
+        }
+    }
+
+    tera::scheduler::defaults::seed(&daemon.runtime_db);
+    let item = SchedulerDb::list_schedules(&daemon.runtime_db)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.name == "Memory compaction")
+        .unwrap();
+    let runner = SchedulerRunner::new(
+        daemon.config.clone(),
+        daemon.runtime_db.clone(),
+        daemon.history_db.clone(),
+        daemon.codex.clone(),
+        daemon.session.clone(),
+    );
+    let started = Instant::now();
+    runner.run_schedule(&item).await.unwrap();
+    let last = &SchedulerDb::recent_runs(&daemon.runtime_db, 1).unwrap()[0];
+    assert_eq!(last.state, RunState::Completed, "{:?}", last.error);
+    let sent: Vec<_> = daemon
+        .messages()
+        .into_iter()
+        .map(|t| (started.elapsed().as_secs_f32(), t))
+        .collect();
+    print("nightly", "(nightly memory pass)", &sent, &[]);
+
+    let tree: Vec<(String, String)> = walkdir(&memories)
+        .into_iter()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+        .map(|path| {
+            let name = path.strip_prefix(&memories).unwrap().display().to_string();
+            (name, std::fs::read_to_string(path).unwrap())
+        })
+        .collect();
+    for (name, text) in &tree {
+        println!("  --- {name}\n{text}");
+    }
+    let all = tree
+        .iter()
+        .map(|(_, text)| text.to_lowercase())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        git(&["log", "-1", "--format=%s"]).starts_with("Nightly"),
+        "no Nightly commit"
+    );
+    assert!(
+        all.contains("kasun") && all.contains("signal"),
+        "missed the new person"
+    );
+    assert!(
+        ["bullet", "plain sentence", "lists"]
+            .iter()
+            .any(|word| all.contains(word)),
+        "missed the corrected preference"
+    );
+    assert!(all.contains("dentist"), "dropped a live open loop");
+    assert!(!all.contains("printer"), "kept a closed loop");
+    assert!(!all.contains("snapshots"), "kept a fix story");
+    for (name, text) in &tree {
+        assert!(
+            !text.lines().any(|line| line.starts_with('#'))
+                && !text.contains("**")
+                && !text.contains("]("),
+            "{name} still has markdown"
+        );
+    }
+    let after = words();
+    println!("  words {before} -> {after}, messages {}", sent.len());
+    assert!(after < before, "memory grew");
+    assert!(sent.len() <= 1, "the pass may send at most one message");
+}
+
 fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir(dir).unwrap().flatten() {

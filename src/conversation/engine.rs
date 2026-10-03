@@ -2,10 +2,10 @@ use crate::codex::process::TurnInput;
 use crate::codex::CodexSupervisor;
 use crate::config::Config;
 use crate::conversation::buffer::MessageBurst;
-use crate::conversation::record_assistant_message;
 use crate::conversation::renderer::InputRenderer;
 use crate::conversation::session::{ConversationSession, FOREGROUND};
 use crate::conversation::typing::TypingGuard;
+use crate::conversation::{pairing_message, record_assistant_message};
 use crate::history::assets::AssetStorage;
 use crate::history::db::{Attachment, ConversationEvent, HistoryDb, ProviderRef};
 use crate::runtime::{RuntimeDb, TurnState};
@@ -280,40 +280,6 @@ impl TurnEngine {
         }
 
         info!("Recorded inbound message from {}: {:?}", sender, msg.text);
-
-        if let Some(ref media_err) = msg.media_error {
-            let failure_reply = format!("⚠️ Could not download attachment: {media_err}");
-            let reply_target = MessageRef {
-                provider_msg_id: msg.provider_msg_id.clone(),
-                chat_jid: msg.chat_jid.clone(),
-                from_me: msg.from_own_account,
-                text: msg.text.clone(),
-            };
-            // Best effort: a caption that came with the failed file still
-            // deserves its turn.
-            match self
-                .transport
-                .send_text(&msg.chat_jid, &failure_reply, Some(&reply_target))
-                .await
-            {
-                Ok(outbound_msg_id) => {
-                    record_assistant_message(
-                        &self.history_db,
-                        &msg.chat_jid,
-                        &outbound_msg_id,
-                        &failure_reply,
-                        Some(logical_turn.clone()),
-                        Some(event_id.clone()),
-                    )?;
-                }
-                Err(e) => warn!("Could not report the failed attachment download: {e:?}"),
-            }
-
-            // If file-only, there is no user text to answer, so the turn ends here.
-            if msg.text.as_deref().is_none_or(|t| t.trim().is_empty()) {
-                return Ok(());
-            }
-        }
 
         match route {
             Route::Steer => {
@@ -743,12 +709,11 @@ impl TurnEngine {
                         // every message sent meanwhile would steer into a turn
                         // that cannot run. So say plainly that the question needs
                         // sending again.
-                        let prompt = format!(
-                            "👋 I'm not paired with Codex yet, so I can't answer that.\n\n\
-                             Authorize this device:\n\
-                             1. Open {url}\n\
-                             2. Enter code: *{code}*\n\n\
-                             _The code expires in 15 minutes. I'll tell you when it's done, then send your message again._"
+                        let prompt = pairing_message(
+                            "👋 I'm not paired with Codex yet, so I can't answer that.",
+                            &url,
+                            &code,
+                            "I'll tell you when it's done, then send your message again.",
                         );
                         let outbound_msg_id = self
                             .transport
@@ -776,7 +741,7 @@ impl TurnEngine {
                 }
             }
 
-            let reply_text = match self.codex.run_main_turn(&inputs).await {
+            let reply_text = match self.codex.run_main_turn(&burst.turn_id, &inputs).await {
                 Ok(reply) => reply,
                 Err(error) => {
                     error!("Codex turn failed: {error:?}");

@@ -182,7 +182,7 @@ impl CodexSupervisor {
     /// amnesia to the person on the other end. A thread that carries on is
     /// shown what was said in the chat from outside it since its last turn,
     /// which is how it learns what a scheduled task told the owner.
-    pub async fn run_main_turn(&self, inputs: &[TurnInput]) -> Result<String> {
+    pub async fn run_main_turn(&self, turn_id: &str, inputs: &[TurnInput]) -> Result<String> {
         let mgr = self.ensure().await?;
         let started_fresh = self.attach_main_thread(&mgr).await?;
         let seen_through = self.history_db.latest_seq()?;
@@ -191,7 +191,14 @@ impl CodexSupervisor {
             let mut context = vec![TurnInput::Text(ThreadRouter::build_bootstrap_context(
                 &self.config,
             ))];
-            let recent = self.history_db.recent_messages(RECENT_HISTORY_MESSAGES)?;
+            // This turn's own messages arrive as `inputs`; listing them here too
+            // would show the model every new message twice.
+            let recent: Vec<ConversationEvent> = self
+                .history_db
+                .recent_messages(RECENT_HISTORY_MESSAGES)?
+                .into_iter()
+                .filter(|event| event.turn_id() != Some(turn_id))
+                .collect();
             if !recent.is_empty() {
                 context.push(TurnInput::Text(InputRenderer::render_history(
                     "Recent conversation from history",
@@ -207,11 +214,14 @@ impl CodexSupervisor {
                 .collect()
         };
 
-        self.runtime_db
-            .set_state_value(MAIN_SEEN_THROUGH_KEY, &seen_through.to_string())?;
         let with_context: Vec<TurnInput> =
             context.into_iter().chain(inputs.iter().cloned()).collect();
-        mgr.run_turn_inputs(&with_context).await
+        let reply = mgr.run_turn_inputs(&with_context).await?;
+        // Only once the thread has really taken them in. A failed turn shows
+        // the same outside messages again next time.
+        self.runtime_db
+            .set_state_value(MAIN_SEEN_THROUGH_KEY, &seen_through.to_string())?;
+        Ok(reply)
     }
 
     /// Messages sent into the chat from outside the main thread since its last

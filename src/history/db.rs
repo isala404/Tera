@@ -308,7 +308,7 @@ impl HistoryDb {
     /// attachment or provider reference fails to write, no orphaned event row or
     /// projection survives.
     pub fn insert_event(&self, event: ConversationEvent) -> Result<ConversationEvent> {
-        self.insert_event_full(event, None, None)
+        self.insert_event_full(event, None)
             .map(|opt| opt.expect("event without provider ref cannot be deduplicated away"))
     }
 
@@ -321,14 +321,13 @@ impl HistoryDb {
         event: ConversationEvent,
         provider_ref: ProviderRef,
     ) -> Result<Option<ConversationEvent>> {
-        self.insert_event_full(event, Some(&provider_ref), None)
+        self.insert_event_full(event, Some(&provider_ref))
     }
 
     pub fn insert_event_full(
         &self,
         mut event: ConversationEvent,
         provider_ref: Option<&ProviderRef>,
-        delivery: Option<(&str, Option<&str>)>,
     ) -> Result<Option<ConversationEvent>> {
         // The projection files events by month, so a timestamp chrono cannot
         // represent must never be stored.
@@ -429,13 +428,6 @@ impl HistoryDb {
                 "INSERT INTO provider_refs (event_id, provider, provider_message_id, chat_jid, from_me)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![event.id, r.provider, r.provider_msg_id, r.chat_jid, r.from_me as i32],
-            )?;
-        }
-
-        if let Some((state, detail)) = delivery {
-            tx.execute(
-                "INSERT INTO delivery_events (event_id, occurred_at_ms, state, detail) VALUES (?1, ?2, ?3, ?4)",
-                params![event.id, Utc::now().timestamp_millis(), state, detail],
             )?;
         }
 

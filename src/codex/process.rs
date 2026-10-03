@@ -147,7 +147,7 @@ pub struct CodexProcessManager {
     /// requires the id of the turn it is steering as a precondition.
     active_turns: Arc<Mutex<HashMap<String, String>>>,
     /// Set once the child process is known to be gone, so callers stop waiting
-    /// 15 seconds for a reply that will never come.
+    /// out the request timeout for a reply that will never come.
     dead: Arc<AtomicBool>,
     login_completed_tx: broadcast::Sender<bool>,
 }
@@ -527,8 +527,7 @@ impl CodexProcessManager {
     /// be able to read any path, write any path, reach the network and install
     /// what it needs. The app-server can still ask, for an explicit permission
     /// grant, or through a legacy approval path, and an unanswered request is
-    /// not a refusal, it is a stall: the turn blocks until our timeout and the
-    /// agent reports that it was denied.
+    /// not a refusal, it is a stall that blocks the turn for good.
     ///
     /// So every approval is granted, at session scope, and anything we genuinely
     /// cannot answer gets an error rather than silence.
@@ -900,7 +899,11 @@ impl CodexProcessManager {
             .await
             .map_err(|_| anyhow!("Failed to send request to Codex stdin worker"))?;
 
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(15), rx)
+        // Generous, because a request that times out may still have run. A
+        // `turn/start` cut off early would produce a failure reply and then the
+        // real answer, and resuming a long thread on a small machine is slow.
+        // Process death needs no timeout, it drops every waiter.
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(120), rx)
             .await
             .map_err(|_| anyhow!("Timeout waiting for response to method '{}'", method))?
             .map_err(|_| {

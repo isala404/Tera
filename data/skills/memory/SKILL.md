@@ -22,6 +22,10 @@ Run it like a personal CRM, so the next conversation starts where the last one l
 
 Update facts in place rather than appending, and date anything that can change. Note a preference when the owner corrects you, since that is the cheapest lesson there is.
 
+## Format
+
+Memory is read into a context window every conversation, so every word costs. Write plain lines, one fact per line, with no headings, bold, tables, links or nested lists, since the file name already says the topic. Say each fact as it stands now in the fewest words that carry it. A line earns its place only if it would change what you say or do in a later conversation. How something got fixed, closed loops, and anything `SYSTEM.md`, a task's `MEMORY.md` or history already holds do not belong here. Facts about this machine go in `SYSTEM.md`.
+
 ## Writing
 
 Edit the files, then commit in one step. A message that says what changed is what makes `git log` worth reading later.
@@ -34,7 +38,7 @@ Commit whenever you learn something durable. Small commits are the point. If a p
 
 Names are capitals with a `.md` suffix. Keep `INDEX.md` accurate whenever you add or remove a file, and keep `HORIZON.md` short.
 
-Record durable facts and open loops. Not a diary, not anything trivially recoverable from history, and never a copy of `PERSONA.md` or `SYSTEM.md`. Something the owner said they might do is not something they did. Where the evidence does not settle a question, write that down instead of picking an answer.
+Something the owner said they might do is not something they did. Where the evidence does not settle a question, write that down instead of picking an answer.
 
 ## Maintenance
 

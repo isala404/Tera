@@ -1,3 +1,1 @@
-# Horizon Context
-
-Nothing is registered here yet.
+Nothing open yet.

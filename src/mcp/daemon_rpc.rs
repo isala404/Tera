@@ -13,6 +13,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -76,6 +77,8 @@ impl DaemonRpcServer {
 
         let listener = UnixListener::bind(&sock_path)
             .with_context(|| format!("Failed to bind Unix domain socket at {:?}", sock_path))?;
+        // Anyone who can connect can send messages as the owner.
+        std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))?;
         info!(
             "Daemon MCP RPC server listening on Unix socket {:?}",
             sock_path
@@ -340,11 +343,8 @@ impl DaemonRpcServer {
                     );
                     let provider_ref =
                         ProviderRef::whatsapp(&event_id, &provider_msg_id, &recipient, true);
-                    self.history_db.insert_event_full(
-                        event,
-                        Some(&provider_ref),
-                        Some(("sent", None)),
-                    )?;
+                    self.history_db
+                        .insert_event_full(event, Some(&provider_ref))?;
                     Ok(())
                 })();
                 if let Err(error) = recorded {

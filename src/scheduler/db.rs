@@ -368,6 +368,23 @@ impl SchedulerDb {
             .map_err(Into::into)
     }
 
+    /// How many runs of one schedule have ended failed on one slot. A recovered
+    /// run goes back on its slot, so this is how many times that slot crashed.
+    pub fn failed_runs_on_slot(
+        runtime_db: &RuntimeDb,
+        schedule_id: &str,
+        scheduled_for_ms: i64,
+    ) -> Result<usize> {
+        let conn = runtime_db.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM schedule_runs
+             WHERE schedule_id = ?1 AND scheduled_for_ms = ?2 AND state = 'failed'",
+            params![schedule_id, scheduled_for_ms],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
     pub fn get_run(runtime_db: &RuntimeDb, run_id: &str) -> Result<Option<ScheduleRun>> {
         let conn = runtime_db.conn.lock().unwrap();
         let query = format!("SELECT {RUN_COLUMNS} FROM schedule_runs WHERE id = ?1");
@@ -388,6 +405,15 @@ impl SchedulerDb {
         conn.execute(
             "UPDATE schedules SET next_run_at_ms = ?1 WHERE id = ?2",
             params![next_run_at_ms, schedule_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_prompt(runtime_db: &RuntimeDb, schedule_id: &str, prompt: &str) -> Result<()> {
+        let conn = runtime_db.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE schedules SET prompt = ?1 WHERE id = ?2",
+            params![prompt, schedule_id],
         )?;
         Ok(())
     }

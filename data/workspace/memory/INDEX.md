@@ -1,5 +1,3 @@
-# Active Memory Index
-
-- [USER.md](USER.md) holds facts and preferences about the owner.
-- [HORIZON.md](HORIZON.md) holds the current focus and anything still pending.
-- `PEOPLE/` holds one file per recurring person, created as they come up.
+USER.md the owner, who they are, tastes and how they like things done
+HORIZON.md open loops and what is coming up, each dated
+PEOPLE/ one file per recurring person

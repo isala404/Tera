@@ -5,9 +5,9 @@
 
 use crate::codex::CodexSupervisor;
 use crate::config::Config;
-use crate::conversation::record_assistant_message;
 use crate::conversation::renderer::InputRenderer;
 use crate::conversation::session::ConversationSession;
+use crate::conversation::{pairing_message, record_assistant_message};
 use crate::data;
 use crate::history::db::HistoryDb;
 use crate::runtime::crash_mark::CrashMark;
@@ -146,14 +146,25 @@ impl Phoenix {
         let mut completions = self.codex.subscribe_login_completed().await?;
         let (url, code) = self.codex.request_device_login().await?;
 
-        let msg = format!(
-            "👋 Tera restarted and isn't paired with Codex.\n\n\
-             Authorize this device:\n\
-             1. Open {url}\n\
-             2. Enter code: *{code}*\n\n\
-             _The code expires in 15 minutes. I'll pick up where I left off once it's done._"
+        let msg = pairing_message(
+            "👋 Tera restarted and isn't paired with Codex.",
+            &url,
+            &code,
+            "I'll pick up where I left off once it's done.",
         );
-        self.transport.send_text(chat_jid, &msg, None).await?;
+        let outbound_msg_id = self.transport.send_text(chat_jid, &msg, None).await?;
+        // Already sent, so a failed write must not fail the pairing and send
+        // a second code.
+        if let Err(e) = record_assistant_message(
+            &self.history_db,
+            chat_jid,
+            &outbound_msg_id,
+            &msg,
+            None,
+            None,
+        ) {
+            warn!("Sent the pairing code but could not record it in history: {e:?}");
+        }
 
         let outcome = tokio::time::timeout(PAIRING_TIMEOUT, completions.recv()).await;
         // Spent either way: a retry has to be able to ask for a fresh code.

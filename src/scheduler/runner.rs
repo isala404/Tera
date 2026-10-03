@@ -31,6 +31,10 @@ const MAX_COUNTED_MISSES: usize = 100;
 /// owner already said or did what the task is about to ask them.
 const RECENT_CONVERSATION_MESSAGES: usize = 20;
 
+/// Times one slot may be cut off by a crash before it is given up. A run that
+/// takes the daemon down with it would otherwise crash it on every start.
+const MAX_CRASHES_PER_SLOT: usize = 3;
+
 /// How far behind its schedule a run is.
 struct Lateness {
     by_ms: i64,
@@ -144,10 +148,9 @@ impl SchedulerRunner {
         fs::write(
             task_dir.join("PHOENIX_RECOVERY.md"),
             format!(
-                "Phoenix recovered schedule {} at {}. The previous process crashed while this run was marked running. Read MEMORY.md, RUNS.jsonl and artifacts before acting. Tell {} you recovered the run and continue only what remains.\n",
+                "Phoenix recovered schedule {} at {}. The previous process crashed while this run was marked running. Read MEMORY.md, RUNS.jsonl and artifacts before acting, and continue only what remains.\n",
                 item.name,
                 readable_now(),
-                self.config.owner_name,
             ),
         )?;
 
@@ -158,11 +161,26 @@ impl SchedulerRunner {
             Some("Phoenix recovered this run after a daemon restart"),
         )?;
 
-        // Back on its original slot, so the retry is reported as late as it is.
-        if item.status == ScheduleStatus::Active {
+        if item.status != ScheduleStatus::Active {
+            return Ok(());
+        }
+        let crashes =
+            SchedulerDb::failed_runs_on_slot(&self.runtime_db, &item.id, run.scheduled_for_ms)?;
+        if crashes < MAX_CRASHES_PER_SLOT {
+            // Back on its original slot, so the retry is reported as late as it is.
             SchedulerDb::set_next_run(&self.runtime_db, &item.id, Some(run.scheduled_for_ms))?;
             warn!("Phoenix re-queued interrupted schedule '{}'", item.name);
+            return Ok(());
         }
+        let next = item.timing.next_run(Utc::now().timestamp_millis())?;
+        SchedulerDb::set_next_run(&self.runtime_db, &item.id, next)?;
+        if next.is_none() {
+            SchedulerDb::complete_schedule(&self.runtime_db, &item.id)?;
+        }
+        error!(
+            "Schedule '{}' crashed {crashes} times on one slot; skipped to {:?}",
+            item.name, next
+        );
 
         Ok(())
     }
