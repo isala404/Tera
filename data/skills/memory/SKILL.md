@@ -18,7 +18,7 @@ Run it like a personal CRM, so the next conversation starts where the last one l
 - `USER.md` is the owner. Who they are, routines, tastes, and how they like things done.
 - `PEOPLE/` has one file per person who comes up more than once, named after them. Who they are to the owner, how to reach them, what they care about, dates worth remembering, and open threads with them.
 - Topic files such as `HEALTH.md`, `WORK.md` or `HOME.md` hold an ongoing area of life with its current state and decisions.
-- `HORIZON.md` holds what is coming up and open loops, each with a date.
+- `HORIZON.md` holds what is coming up and open loops, each with a date. A decision waiting on the owner notes when it was last asked and how often.
 
 Update facts in place rather than appending, and date anything that can change. Note a preference when the owner corrects you, since that is the cheapest lesson there is.
 

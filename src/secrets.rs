@@ -248,6 +248,16 @@ impl SecretStore {
             Capture::Rejected {
                 reason: format!("The message held no value for {}", request.name),
             }
+        } else if value.contains(char::is_whitespace) {
+            // Owners wrap the key in a sentence ("here it is abc123"), and
+            // storing that whole sentence breaks the login silently. Guessing which
+            // word is the key would be worse, so ask for the bare value.
+            Capture::Rejected {
+                reason: format!(
+                    "the message had words around the value. Send only the value, or /secret {} value",
+                    request.name
+                ),
+            }
         } else {
             self.store(request.name, value, now_ms)
         };
@@ -562,6 +572,17 @@ mod tests {
             store.get("SPOTIFY_CLIENT_ID").unwrap().as_deref(),
             Some("abc123")
         );
+    }
+
+    #[test]
+    fn test_pending_request_rejects_a_value_wrapped_in_words() {
+        let (_dir, store) = store();
+        store.request("API_TOKEN", 0).unwrap();
+        assert!(matches!(
+            store.capture("here you go abc123", 0).unwrap(),
+            Capture::Rejected { .. }
+        ));
+        assert_eq!(store.get("API_TOKEN").unwrap(), None);
     }
 
     /// One message, one claim. Otherwise every later message is swallowed.

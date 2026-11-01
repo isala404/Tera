@@ -9,6 +9,7 @@ use crate::conversation::{pairing_message, record_assistant_message};
 use crate::history::assets::AssetStorage;
 use crate::history::db::{Attachment, ConversationEvent, HistoryDb, ProviderRef};
 use crate::runtime::{RuntimeDb, TurnState};
+use crate::scheduler::db::SchedulerDb;
 use crate::secrets::{Capture, SecretStore};
 use crate::transport::owner::jid_user;
 use crate::transport::{
@@ -587,6 +588,12 @@ impl TurnEngine {
             events,
             &reply_targets,
         ))];
+        match SchedulerDb::list_schedules(&self.runtime_db) {
+            Ok(items) => {
+                inputs.extend(InputRenderer::render_schedules(&items).map(TurnInput::Text))
+            }
+            Err(e) => warn!("Could not list schedules for the turn: {e:?}"),
+        }
         inputs.extend(self.media_inputs(events));
         inputs
     }

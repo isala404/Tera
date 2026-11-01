@@ -511,6 +511,11 @@ fn attachment_argument(args: &Value) -> Result<Option<(&'static str, &str)>> {
 }
 
 fn resolve_media_path(workspace: &Path, raw: &str) -> Result<PathBuf> {
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        return Err(anyhow!(
+            "media paths are local files, not links; download {raw} into the workspace with curl and pass that path"
+        ));
+    }
     let raw = PathBuf::from(raw);
     let path = if raw.is_absolute() {
         raw
@@ -577,6 +582,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let error = resolve_media_path(dir.path(), ".").unwrap_err();
         assert!(error.to_string().contains("media file not found"));
+    }
+
+    /// Agents pasted image links as text instead of sending the picture.
+    #[test]
+    fn a_link_is_refused_with_how_to_send_it() {
+        let dir = tempdir().unwrap();
+        let error = resolve_media_path(dir.path(), "https://example.com/a.jpg").unwrap_err();
+        assert!(error.to_string().contains("download"), "{error}");
     }
 
     /// A `DaemonRpcServer` wired to a mock transport, with a chat already open

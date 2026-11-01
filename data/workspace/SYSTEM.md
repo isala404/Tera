@@ -53,4 +53,4 @@ Deleting is not cleanup. Know what it is and that it regenerates.
 
 ## Maintenance log
 
-Newest first, one line per pass. Include the date, what was checked and changed, what was left alone and why, upgrades flagged, and whether {{OWNER}} approved. Collapse anything older than a few months into one summary line.
+Newest first. Write a line only when a pass changed something or found something new, with the date, what changed, what was left alone and why. A clean pass writes nothing here. Asks waiting on {{OWNER}} live in `MEMORIES/HORIZON.md`, not here. Collapse lines older than a month into one line per month.

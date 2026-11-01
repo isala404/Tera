@@ -1,4 +1,6 @@
 use crate::history::db::ConversationEvent;
+use crate::scheduler::db::ScheduleItem;
+use crate::scheduler::recurrence::local_time;
 use chrono::{Local, TimeZone};
 use std::collections::HashMap;
 
@@ -37,6 +39,25 @@ impl InputRenderer {
         }
 
         rendered.trim().to_string()
+    }
+
+    /// The live schedules, shown with every message. A reply like "took it at
+    /// 4" has to move the reminder chain it belongs to, and an agent that must
+    /// first think of calling `list_schedules` mostly doesn't.
+    pub fn render_schedules(items: &[ScheduleItem]) -> Option<String> {
+        if items.is_empty() {
+            return None;
+        }
+        let mut rendered =
+            String::from("[Live schedules. Move or cancel any that these messages change.]\n");
+        for item in items {
+            let next = item
+                .next_run_at_ms
+                .map(local_time)
+                .unwrap_or_else(|| "not scheduled".to_string());
+            rendered.push_str(&format!("{} {}, next {}\n", item.id, item.name, next));
+        }
+        Some(rendered.trim_end().to_string())
     }
 
     /// Render past messages under a heading. Each carries its full local
@@ -126,6 +147,30 @@ mod tests {
         let rendered = InputRenderer::render_burst_with_replies(&[ev], &HashMap::new());
         assert!(rendered.contains("User m_test:"), "{rendered}");
         assert!(rendered.contains("Test query"));
+    }
+
+    #[test]
+    fn test_schedules_render_with_id_name_and_next_run() {
+        use crate::scheduler::db::ScheduleStatus;
+        use crate::scheduler::ScheduleTiming;
+        assert_eq!(InputRenderer::render_schedules(&[]), None);
+        let item = ScheduleItem {
+            id: "sched_1".to_string(),
+            name: "Dose reminder".to_string(),
+            prompt: "remind".to_string(),
+            timing: ScheduleTiming::Once {
+                at_ms: 1_700_000_000_000,
+            },
+            task_path: "tasks/schedule-1".to_string(),
+            status: ScheduleStatus::Active,
+            next_run_at_ms: Some(1_700_000_000_000),
+        };
+        let rendered = InputRenderer::render_schedules(&[item]).unwrap();
+        assert!(rendered.contains("Live schedules"), "{rendered}");
+        assert!(
+            rendered.contains("sched_1 Dose reminder, next "),
+            "{rendered}"
+        );
     }
 
     #[test]

@@ -18,9 +18,13 @@ Read `{{WORKSPACE}}/AGENTS.md`, `{{WORKSPACE}}/tasks/AGENTS.md`, then `MEMORY.md
 
 Read the recent conversation before you say anything. If {{OWNER}} already dealt with it, already got told, or said something that changes the plan, act on that. That can mean staying quiet, adjusting the task, or rescheduling it from what actually happened.
 
-The only way to reach {{OWNER}} is `send_message` on the `tera` MCP server. Returned text goes to a log nobody reads. They didn't ask for this right now, so message only with something new since the last run, something they'd want today, or a decision only they can make. Same as last time means silence, and a silent run is a success. Raise an unanswered ask again only when it changed or got more urgent.
+The only way to reach {{OWNER}} is `send_message` on the `tera` MCP server. Returned text goes to a log nobody reads. They didn't ask for this right now, so message only with something new since the last run, something they'd want today, or a decision only they can make. Same as last time means silence, and a silent run is a success.
 
-When you do write, text like a friend, short and natural, and never in the shape of an earlier run's message.
+A decision for {{OWNER}} goes in `{{WORKSPACE}}/MEMORIES/HORIZON.md`. Send it only when it's new or got more urgent.
+
+When you do write, text like a friend, short, leading with what matters, and never in the shape of an earlier run's message.
+
+If what this run needs isn't ready yet, check back later rather than reporting the gap.
 
 If the run is late enough that the result would mislead, say so. Missed slots are already merged into this one run.
 

@@ -414,6 +414,9 @@ fn render_task_prompt(
     crate::data::render(
         crate::data::SCHEDULED_TASK_PROMPT,
         &[
+            // The task prompt goes in first so the placeholders it carries,
+            // like {{OWNER}} in the built-in prompts, are filled after it.
+            ("TASK_PROMPT", &item.prompt),
             ("OWNER", &config.owner_name),
             ("WORKSPACE", &config.workspace_dir.display().to_string()),
             ("TASK_NAME", &item.name),
@@ -421,7 +424,6 @@ fn render_task_prompt(
             ("NOW", &readable_now()),
             ("TASK_DIR", &task_dir.display().to_string()),
             ("LATE", &timing),
-            ("TASK_PROMPT", &item.prompt),
             ("RECENT_CONVERSATION", conversation),
         ],
     )
@@ -512,6 +514,20 @@ mod tests {
         assert!(prompt.contains("send_message"));
         assert!(prompt.contains("on time"));
         assert!(prompt.contains("said something"));
+        assert!(!prompt.contains("{{"), "unfilled placeholder: {prompt}");
+    }
+
+    #[test]
+    fn test_placeholders_inside_the_task_prompt_are_filled() {
+        let mut item = hourly(Some(NOW));
+        item.prompt = "Ask {{OWNER}} before upgrading".to_string();
+        let prompt = render_task_prompt(
+            &owner_config(),
+            &item,
+            Path::new("/ws/tasks/schedule-1"),
+            None,
+            "",
+        );
         assert!(!prompt.contains("{{"), "unfilled placeholder: {prompt}");
     }
 

@@ -1,12 +1,12 @@
 [
   {
     "name": "send_message",
-    "description": "Send {{OWNER}} a WhatsApp message. The only way to reach them. Returned text is just a fallback in the chat and goes nowhere from a scheduled task. Plain text, no markdown, no dash or numbered lists. Text like a friend, short, separate thoughts in separate messages, and don't repeat what you already sent. If the reply needs a web lookup or digging around, call this first with one short line saying what you're on. Transcript lines carry message ids, so pass one as reply_to only when a bare message would be ambiguous. To include a credential you can't see, write ${NAME} where it belongs, e.g. client_id=${SPOTIFY_CLIENT_ID}, and Tera fills it in on the way out while history keeps the placeholder.",
+    "description": "Send {{OWNER}} a WhatsApp message. The only way to reach them. Returned text is just a fallback in the chat and goes nowhere from a scheduled task. Plain text, no markdown, no dash or numbered lists. Text like a friend, short, separate thoughts in separate messages, and don't repeat what you already sent. If the reply needs a web lookup or digging around, call this first with one short line saying what you're on. To show a picture, send the file, not a link. Transcript lines carry message ids, so pass one as reply_to only when a bare message would be ambiguous. To include a credential you can't see, write ${NAME} where it belongs, e.g. client_id=${SPOTIFY_CLIENT_ID}, and Tera fills it in on the way out while history keeps the placeholder.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "text": { "type": "string", "description": "Message text. Plain, short, no markdown." },
-        "image_path": { "type": "string", "description": "Path to an image file: absolute, or relative to the workspace root" },
+        "image_path": { "type": "string", "description": "Path to a local image file: absolute, or relative to the workspace root. Not a URL." },
         "video_path": { "type": "string", "description": "Path to a video file: absolute, or relative to the workspace root" },
         "audio_path": { "type": "string", "description": "Path to an ordinary audio attachment: absolute, or relative to the workspace root" },
         "voice_note_path": { "type": "string", "description": "Path to an Ogg Opus voice note: absolute, or relative to the workspace root. Sends it with WhatsApp's push-to-talk flag." },
