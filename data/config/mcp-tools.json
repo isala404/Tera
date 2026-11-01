@@ -1,7 +1,7 @@
 [
   {
     "name": "send_message",
-    "description": "Send {{OWNER}} a WhatsApp message. The only way to reach them. Returned text is just a fallback in the chat and goes nowhere from a scheduled task. Plain text, no markdown, no dash or numbered lists. Text like a friend, short, separate thoughts in separate messages, and don't repeat what you already sent. If the reply needs a web lookup or digging around, call this first with one short line saying what you're on. To show a picture, send the file, not a link. Transcript lines carry message ids, so pass one as reply_to only when a bare message would be ambiguous. To include a credential you can't see, write ${NAME} where it belongs, e.g. client_id=${SPOTIFY_CLIENT_ID}, and Tera fills it in on the way out while history keeps the placeholder.",
+    "description": "Send {{OWNER}} a WhatsApp message, the only way to reach them. Final turn text is just a fallback and goes nowhere from a scheduled task. Plain text like a friend, short, one thought per message. To show a picture, send the file, not a link. Pass a transcript message id as reply_to only when a bare message would be ambiguous. Write ${NAME} for a credential you can't see, e.g. client_id=${SPOTIFY_CLIENT_ID}, and Tera fills it in on the way out.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -17,7 +17,7 @@
   },
   {
     "name": "react",
-    "description": "React to a message with an emoji. Often the whole reply, for acknowledging or agreeing. A reaction is a whole reply, so never follow it with a message that says the same thing.",
+    "description": "React to a message with an emoji. A reaction is a whole reply.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -29,7 +29,7 @@
   },
   {
     "name": "schedule",
-    "description": "Schedule a one-off or recurring background task. Use this for anything time-based, never cron or launchd. Times are this machine's local time. The run starts on a fresh thread that sees only your prompt and the recent chat, so write `prompt` as standalone instructions: what to do, where to look, and when it's worth messaging {{OWNER}}. If the timing depends on when something actually happens, schedule a single run from that event and reschedule when it happens again, instead of a fixed recurring clock. Never poll. A reminder is a single run at the exact time. The response echoes the first run, check it's what you meant.",
+    "description": "Schedule a one-off or recurring background task, in this machine's local time. The run sees only `prompt` and the recent chat, so make it standalone. Time it to when things actually happen rather than polling. The response echoes the first run.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -51,12 +51,12 @@
   },
   {
     "name": "list_schedules",
-    "description": "List active schedules with their next run in local time. Check it before creating something that may already exist, and when something {{OWNER}} says affects a schedule.",
+    "description": "List active schedules with their next run in local time.",
     "inputSchema": { "type": "object" }
   },
   {
     "name": "cancel_schedule",
-    "description": "Cancel an active schedule. Cancel ones that stopped being useful, and cancel and recreate one whose timing changed.",
+    "description": "Cancel an active schedule.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -67,7 +67,7 @@
   },
   {
     "name": "request_secret",
-    "description": "Ask {{OWNER}} for a credential a skill needs: an API key, client ID or token. Sends them a short message and claims their next message as the value, which Tera stores where skills read it. You never see the value, not now and not later. It is taken out of the message before it reaches you, so there is no point asking for it in plain conversation and no point reading it back to check. Always use this rather than asking in your own words: a credential typed into an ordinary message ends up in history, in the JSONL projection, and in every memory generation built from it. Check `.runtime/secrets.json` first, it may already be stored. The request expires in 15 minutes.",
+    "description": "Ask {{OWNER}} for a credential a skill needs. Their next message is stored where skills read it and never reaches you or history, so always use this instead of asking in chat. Check `.runtime/secrets.json` first. Expires in 15 minutes.",
     "inputSchema": {
       "type": "object",
       "properties": {

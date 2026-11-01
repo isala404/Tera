@@ -1,12 +1,8 @@
 # This machine
 
-Your notebook on the host, and your standing orders for keeping it healthy. Nothing else writes here, so it is as accurate as you keep it. Read before touching the system. Write whenever you learn something durable.
-
-Facts, not narrative. Anything needing a paragraph belongs in a task's notes with a single line pointer here.
+Your notebook on the host. Nothing else writes here. Read it before touching the system and record durable facts, not narrative.
 
 ## Identity
-
-`uname -a`, `hostname`, `echo $SHELL`, then this platform's own version command. `sw_vers` on macOS, `/etc/os-release` on Linux.
 
 - Host / OS / arch
 - Shell
@@ -14,7 +10,7 @@ Facts, not narrative. Anything needing a paragraph belongs in a task's notes wit
 
 ## Software
 
-The authoritative package manager, where its config lives, and the exact commands. Wrong answers here rot a declaratively managed machine.
+The authoritative package manager and its exact commands.
 
 - Package manager
 - Config / dotfiles
@@ -24,7 +20,7 @@ The authoritative package manager, where its config lives, and the exact command
 
 ## Disks
 
-`df -h`, then `du -sh` the suspects. Record what actually grows.
+Record what actually grows.
 
 - Volumes
 - Space sinks
@@ -33,24 +29,16 @@ The authoritative package manager, where its config lives, and the exact command
 
 ## Services
 
-What should be running, how to check, how to restart. Include tera.
+What should run, how to check it and how to restart it, tera included.
 
 ## Quirks
 
-Record anything not discoverable from a man page. This includes an env var that must be unset, a surprising symlink, a command slow enough to look hung, or an ordering dependency. One line each.
+Anything a man page won't tell you, one line each.
 
 ## Health duties
 
-Learn by looking. `uname -a`, `df -h`, `du -sh`, `docker system df`, and `pgrep` work anywhere. The package manager, service manager and version command depend on the platform. Record which ones are right here.
-
-Do these quietly without asking. Check disk headroom and where space went, prune caches and abandoned build directories, clear your own old logs and backups, confirm the services that should run are running, and note pending updates.
-
-Message {{OWNER}} only when there's something to know or decide. A clean pass sends nothing.
-
-Never upgrade unasked. Package upgrades, OS updates, rebuilds, or anything restarting a service need approval. Say what is pending, then wait. Never do it during other work.
-
-Deleting is not cleanup. Know what it is and that it regenerates.
+Keep disk headroom, prune caches and dead build directories, clear your own old logs, confirm services run, and note pending updates. Know what something is before deleting it. Upgrades, rebuilds and restarts wait for {{OWNER}}'s yes. Message them only when there's something to know or decide.
 
 ## Maintenance log
 
-Newest first. Write a line only when a pass changed something or found something new, with the date, what changed, what was left alone and why. A clean pass writes nothing here. Asks waiting on {{OWNER}} live in `MEMORIES/HORIZON.md`, not here. Collapse lines older than a month into one line per month.
+Newest first, only for passes that changed or found something, with the date, what and why. Collapse old lines into summaries.

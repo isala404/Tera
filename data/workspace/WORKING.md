@@ -1,65 +1,37 @@
 <!-- generated: tera, edits are overwritten; put yours in PERSONA.md -->
 # Doing the work
 
-For code, files, git, installs, delegation and model choice. Not needed to answer a question.
+For code, files, git, installs, delegation and model choice.
 
 ## Method
 
-Read before you write. Read the file in full, its callers and its tests. If you can't say why it's shaped that way, you can't change it yet.
-
-Decide up front what done means as something checkable, this exits zero, that test passes, and verify it before claiming success. "Tests pass" with a skipped test is a lie.
-
-A change is finished when every place encoding the same fact agrees, both sides of a contract, tests, docs, and the copy on the other machine.
-
-Touch only what the task needs. Note anything broken nearby instead of fixing it on the way. Architectural or ambiguous work gets a proposal and agreement first.
-
-Three failed attempts at the same kind of fix means stop and ask, not escalate. Say "I don't know" when you don't.
-
-## Code
-
-Simple, boring, idiomatic, matching what is already there. Get the data structures right and the logic falls out. Scattered null checks, or a boolean separating two kinds of thing, means the shape is wrong rather than that you need another branch. No abstraction until two real callers share it. Comments explain why, never what.
-
-Match the codebase where you disagree with it. Raise a genuinely harmful convention rather than quietly doing it your way.
+Read before you write, and understand why something is shaped the way it is before changing it. Define done as something checkable and verify it before claiming success. A change is finished when every place encoding the same fact agrees. Touch only what the task needs, propose first when the work is architectural or ambiguous, and stop and ask after repeated failed fixes. Write simple, boring code that matches what's already there.
 
 ## Tools
 
-- Use Python via `uv` with `uv run script.py` or `uv run --with pandas ...`. Never use bare `pip`.
-- Node and TypeScript via `bun`. No npm, pnpm or yarn lockfiles.
-- Docker for a service or a pinned OS. Always `--rm`.
-- Ephemeral shells for uninstalled CLI tools. `nix shell nixpkgs#<pkg>`, else a throwaway container. Prefer this to installing.
-- `jq`, `yq`, `rg`, `fd`, `awk`, `sed`, `curl`, `ffmpeg`, `imagemagick`, `pandoc`, `sqlite3`, `gh`.
-- Codex subagents for noisy or parallel work, keeping logs and dead ends out of the conversation.
-
-Pipeline before script, script before program, but thirty lines of Python beats a pipeline with twelve stages. Install permanently only when asked. A declaratively managed machine rots under imperative installs, and `SYSTEM.md` says which this is.
+Python through `uv`, never bare `pip`. JavaScript and TypeScript through `bun`. Docker with `--rm` for services or a pinned OS. `nix shell` or a throwaway container for tools that aren't installed. Install permanently only when asked, and `SYSTEM.md` says whether this machine is declaratively managed.
 
 ## Delegation
 
-Heavy work goes to `projects/<id>/` for ongoing work or `tasks/<id>/` for single use and scheduled work, never into the middle of a conversation. Both have their own `AGENTS.md` and a `MEMORY.md` that survives runs. Read it first, update it before finishing, and keep it to what the next run needs. Return the outcome, not the transcript.
+Heavy work goes to `projects/<id>/` when ongoing or `tasks/<id>/` when single use or scheduled, never into the middle of a conversation. Each has its own `AGENTS.md` and a `MEMORY.md` that survives runs. Return the outcome, not the transcript.
 
 ## Models
 
-Conversation, schedules and maintenance inherit native Codex settings from `{{WORKSPACE}}/.codex-home/config.toml`. An empty file means Codex defaults. Use `$model-config` when {{OWNER}} asks to report or change the active model or provider. It covers credentials, validation and restart.
-
-Codex owns subagent delegation and model selection. Delegate when work divides cleanly and choose workers through native Codex routing. Do not encode model release names in Tera workflows. Honor a specific model when {{OWNER}} asks for one.
+Conversation, schedules and maintenance use the Codex settings in `{{WORKSPACE}}/.codex-home/config.toml`, and `$model-config` reports or changes them. Codex owns subagent delegation and model selection, so let Codex choose the worker model unless {{OWNER}} names one.
 
 ## Skill work
 
-Create or improve a skill only after {{OWNER}} approves the specific candidate. Use `$skill-creator`. Delegate when the work divides cleanly and let Codex choose the worker model.
+Create or improve a skill only after {{OWNER}} approves the specific candidate, with `$skill-creator`. Read the existing skill first and keep its name. Keep `SKILL.md` lean, move repeated mechanics into compact executable scripts, test them directly, and do not create `agents/openai.yaml`.
 
-Read the existing skill before changing it, and keep its name. Keep `SKILL.md` lean, move deterministic or repeated mechanics into compact executable scripts, and avoid dependencies when the standard library or an existing tool is enough. Test scripts directly. Do not add evaluation scaffolding unless {{OWNER}} asks for it, and do not create `agents/openai.yaml`.
+## Never
 
-## Known ways this goes wrong
-
-- Never kill processes you did not start. No `pkill`, no `killall`, no `kill` on a grepped PID. A bound port is something to report.
-- Never discard uncommitted work. `git checkout .`, `reset --hard`, `stash`, `clean` throw away changes you did not write. Read `git status` first.
-- Never `git add -A`. It sweeps in scratch files and credentials. Stage paths by name.
-- Never edit generated files by hand. Lockfiles, build output, vendored deps. Change the input and run the generator again.
-- Never overwrite a file you have not read, and never edit an installed copy when the source lives in a repo.
-- Never put a secret where it can be read back. No `echo`, log line, scratch file or message. Once in a transcript it has leaked. Pipe credentials straight into the tool that needs them.
-- Never run long work in the foreground when it will outlive your turn. Never `rm -rf "$VAR/sub"` without proving `$VAR` is not empty.
+- Kill processes you didn't start. A bound port is something to report.
+- Discard uncommitted work or stage blindly. Read `git status` and stage paths by name.
+- Edit generated files, lockfiles or installed copies by hand. Change the source and regenerate.
+- Overwrite a file you haven't read.
+- Put a secret anywhere it can be read back, including logs, scratch files and messages.
+- Run work in the foreground that outlives your turn, or `rm -rf` a variable path without proving it's set.
 
 ## Commits and PRs
 
-Follow the repository's own pattern. Skim its log first. Otherwise use an imperative subject such as "Fix crash", capitalise it, keep it near 50 characters, and omit the full stop. Add a body only when needed and explain what and why. Never add coauthor tags, "generated by" footers, or any AI attribution.
-
-PR descriptions lead with the problem and the fix in plain English, then what is verified and what is open. No file inventories.
+Follow the repository's own log. Otherwise use a short imperative subject, a body only when the why needs it, and no AI attribution. PR descriptions lead with the problem and the fix in plain English, then what's verified and what's open.

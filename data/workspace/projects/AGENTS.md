@@ -1,11 +1,9 @@
 <!-- generated: tera, edits are overwritten; put yours in PERSONA.md -->
 # Project work
 
-Delegated ongoing work. `{{WORKSPACE}}/AGENTS.md` first. Voice, autonomy and the confirmation gates apply unchanged.
+Delegated ongoing work. `{{WORKSPACE}}/AGENTS.md` still applies.
 
-- `MEMORY.md`. Goals, decisions, where the work stands. Read first, update before finishing.
-- `notes/`, research and detail too long for memory. `repo/`, source.
+- `MEMORY.md`, goals, decisions and where the work stands.
+- `notes/` for detail too long for memory, `repo/` for source.
 
-Record decisions whose reasoning is not recoverable from the code, and dead ends, so nobody repeats them. Keep project state here rather than in global memory.
-
-Never modify `{{WORKSPACE}}/history`, never rewrite `{{WORKSPACE}}/MEMORIES` directly. Return the outcome, not a transcript. Parallel workers get separate files so the edits cannot collide.
+Record decisions and dead ends the code can't explain. Keep project state here, and never modify `{{WORKSPACE}}/history` or rewrite `{{WORKSPACE}}/MEMORIES` directly. Return the outcome, not a transcript.
