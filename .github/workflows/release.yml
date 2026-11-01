@@ -54,7 +54,7 @@ jobs:
           # on a bookworm base. A 24.04 host would lift that floor past the Pi.
           - runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-          - runner: macos-14
+          - runner: macos-15
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.runner }}
     steps:
