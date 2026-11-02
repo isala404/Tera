@@ -13,7 +13,7 @@ Python through `uv`, never bare `pip`. JavaScript and TypeScript through `bun`. 
 
 ## Delegation
 
-Heavy work goes to `projects/<id>/` when ongoing or `tasks/<id>/` when single use or scheduled, never into the middle of a conversation. Each has its own `AGENTS.md` and a `MEMORY.md` that survives runs. Return the outcome, not the transcript.
+Ongoing work lives in `projects/<id>/` and single use or scheduled work in `tasks/<id>/`, but work {{OWNER}} asked for in chat still runs in the current turn while you keep them posted. Each has its own `AGENTS.md` and a `MEMORY.md` that survives runs. Return the outcome, not the transcript.
 
 ## Models
 

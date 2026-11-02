@@ -495,10 +495,10 @@ mod tests {
         // The acknowledgement is the beat that gets dropped first, because a
         // model that already knows the answer to the next step reads "speak when
         // you have an answer" as permission to stay silent until it does.
-        assert!(WORKSPACE_AGENTS.contains("before reading anything"));
-        assert!(WORKSPACE_AGENTS.contains("a lookup, browsing or digging around"));
-        assert!(WORKSPACE_AGENTS.contains("While working, message only"));
-        assert!(WORKSPACE_AGENTS.contains("meaningful boundary"));
+        assert!(WORKSPACE_AGENTS.contains("Answer every message with a short line"));
+        assert!(WORKSPACE_AGENTS.contains("before you read or run anything"));
+        assert!(WORKSPACE_AGENTS.contains("quick update every so often"));
+        assert!(WORKSPACE_AGENTS.contains("rather than handing it to a schedule"));
         assert!(WORKSPACE_AGENTS.contains("Never narrate commands"));
         assert!(WORKSPACE_AGENTS.contains("huge final message"));
     }

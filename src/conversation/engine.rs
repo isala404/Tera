@@ -38,8 +38,22 @@ const MAX_BURST_WAIT: Duration = Duration::from_secs(8);
 const PRESENCE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_PRESENCE_HOLD: Duration = Duration::from_secs(5 * 60);
 
-const MODEL_FAILURE_REPLY: &str =
-    "I couldn't complete that because the model provider is unavailable. Check Tera's service log for the cause, then try again.";
+/// How long the owner may go without hearing from a running turn before Tera
+/// steers in a reminder. The gap starts short, so a missing acknowledgement is
+/// caught quickly, and widens as the turn runs on, so a long job reports less
+/// often. Each wait is jittered so updates don't land on a metronome.
+const FIRST_UPDATE_GAP: Duration = Duration::from_secs(90);
+const MAX_UPDATE_GAP: Duration = Duration::from_secs(12 * 60);
+
+fn update_gap(running_for: Duration, jitter: f64) -> Duration {
+    let gap = (FIRST_UPDATE_GAP + running_for / 3).min(MAX_UPDATE_GAP);
+    gap.mul_f64(0.7 + 0.6 * jitter)
+}
+
+/// Uniform in [0, 1). A v4 uuid is already random, which saves a dependency.
+fn jitter() -> f64 {
+    (Uuid::new_v4().as_u128() >> 75) as f64 / (1u64 << 53) as f64
+}
 
 /// Bursts waiting out their quiet period, and the logical turn currently being
 /// executed.
@@ -756,14 +770,20 @@ impl TurnEngine {
                 }
             }
 
-            let reply_text = match self.codex.run_main_turn(&burst.turn_id, &inputs).await {
+            let turn = self.codex.run_main_turn(&burst.turn_id, &inputs);
+            let outcome = tokio::select! {
+                outcome = turn => outcome,
+                never = self.nudge_while_silent(Instant::now()) => match never {},
+            };
+            let reply_text = match outcome {
                 Ok(reply) => reply,
                 Err(error) => {
                     error!("Codex turn failed: {error:?}");
                     if self.session.sends(FOREGROUND) == sends_before {
+                        let failure_reply = format!("I couldn't finish that. {error}");
                         match self
                             .transport
-                            .send_text(&chat_jid, MODEL_FAILURE_REPLY, reply_target.as_ref())
+                            .send_text(&chat_jid, &failure_reply, reply_target.as_ref())
                             .await
                         {
                             Ok(outbound_msg_id) => {
@@ -771,7 +791,7 @@ impl TurnEngine {
                                     &self.history_db,
                                     &chat_jid,
                                     &outbound_msg_id,
-                                    MODEL_FAILURE_REPLY,
+                                    &failure_reply,
                                     Some(burst.turn_id.clone()),
                                     burst.events.last().map(|event| event.id.clone()),
                                 ) {
@@ -865,6 +885,39 @@ impl TurnEngine {
         result
     }
 
+    /// Steer a reminder into the running turn whenever the owner has gone a
+    /// while without hearing from it. Never returns; the turn finishing drops it.
+    async fn nudge_while_silent(&self, started: Instant) -> std::convert::Infallible {
+        let mut last_nudge = started;
+        loop {
+            let quiet_since = self
+                .session
+                .last_send(FOREGROUND)
+                .map_or(last_nudge, |sent| sent.max(last_nudge));
+            let due = quiet_since + update_gap(started.elapsed(), jitter());
+            tokio::time::sleep_until(due.into()).await;
+            if self.session.last_send(FOREGROUND) > Some(quiet_since) {
+                continue;
+            }
+
+            let minutes = (quiet_since.elapsed().as_secs() / 60).max(1);
+            let owner = &self.config.owner_name;
+            let reminder = format!(
+                "Tera here, not {owner}. {owner} hasn't heard from you for about {minutes} minutes. Send them a short update on what you've found and what's next, then carry on."
+            );
+            match self
+                .codex
+                .steer_main_turn(&[TurnInput::Text(reminder)])
+                .await
+            {
+                Ok(true) => info!("Nudged the running turn after {minutes} quiet minutes"),
+                Ok(false) => {}
+                Err(e) => warn!("Could not nudge the running turn: {e:?}"),
+            }
+            last_nudge = Instant::now();
+        }
+    }
+
     /// Tell the owner how the pairing they were asked for turned out.
     ///
     /// One at a time: the code is cached until it resolves, so repeated messages
@@ -909,6 +962,42 @@ impl TurnEngine {
             }
             notifier_flag.store(false, Ordering::SeqCst);
         });
+    }
+}
+
+#[cfg(test)]
+mod update_gap_tests {
+    use super::*;
+
+    #[test]
+    fn test_first_update_comes_quickly() {
+        let gap = update_gap(Duration::ZERO, 0.5);
+        assert_eq!(gap, FIRST_UPDATE_GAP);
+    }
+
+    #[test]
+    fn test_gap_widens_as_the_turn_runs_and_is_capped() {
+        let early = update_gap(Duration::from_secs(5 * 60), 0.5);
+        let late = update_gap(Duration::from_secs(20 * 60), 0.5);
+        assert!(FIRST_UPDATE_GAP < early && early < late);
+        assert_eq!(
+            update_gap(Duration::from_secs(3 * 3600), 0.5),
+            MAX_UPDATE_GAP
+        );
+    }
+
+    #[test]
+    fn test_jitter_spreads_the_gap_both_ways() {
+        let running = Duration::from_secs(10 * 60);
+        let low = update_gap(running, 0.0);
+        let high = update_gap(running, 0.999);
+        assert!(low < update_gap(running, 0.5) && update_gap(running, 0.5) < high);
+        assert!(high.as_secs_f64() / low.as_secs_f64() > 1.8);
+    }
+
+    #[test]
+    fn test_jitter_is_in_unit_range() {
+        assert!((0..1000).map(|_| jitter()).all(|j| (0.0..1.0).contains(&j)));
     }
 }
 

@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// The worker id of the main conversation. Scheduled tasks and Phoenix name
 /// themselves when their thread starts.
@@ -24,6 +25,7 @@ pub const FOREGROUND: &str = "foreground";
 struct WorkerSession {
     turn_id: Option<String>,
     sends: u64,
+    last_send: Option<Instant>,
 }
 
 #[derive(Clone, Default)]
@@ -64,7 +66,14 @@ impl ConversationSession {
     /// Called after a message or reaction actually reaches the provider.
     pub fn record_send(&self, worker_id: &str) {
         let mut workers = self.workers.lock().unwrap();
-        workers.entry(worker_id.to_string()).or_default().sends += 1;
+        let worker = workers.entry(worker_id.to_string()).or_default();
+        worker.sends += 1;
+        worker.last_send = Some(Instant::now());
+    }
+
+    pub fn last_send(&self, worker_id: &str) -> Option<Instant> {
+        let workers = self.workers.lock().unwrap();
+        workers.get(worker_id).and_then(|w| w.last_send)
     }
 
     /// Monotonic count; snapshot it before a turn and compare after.
@@ -89,6 +98,17 @@ mod tests {
         mcp_side.record_send(FOREGROUND);
 
         assert_eq!(session.sends(FOREGROUND) - snapshot, 2);
+    }
+
+    #[test]
+    fn test_last_send_is_per_worker() {
+        let session = ConversationSession::new();
+        assert_eq!(session.last_send(FOREGROUND), None);
+
+        session.record_send("schedule:1");
+        assert_eq!(session.last_send(FOREGROUND), None);
+        session.record_send(FOREGROUND);
+        assert!(session.last_send(FOREGROUND).is_some());
     }
 
     #[test]
