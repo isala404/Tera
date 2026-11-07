@@ -369,32 +369,17 @@ mod tests {
         assert!(send_message["inputSchema"]["properties"]["file_path"].is_object());
     }
 
-    /// Voice rules the agent has to follow every turn. They have been lost to a
-    /// rewrite once; this is the tripwire.
+    /// The message rules, measured against glm-5.3-flash replaying real chats.
+    /// Longer versions with a forced acknowledgement, periodic updates and a
+    /// witty voice produced templated filler and repeats, so these few lines are
+    /// the tripwire against growing them back.
     #[test]
-    fn test_the_root_instructions_still_ban_markdown() {
-        // Stated as a hard rule with the notations spelled out, because a short
-        // ban gets read as a style preference and bullets come back.
-        assert!(WORKSPACE_AGENTS.contains("Hard rule. Messages are plain text."));
-        assert!(WORKSPACE_AGENTS.contains("No markdown of any kind"));
-        for notation in [
-            "headings",
-            "bold",
-            "italics",
-            "bullets",
-            "tables",
-            "backticks",
-        ] {
-            assert!(WORKSPACE_AGENTS.contains(notation), "{notation}");
-        }
-    }
-
-    #[test]
-    fn test_the_root_instructions_keep_messages_informal() {
-        assert!(WORKSPACE_AGENTS.contains("No em dashes, colons or semicolons in messages"));
-        assert!(WORKSPACE_AGENTS.contains("informal, slightly goofy and witty"));
-        assert!(WORKSPACE_AGENTS.contains("Absolutely, you're right"));
-        assert!(WORKSPACE_AGENTS.contains("Never agree automatically"));
+    fn test_the_root_instructions_keep_messages_short_and_new() {
+        assert!(WORKSPACE_AGENTS.contains("plain text with no markdown"));
+        assert!(WORKSPACE_AGENTS.contains("Answer what was asked and stop"));
+        assert!(WORKSPACE_AGENTS.contains("send only what's new"));
+        assert!(WORKSPACE_AGENTS.contains("one line start and then its result"));
+        assert!(WORKSPACE_AGENTS.contains("only for things that must wait for a time"));
     }
 
     #[test]
@@ -488,19 +473,6 @@ mod tests {
         assert!(WORKING.contains("Create or improve a skill"));
         assert!(WORKING.contains("compact executable scripts"));
         assert!(WORKING.contains("do not create `agents/openai.yaml`"));
-    }
-
-    #[test]
-    fn test_the_root_instructions_pace_large_task_updates() {
-        // The acknowledgement is the beat that gets dropped first, because a
-        // model that already knows the answer to the next step reads "speak when
-        // you have an answer" as permission to stay silent until it does.
-        assert!(WORKSPACE_AGENTS.contains("Answer every message with a short line"));
-        assert!(WORKSPACE_AGENTS.contains("before you read or run anything"));
-        assert!(WORKSPACE_AGENTS.contains("quick update every so often"));
-        assert!(WORKSPACE_AGENTS.contains("rather than handing it to a schedule"));
-        assert!(WORKSPACE_AGENTS.contains("Never narrate commands"));
-        assert!(WORKSPACE_AGENTS.contains("huge final message"));
     }
 
     #[test]

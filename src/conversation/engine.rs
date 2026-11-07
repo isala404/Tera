@@ -903,7 +903,7 @@ impl TurnEngine {
             let minutes = (quiet_since.elapsed().as_secs() / 60).max(1);
             let owner = &self.config.owner_name;
             let reminder = format!(
-                "Tera here, not {owner}. {owner} hasn't heard from you for about {minutes} minutes. Send them a short update on what you've found and what's next, then carry on."
+                "Tera here, not {owner}. It's been about {minutes} minutes since {owner} last heard from you. If you've learned something they'd want to know now, tell them in a line, otherwise just carry on."
             );
             match self
                 .codex

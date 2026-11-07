@@ -336,7 +336,7 @@ impl DaemonRpcServer {
                         event_id.clone(),
                         occurred_at_ms,
                         "assistant",
-                        authored,
+                        authored.clone(),
                         reply_to.map(str::to_string),
                         self.session.turn(worker_id),
                         attachments,
@@ -351,10 +351,14 @@ impl DaemonRpcServer {
                     error!("Sent {provider_msg_id} but could not record it in history: {error:?}");
                 }
 
+                // Echoing the text matters. Given only a status and ids, models
+                // lose track of what the owner has already read and send the same
+                // answer again.
                 Ok(json!({
                     "status": "sent",
                     "message_id": event_id,
-                    "provider_message_id": provider_msg_id
+                    "provider_message_id": provider_msg_id,
+                    "text": authored
                 }))
             }
 
@@ -625,7 +629,7 @@ mod tests {
             .set("SPOTIFY_CLIENT_ID", "abc123def456", 0)
             .unwrap();
 
-        server
+        let result = server
             .execute_tool(
                 "send_message",
                 &json!({"text": "Log in: https://accounts.spotify.com/authorize?client_id=${SPOTIFY_CLIENT_ID}&state=x"}),
@@ -633,6 +637,10 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(
+            result["text"],
+            "Log in: https://accounts.spotify.com/authorize?client_id=${SPOTIFY_CLIENT_ID}&state=x"
+        );
 
         let sent = transport.sent_messages.lock().unwrap();
         assert!(
